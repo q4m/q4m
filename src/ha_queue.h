@@ -97,7 +97,7 @@ public:
   void lock() { pthread_mutex_lock(&mutex); }
   void unlock() { pthread_mutex_unlock(&mutex); }
   void lock_reader() { lock(); ++num_readers; unlock(); }
-  void unlock_reader() { lock(); --num_readers; unlock(); }
+  void unlock_reader();
   void wake_listener() { pthread_cond_signal(&queue_cond); }
   int wait(time_t t) {
     timespec ts = { t, 0 };
@@ -113,7 +113,7 @@ public:
   off_t begin() { return first_row; }
   off_t end() { return header()->eod(); }
   int next(off_t *off);
-  off_t get_owned_row(pthread_t owner);
+  off_t get_owned_row(pthread_t owner, bool remove = false);
   void write_begin();
   void write_append(const void* data, size_t size);
   int write_commit();

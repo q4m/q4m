@@ -42,6 +42,7 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 
 using namespace std;
 
+#define COMPACTION_SIZE 4*1024*1024
 #define EXPAND_BY (65536)
 #define Q4M ".Q4M"
 
@@ -186,6 +187,58 @@ void queue_share_t::release()
   pthread_mutex_unlock(&g_mutex);
 }
 
+static int copy_file_content(int fd, off_t begin, off_t end, off_t dest)
+{
+  char buf[65536];
+  
+  while (begin < end) {
+    size_t bs = min(end - begin, sizeof(buf));
+    if (pread(fd, buf, bs, begin) != bs
+	|| pwrite(fd, buf, bs, dest) != bs) {
+      return -1;
+    }
+    begin += bs;
+    dest += bs;
+  }
+  
+  return 0;
+}
+
+void queue_share_t::unlock_reader()
+{
+  lock();
+  
+  if (--num_readers == 0) {
+    off_t delta;
+    if (end() >= COMPACTION_SIZE
+	&& end() - begin() <= (delta = begin() - sizeof(queue_file_header_t))) {
+      /* copy data to top */
+      if (copy_file_content(fd, begin(), end(), sizeof(queue_file_header_t)) ==
+	  -1
+	  || fsync(fd) == -1
+	  || _header.set_eod(fd, end() - delta) == -1) {
+	return; // maybe we should log this error
+      }
+      /* adjust member variables */
+      first_row = sizeof(queue_file_header_t);
+      for (queue_rows_owned_t::iterator i = rows_owned.begin();
+	   i != rows_owned.end();
+	   ++i) {
+	i->second -= delta;
+      }
+      if (cache.off != 0) {
+	cache.off -= delta;
+      }
+      /* truncate file */
+      if (ftruncate(fd, end()) == -1) {
+	return; // as above
+      }
+    }
+  }
+  
+  unlock();
+}
+
 off_t queue_share_t::reset_owner(pthread_t owner)
 {
   off_t off = 0;
@@ -239,11 +292,11 @@ int queue_share_t::write_file(const void *data, off_t off, size_t size)
   } else if (cache.off <= off) {
     memcpy(cache.buf + off - cache.off,
 	   data,
-	   min(size, sizeof(cache.off) - (off - cache.off)));
+	   min(size, sizeof(cache.buf) - (off - cache.off)));
   } else {
     memcpy(cache.buf,
 	   static_cast<const char*>(data) + cache.off - off,
-	   min(size - (cache.off - off), sizeof(cache.off)));
+	   min(size - (cache.off - off), sizeof(cache.buf)));
   }
   return 0;
 }
@@ -282,12 +335,15 @@ int queue_share_t::next(off_t *off)
   return 0;
 }
 
-off_t queue_share_t::get_owned_row(pthread_t owner)
+off_t queue_share_t::get_owned_row(pthread_t owner, bool remove)
 {
   for (queue_rows_owned_t::iterator i = rows_owned.begin();
        i != rows_owned.end();
        ++i) {
     if (i->first == owner) {
+      if (remove) {
+	rows_owned.erase(i);
+      }
       return i->second;
     }
   }
@@ -419,7 +475,7 @@ static void erase_owned()
   if ((share = static_cast<queue_share_t*>(pthread_getspecific(share_key)))
       != NULL) {
     share->lock();
-    off_t off = share->get_owned_row(pthread_self());
+    off_t off = share->get_owned_row(pthread_self(), true);
     share->erase_row(off);
     share->unlock();
     share->release();
