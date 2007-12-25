@@ -1,0 +1,75 @@
+Q4M - a Message Queue for MySQL
+
+Dec. 21 2007
+Kazuho Oku
+Cybozu Labs, Inc.
+
+
+Q4M is a message queue that works as a pluggable storage engine of MySQL
+5.1.
+
+Since its development is still in very early alpha-stage, NEVER USE THE
+SOFTWARE IN PRODUCTION ENVIRONMENT.
+
+
+* LICENSE and COPYRIGHT
+
+Please refer to each file.  The engine was built from the Skeleton engine
+and the copyright of the build scripts mostly belong to their authors.
+Copyright of the source code of the queue engine belongs to Cybozu Labs,
+Inc., and is licensed under GPLv2.
+
+
+* LIMITATIONS
+
+- table contents are not saved onto disk
+  - wait for updates
+- no indexes support
+  - simplicity for speed
+  - is it neressary, when we can create any number of tables=queues?
+
+
+* INSTALLATION
+
+To install the software, follow the steps below.
+
+ % ./configure --with-mysql=<mysql-source-dir> --libdir=<mysql-lib-dir>
+ % make
+ % make install
+ % mysql -u root
+ > INSTALL PLUGIN queue SONAME 'libqueue_engine.so';
+ > CREATE FUNCTION queue_wait RETURN INT SONAME 'libqueue_engine.so';
+ > CREATE FUNCTION queue_end RETURN INT SONAME 'libqueue_engine.so';
+ > CREATE FUNCTION queue_abort RETURN INT SONAME 'libqueue_engine.so';
+
+If you are installing Q4M against a debug build of MySQL, it might be
+necessary to set the -DSAFE_MUTEX compile option.
+
+ % CFLAGS=-DSAFE_MUTEX CXXFLAGS=-DSAFE_MUTEX ./configure ...
+
+
+* USAGE
+
+creating queues:
+ > CREATE TABLE my_queue (id INT UNSIGNED NOT NULL) ENGINE=queue;
+
+sending messages to queue:
+ > INSERT INTO my_queue (id) values (2),(3),(4);
+
+receiving messages from queue (shown in perl code):
+  
+  while (1) {
+    # wait until any data becomes available
+    $dbh->do('select queue_wait("dbname.tblname")');
+    # receive data (only one row becomes ready at once)
+    if (my @ary = $dbh->selectrow_array('select * from tblname')) {
+      # process data
+      unless (process_row(@ary)) {
+        # abort if failed, return data to queue
+        $dbh->do('select queue_abort()');
+        last;
+      }
+    }
+  }
+  # tidy up
+  $dbh->do('select queue_end()');
