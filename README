@@ -38,9 +38,9 @@ To install the software, follow the steps below.
  % make install
  % mysql -u root
  > INSTALL PLUGIN queue SONAME 'libqueue_engine.so';
- > CREATE FUNCTION queue_wait RETURN INT SONAME 'libqueue_engine.so';
- > CREATE FUNCTION queue_end RETURN INT SONAME 'libqueue_engine.so';
- > CREATE FUNCTION queue_abort RETURN INT SONAME 'libqueue_engine.so';
+ > CREATE FUNCTION queue_wait RETURNS INT SONAME 'libqueue_engine.so';
+ > CREATE FUNCTION queue_end RETURNS INT SONAME 'libqueue_engine.so';
+ > CREATE FUNCTION queue_abort RETURNS INT SONAME 'libqueue_engine.so';
 
 If you are installing Q4M against a debug build of MySQL, it might be
 necessary to set the -DSAFE_MUTEX compile option.
