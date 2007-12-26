@@ -20,22 +20,25 @@
 
 class queue_share_t;
 
+// forget about endianness, for now :-)
+
 class queue_row_t {
-  unsigned _size; /* lower 2 bits used for flags, removed, and reserved */
+  unsigned _size; /* upper 2 bits used for flags, removed, and reserved */
   uchar _bytes[1];
 public:
+  queue_row_t() : _size(0) {}
   queue_row_t(unsigned size, bool removed = false) {
-    assert((size & 3) == 0);
-    _size = size | removed;
+    assert(size <= 0x3fffffff);
+    _size = (removed ? 0x80000000 : 0) | size;
   }
   unsigned size() const {
-    return _size & 0xfffffffc;
+    return _size & 0x3fffffff;
   }
   bool is_removed() const {
-    return (_size & 1) != 0;
+    return (_size & 0x80000000) != 0;
   }
   void set_is_removed() {
-    _size |= 1;
+    _size |= 0x80000000;
   }
   uchar *bytes() { return _bytes; }
   static size_t header_size() {
@@ -87,8 +90,6 @@ class queue_share_t {
     char buf[1024]; // should be smaller than queue_file_header_t for using off==0 for invalidation
   } cache;
   
-  std::vector<char> write_buf;
-  
   queue_rows_owned_t rows_owned;
   
   pthread_cond_t queue_cond;
@@ -112,21 +113,20 @@ public:
   const queue_file_header_t *header() const { return &_header; }
   off_t reset_owner(pthread_t owner);
   /* functions below requires lock */
-  ssize_t read_direct(void *data, off_t off, size_t size);
-  const void *read_cache(off_t off, size_t size, bool use_syscall);
+  const void *read_cache(off_t off, ssize_t size, bool populate_cache);
+  ssize_t read(void *data, off_t off, ssize_t size, bool populate_cache);
   int write_file(const void *data, off_t off, size_t size);
   off_t begin() { return first_row; }
   off_t end() { return header()->eod(); }
   int next(off_t *off);
   off_t get_owned_row(pthread_t owner, bool remove = false);
-  void write_begin();
-  void write_append(const void* data, size_t size);
-  int write_commit();
-  int erase_row(off_t row);
+  int write_row(queue_row_t *row, bool sync);
+  int erase_row(off_t off, bool sync);
+  int sync();
   pthread_t find_owner(off_t off);
   off_t assign_owner(pthread_t owner);
-  int compact();
 private:
+  int compact();
   queue_share_t();
   ~queue_share_t();
   queue_share_t(const queue_share_t&);
@@ -139,6 +139,8 @@ class ha_queue: public handler
   queue_share_t *share;
   
   off_t pos;
+  queue_row_t *row;
+  bool is_bulk_insert, is_dirty;
   
  public:
   ha_queue(handlerton *hton, TABLE_SHARE *table_arg);
@@ -173,9 +175,15 @@ class ha_queue: public handler
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type);     ///< required
   
+  void start_bulk_insert();
+  int end_bulk_insert();
+  
   int write_row(uchar *buf);
   int update_row(const uchar *old_data, uchar *new_data);
   int delete_row(const uchar *buf);
+ private:
+  void unpack_row(uchar *buf);
+  void pack_row(uchar *buf);
 };
 
 #undef queue_end

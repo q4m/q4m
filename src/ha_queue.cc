@@ -141,7 +141,6 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   pthread_mutex_init(&share->mutex, MY_MUTEX_INIT_FAST);
   thr_lock_init(&share->store_lock);
   share->cache.off = 0;
-  new (&share->write_buf) vector<char>();
   new (&share->rows_owned) queue_rows_owned_t();
   pthread_cond_init(&share->queue_cond, NULL);
   share->num_readers = 0;
@@ -152,7 +151,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
     goto ERR_ON_FILEOPEN;
   }
   /* load header */
-  if (read(share->fd, &share->_header, sizeof(share->_header))
+  if (pread(share->fd, &share->_header, sizeof(share->_header), 0)
       != sizeof(share->_header)) {
     goto ERR_AFTER_FILEOPEN;
   }
@@ -162,12 +161,11 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   /* determine first row position */
   if ((share->first_row = sizeof(queue_file_header_t))
       != share->header()->eod()) {
-    const queue_row_t *row;
-    if ((row = static_cast<const queue_row_t*>(share->read_cache(share->first_row, 4, true)))
-	== NULL) {
-      if (row->is_removed() && share->next(&share->first_row) != 0) {
-	goto ERR_AFTER_FILEOPEN;
-      }
+    queue_row_t row;
+    if (share->read(&row, share->first_row, queue_row_t::header_size(), true)
+	!= queue_row_t::header_size()
+	|| (row.is_removed() && share->next(&share->first_row) != 0)) {
+      goto ERR_AFTER_FILEOPEN;
     }
   }
   
@@ -185,7 +183,6 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
  ERR_ON_FILEOPEN:
   pthread_cond_destroy(&share->queue_cond);
   share->rows_owned.~list();
-  share->write_buf.~vector();
   thr_lock_delete(&share->store_lock);
   pthread_mutex_destroy(&share->mutex);
   my_free(reinterpret_cast<uchar*>(share), MYF(0));
@@ -203,7 +200,6 @@ void queue_share_t::release()
     close(fd);
     pthread_cond_destroy(&queue_cond);
     rows_owned.~list();
-    write_buf.~vector();
     thr_lock_delete(&store_lock);
     pthread_mutex_destroy(&mutex);
     my_free(reinterpret_cast<uchar*>(this), MYF(0));
@@ -244,12 +240,8 @@ off_t queue_share_t::reset_owner(pthread_t owner)
   return off;
 }
 
-ssize_t queue_share_t::read_direct(void *data, off_t off, size_t size)
-{
-  return pread(fd, data, size, off);
-}
-
-const void *queue_share_t::read_cache(off_t off, size_t size, bool use_syscall)
+const void *queue_share_t::read_cache(off_t off, ssize_t size,
+				      bool populate_cache)
 {
   if (size > sizeof(cache.buf)) {
     return NULL;
@@ -257,7 +249,7 @@ const void *queue_share_t::read_cache(off_t off, size_t size, bool use_syscall)
   if (cache.off <= off && off + size <= cache.off + sizeof(cache.buf)) {
     return cache.buf + off - cache.off;
   }
-  if (! use_syscall) {
+  if (! populate_cache) {
     return NULL;
   }
   if (pread(fd, cache.buf, sizeof(cache.buf), off) < size) {
@@ -266,6 +258,17 @@ const void *queue_share_t::read_cache(off_t off, size_t size, bool use_syscall)
   }
   cache.off = off;
   return cache.buf;
+}
+
+ssize_t queue_share_t::read(void *data, off_t off, ssize_t size,
+			    bool populate_cache)
+{
+  const void* cp;
+  if ((cp = read_cache(off, size, populate_cache)) != NULL) {
+    memcpy(data, cp, size);
+    return size;
+  }
+  return pread(fd, data, size, off);
 }
 
 int queue_share_t::write_file(const void *data, off_t off, size_t size)
@@ -292,24 +295,24 @@ int queue_share_t::next(off_t *off)
   if (*off == header()->eod()) {
     // eof
   } else {
-    const queue_row_t *row;
-    if ((row = static_cast<const queue_row_t*>(read_cache(*off, queue_row_t::header_size(), true)))
-	 == NULL) {
+    queue_row_t row;
+    if (read(&row, *off, queue_row_t::header_size(), true)
+	!= queue_row_t::header_size()) {
       return -1;
     }
-    *off += queue_row_t::header_size() + row->size();
+    *off += queue_row_t::header_size() + row.size();
     while (1) {
       if (*off == header()->eod()) {
 	break;
       }
-      if ((row = static_cast<const queue_row_t*>(read_cache(*off, queue_row_t::header_size(), true)))
-	   == NULL) {
+      if (read(&row, *off, queue_row_t::header_size(), true)
+	  != queue_row_t::header_size()) {
 	return -1;
       }
-      if (! row->is_removed()) {
+      if (! row.is_removed()) {
 	break;
       }
-      *off += queue_row_t::header_size() + row->size();
+      *off += queue_row_t::header_size() + row.size();
     }
   }
   
@@ -331,38 +334,13 @@ off_t queue_share_t::get_owned_row(pthread_t owner, bool remove)
   return 0;
 }
 
-void queue_share_t::write_begin()
+int queue_share_t::write_row(queue_row_t *row, bool sync)
 {
-  write_buf.resize(queue_row_t::header_size());
-}
-
-void queue_share_t::write_append(const void* data, size_t size)
-{
-  size_t t = write_buf.size();
-  write_buf.resize(t + size);
-  copy(static_cast<const char*>(data),
-       static_cast<const char*>(data) + size,
-       write_buf.begin() + t);
-}
-
-int queue_share_t::write_commit()
-{
-  /* align */
-  if (write_buf.size() & 3 != 0) {
-    size_t cplen = 4 - (write_buf.size() & 3);
-    const char* s = "\0\0";
-    write_buf.resize(write_buf.size() + cplen);
-    copy(s, s + cplen, write_buf.end() - cplen);
-  }
-  /* setup header */
-  queue_row_t *row = reinterpret_cast<queue_row_t*>(&write_buf.front());
-  new (row) queue_row_t(write_buf.size() - queue_row_t::header_size());
+  size_t wlen = queue_row_t::header_size() + row->size();
+  
   /* extend the file by certain amount for speed */
-  if ((_header.eod() - 1) / EXPAND_BY
-      != (_header.eod() + write_buf.size()) / EXPAND_BY) {
-    if (lseek(fd,
-	      ((_header.eod() + write_buf.size()) / EXPAND_BY + 1) * EXPAND_BY
-	      - 1,
+  if ((_header.eod() - 1) / EXPAND_BY != (_header.eod() + wlen) / EXPAND_BY) {
+    if (lseek(fd, ((_header.eod() + wlen) / EXPAND_BY + 1) * EXPAND_BY - 1,
 	      SEEK_SET)
 	== -1 ||
 	write(fd, "", 1) != 1) {
@@ -370,21 +348,73 @@ int queue_share_t::write_commit()
     }
   }
   /* write */
-  write_file(row, _header.eod(), write_buf.size());
-  write_buf.clear();
+  if (write_file(row, _header.eod(), wlen) == -1) {
+    return -1;
+  }
   /* sync data */
+  if (sync) {
+    switch (mode) {
+    case e_sync:
+      if (fdatasync(fd) != 0) {
+	return -1;
+      }
+      break;
+    }
+  }
+  /* update eod */
+  _header.set_eod(_header.eod() + wlen);
+  /* write eod */
+  if (sync) {
+    switch (mode) {
+    case e_sync:
+      if (_header.write(fd) != 0 || fdatasync(fd) != 0) {
+	if (_header.restore(fd) != 0) {
+	  // this is very bad, cannot read from table
+	}
+	return -1;
+      }
+      break;
+    }
+  }
+  return 0;
+}
+
+int queue_share_t::erase_row(off_t off, bool sync)
+{
+  queue_row_t orig_row;
+  
+  if (read(&orig_row, off, queue_row_t::header_size(), false)
+      != queue_row_t::header_size()) {
+    return -1;
+  }
+  queue_row_t new_row_header(orig_row.size(), true);
+  if (write_file(&new_row_header, off, queue_row_t::header_size()) != 0) {
+    return -1;
+  }
+  if (sync) {
+    switch (mode) {
+    case e_sync:
+      if (fdatasync(fd) != 0) {
+	return -1;
+      }
+      break;
+    }
+  }
+  if (off == first_row) {
+    if (next(&off) != 0) {
+      return -1;
+    }
+    first_row = off;
+  }
+  return 0;
+}
+
+int queue_share_t::sync() {
   switch (mode) {
   case e_sync:
     if (fdatasync(fd) != 0) {
       return -1;
     }
-    break;
-  }
-  /* update eod */
-  _header.set_eod(_header.eod() + row->size() + queue_row_t::header_size());
-  /* write eod */
-  switch (mode) {
-  case e_sync:
     if (_header.write(fd) != 0 || fdatasync(fd) != 0) {
       if (_header.restore(fd) != 0) {
 	// this is very bad, cannot read from table
@@ -392,34 +422,6 @@ int queue_share_t::write_commit()
       return -1;
     }
     break;
-  }
-  return 0;
-}
-
-int queue_share_t::erase_row(off_t off)
-{
-  const queue_row_t *orig_row;
-  
-  if ((orig_row = static_cast<const queue_row_t*>(read_cache(off, queue_row_t::header_size(), true)))
-      == NULL) {
-    return -1;
-  }
-  queue_row_t new_row_header(orig_row->size(), true);
-  if (write_file(&new_row_header, off, queue_row_t::header_size()) != 0) {
-    return -1;
-  }
-  switch (mode) {
-  case e_sync:
-    if (fdatasync(fd) != 0) {
-      return -1;
-    }
-    break;
-  }
-  if (off == first_row) {
-    if (next(&off) != 0) {
-      return -1;
-    }
-    first_row = off;
   }
   return 0;
 }
@@ -560,7 +562,7 @@ static void erase_owned()
       != NULL) {
     share->lock();
     off_t off = share->get_owned_row(pthread_self(), true);
-    share->erase_row(off);
+    share->erase_row(off, true);
     share->unlock();
     share->release();
     pthread_setspecific(share_key, NULL);
@@ -615,7 +617,10 @@ static int deinit(void *p)
 ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
   :handler(hton, table_arg),
    share(NULL),
-   pos()
+   pos(),
+   row(NULL),
+   is_bulk_insert(false),
+   is_dirty(false)
 {
 }
 
@@ -635,12 +640,16 @@ int ha_queue::open(const char *name, int mode, uint test_if_locked)
     return 1;
   }
   thr_lock_data_init(share->get_store_lock(), &lock, NULL);
+  row = reinterpret_cast<queue_row_t*>(my_malloc(queue_row_t::header_size() + table->s->reclength + 3, MYF(0)));
+  
   return 0;
 }
 
 int ha_queue::close()
 {
+  my_free(reinterpret_cast<uchar*>(row), MYF(0));
   share->release();
+  
   return 0;
 }
 
@@ -692,23 +701,22 @@ int ha_queue::rnd_next(uchar *buf)
     }
   }
   
-  { /* read data */
-    const void *src;
-    if ((src = share->read_cache(pos + queue_row_t::header_size(),
-				 table->s->reclength, false))
-	!= NULL) {
-      memcpy(buf, src, table->s->reclength);
-    } else {
-      if (share->read_direct(buf, pos + queue_row_t::header_size(),
-			     table->s->reclength)
-	  != table->s->reclength) {
-	err = HA_ERR_GENERIC; // ????
-	goto EXIT;
-      }
-    }
+  /* read data to row buffer */
+  if (share->read(row, pos, queue_row_t::header_size(), true)
+      != queue_row_t::header_size()) {
+    err = HA_ERR_GENERIC; // ????
+    goto EXIT;
+  }
+  if (share->read(row->bytes(), pos + queue_row_t::header_size(), row->size(),
+		  false)
+      != row->size()) {
+    goto EXIT;
   }
   
-  err = 0;
+  /* unlock and convert to internal representation */
+  share->unlock();
+  unpack_row(buf);
+  return 0;
   
  EXIT:
   share->unlock();
@@ -777,15 +785,40 @@ int ha_queue::create(const char *name, TABLE *table_arg,
   return HA_ERR_GENERIC;
 }
 
+void ha_queue::start_bulk_insert()
+{
+  is_bulk_insert = true;
+}
+
+int ha_queue::end_bulk_insert()
+{
+  int ret = 0;
+  
+  is_bulk_insert = false;
+  
+  if (is_dirty) {
+    is_dirty = false;
+    share->lock();
+    if (share->sync() != 0) {
+      ret = HA_ERR_GENERIC; // ????
+    }
+    share->unlock();
+  }
+  
+  return ret;
+}
+
 int ha_queue::write_row(uchar *buf)
 {
   unsigned link_to;
   int ret = 0;
   
+  pack_row(buf);
+  
   share->lock();
-  share->write_begin();
-  share->write_append(buf, table->s->reclength);
-  if (share->write_commit() != 0) {
+  if (share->write_row(row, is_bulk_insert) == 0) {
+    is_dirty = is_bulk_insert;
+  } else {
     ret = HA_ERR_GENERIC; // ????
   }
   share->unlock();
@@ -799,24 +832,7 @@ int ha_queue::write_row(uchar *buf)
 int ha_queue::update_row(const uchar *old_data __attribute__((unused)),
 			 uchar *new_data)
 {
-  int ret = 0;
-  share->lock();
-  
-  pthread_t owner = share->find_owner(pos);
-  if (owner != 0 && owner != pthread_self()) {
-    share->unlock();
-    return HA_ERR_RECORD_DELETED;
-  }
-  
-  /* write code */
-  if (share->write_file(new_data, pos + queue_row_t::header_size(),
-			table->s->reclength)
-      != 0) {
-    ret = HA_ERR_GENERIC; // ????
-  }
-    
-  share->unlock();
-  return ret;
+  return HA_ERR_WRONG_COMMAND;
 }
 
 int ha_queue::delete_row(const uchar *buf __attribute__((unused)))
@@ -828,10 +844,37 @@ int ha_queue::delete_row(const uchar *buf __attribute__((unused)))
     share->unlock();
     return HA_ERR_RECORD_DELETED;
   }
-  share->erase_row(pos);
+  share->erase_row(pos, true);
   
   share->unlock();
   return 0;
+}
+
+void ha_queue::unpack_row(uchar *buf)
+{
+  const uchar *src = row->bytes();
+			  
+  memcpy(buf, row->bytes(), table->s->null_bytes);
+  src += table->s->null_bytes;
+  for (Field **field = table->field; *field != NULL; field++) {
+    if (! (*field)->is_null()) {
+      src = (*field)->unpack(buf + (*field)->offset(table->record[0]), src);
+    }
+  }
+}
+
+void ha_queue::pack_row(uchar *buf)
+{
+  uchar *dst = row->bytes();
+  
+  memcpy(dst, buf, table->s->null_bytes);
+  dst += table->s->null_bytes;
+  for (Field **field = table->field; *field != NULL; field++) {
+    if (! (*field)->is_null()) {
+      dst = (*field)->pack(dst, buf + (*field)->offset(buf));
+    }
+  }
+  new (row) queue_row_t(dst - row->bytes(), false);
 }
 
 struct st_mysql_storage_engine queue_storage_engine = {
