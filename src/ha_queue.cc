@@ -358,10 +358,14 @@ int queue_share_t::write_commit()
   queue_row_t *row = reinterpret_cast<queue_row_t*>(&write_buf.front());
   new (row) queue_row_t(write_buf.size() - queue_row_t::header_size());
   /* extend the file by certain amount for speed */
-  if (_header.eod() / EXPAND_BY
+  if ((_header.eod() - 1) / EXPAND_BY
       != (_header.eod() + write_buf.size()) / EXPAND_BY) {
-    if (lseek(fd, (_header.eod() / EXPAND_BY + 1) * EXPAND_BY, SEEK_SET)
-	== -1) {
+    if (lseek(fd,
+	      ((_header.eod() + write_buf.size()) / EXPAND_BY + 1) * EXPAND_BY
+	      - 1,
+	      SEEK_SET)
+	== -1 ||
+	write(fd, "", 1) != 1) {
       return -1;
     }
   }
