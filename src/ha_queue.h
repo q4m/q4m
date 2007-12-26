@@ -125,6 +125,7 @@ public:
   int erase_row(off_t row);
   pthread_t find_owner(off_t off);
   off_t assign_owner(pthread_t owner);
+  int compact();
 private:
   queue_share_t();
   ~queue_share_t();

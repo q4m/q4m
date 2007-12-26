@@ -212,99 +212,17 @@ void queue_share_t::release()
   pthread_mutex_unlock(&g_mutex);
 }
 
-static int copy_file_content(int src_fd, off_t begin, off_t end, int dest_fd,
-			     off_t dest)
-{
-  char buf[65536];
-  
-  while (begin < end) {
-    size_t bs = min(end - begin, sizeof(buf));
-    if (pread(src_fd, buf, bs, begin) != bs
-	|| pwrite(dest_fd, buf, bs, dest) != bs) {
-      return -1;
-    }
-    begin += bs;
-    dest += bs;
-  }
-  
-  return 0;
-}
-
 void queue_share_t::unlock_reader()
 {
   lock();
   
   if (--num_readers == 0) {
     if (DO_COMPACT(end() - sizeof(_header), begin() - sizeof(_header))) {
-      goto COMPACT;
+      compact(); // how should we handle the error?
     }
   }
   
   unlock();
-  return;
-  
- COMPACT:
-  {
-    /* open new file */
-    char filename[FN_REFLEN], tmp_filename[FN_REFLEN];
-    int tmp_fd;
-    queue_file_header_t hdr;
-    off_t delta = begin() - sizeof(hdr);
-    fn_format(filename, table_name, "", Q4M,
-	      MY_REPLACE_EXT | MY_UNPACK_FILENAME);
-    fn_format(tmp_filename, table_name, "", Q4T,
-	      MY_REPLACE_EXT | MY_UNPACK_FILENAME);
-    if ((tmp_fd = open(tmp_filename, O_CREAT | O_TRUNC | O_RDWR, 0660))
-	== -1) {
-      goto ERR_RETURN;
-    }
-    /* write data and sync */
-    switch (mode) {
-    case e_volatile:
-      /* write header with eod pointing to top */
-      if (write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)
-	  || fdatasync(tmp_fd) != 0) {
-	goto ERR_OPEN;
-      }
-      break;
-    default:
-      hdr.set_eod(end() - delta);
-      if (write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)
-	  || copy_file_content(fd, begin(), end(), tmp_fd, sizeof(hdr)) != 0
-	  || fdatasync(tmp_fd) != 0) {
-	goto ERR_OPEN;
-      }
-      break;
-    }
-    // TODO: we should mark that Q4T is ready, then sync -> rename -> sync
-    /* rename */
-    if (rename(tmp_filename, filename) != 0) {
-      goto ERR_OPEN;
-    }
-    /* replace fd */
-    close(fd);
-    fd = tmp_fd;
-    { /* adjust offsets */
-      first_row -= delta;
-      _header.set_eod(end() - delta);
-      for (queue_rows_owned_t::iterator i = rows_owned.begin();
-	   i != rows_owned.end();
-	   ++i) {
-	i->second -= delta;
-      }
-      cache.off = 0; /* invalidate, since it may go below sizeof(_header) */
-    }
-    /* done */
-    unlock();
-    return;
-    
-  ERR_OPEN:
-    close(tmp_fd);
-    unlink(tmp_filename);
-  ERR_RETURN:
-    unlock();
-    return;
-  }
 }
 
 off_t queue_share_t::reset_owner(pthread_t owner)
@@ -527,6 +445,87 @@ off_t queue_share_t::assign_owner(pthread_t owner)
     }
   }
   return 0;
+}
+
+static int copy_file_content(int src_fd, off_t begin, off_t end, int dest_fd,
+			     off_t dest)
+{
+  char buf[65536];
+  
+  while (begin < end) {
+    size_t bs = min(end - begin, sizeof(buf));
+    if (pread(src_fd, buf, bs, begin) != bs
+	|| pwrite(dest_fd, buf, bs, dest) != bs) {
+      return -1;
+    }
+    begin += bs;
+    dest += bs;
+  }
+  
+  return 0;
+}
+
+int queue_share_t::compact()
+{
+  char filename[FN_REFLEN], tmp_filename[FN_REFLEN];
+  int tmp_fd;
+  queue_file_header_t hdr;
+  off_t delta = begin() - sizeof(hdr);
+  
+  /* open new file */
+  fn_format(filename, table_name, "", Q4M,
+	    MY_REPLACE_EXT | MY_UNPACK_FILENAME);
+  fn_format(tmp_filename, table_name, "", Q4T,
+	    MY_REPLACE_EXT | MY_UNPACK_FILENAME);
+  if ((tmp_fd = open(tmp_filename, O_CREAT | O_TRUNC | O_RDWR, 0660))
+      == -1) {
+    goto ERR_RETURN;
+  }
+  /* write data and sync */
+  switch (mode) {
+  case e_volatile:
+    /* write header with eod pointing to top */
+    if (write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)
+	|| fdatasync(tmp_fd) != 0) {
+      goto ERR_OPEN;
+    }
+    break;
+  default:
+    hdr.set_eod(end() - delta);
+    if (write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)
+	|| copy_file_content(fd, begin(), end(), tmp_fd, sizeof(hdr)) != 0
+	|| fdatasync(tmp_fd) != 0) {
+      goto ERR_OPEN;
+    }
+    break;
+  }
+  // TODO: we should mark that Q4T is ready, then sync -> rename -> sync
+  /* rename */
+  if (rename(tmp_filename, filename) != 0) {
+    goto ERR_OPEN;
+  }
+  /* replace fd */
+  close(fd);
+  fd = tmp_fd;
+  { /* adjust offsets */
+    first_row -= delta;
+    _header.set_eod(end() - delta);
+    for (queue_rows_owned_t::iterator i = rows_owned.begin();
+	 i != rows_owned.end();
+	 ++i) {
+      i->second -= delta;
+    }
+    cache.off = 0; /* invalidate, since it may go below sizeof(_header) */
+  }
+  
+  return 0;
+    
+ ERR_OPEN:
+  close(tmp_fd);
+  unlink(tmp_filename);
+ ERR_RETURN:
+  unlock();
+  return -1;
 }
 
 static queue_share_t* get_share_check(const char* db_table_name)
