@@ -55,7 +55,11 @@ using namespace std;
 static HASH open_tables;
 #ifdef SAFE_MUTEX
 static pthread_mutex_t g_mutex = {
+#ifdef PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP
   PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP,
+#else
+  PTHREAD_MUTEX_INITIALIZER,
+#endif
   PTHREAD_MUTEX_INITIALIZER,
   __FILE__,
   __LINE__
