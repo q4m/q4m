@@ -60,7 +60,9 @@ public:
   queue_file_header_t();
   unsigned magic() const { return _magic; }
   off_t eod() const { return _eod; }
-  int set_eod(int fd, off_t e);
+  void set_eod(off_t e) { _eod = e; }
+  int write(int fd);
+  int restore(int fd);
 };
 
 typedef std::list<std::pair<pthread_t, off_t> > queue_rows_owned_t;
@@ -72,6 +74,11 @@ class queue_share_t {
   
   pthread_mutex_t mutex;
   THR_LOCK store_lock;
+  
+  enum {
+    e_sync,
+    e_volatile,
+  } mode;
   
   int fd;
   off_t first_row;

@@ -42,9 +42,10 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 
 using namespace std;
 
-#define COMPACTION_SIZE 4*1024*1024
+#define DO_COMPACT(all, free) ((all) >= 4 && (free) * 2 >= (all))
 #define EXPAND_BY (65536)
 #define Q4M ".Q4M"
+#define Q4T ".Q4T"
 
 static HASH open_tables;
 static pthread_mutex_t g_mutex;
@@ -61,13 +62,20 @@ queue_file_header_t::queue_file_header_t()
   memset(_padding2, 0, sizeof(_padding2));
 }
 
-int queue_file_header_t::set_eod(int fd, off_t eod)
+int queue_file_header_t::write(int fd)
 {
-  if (pwrite(fd, &eod, sizeof(eod), offsetof(queue_file_header_t, _eod))
-      != sizeof(eod)) {
+  if (pwrite(fd, &_eod, sizeof(_eod), offsetof(queue_file_header_t, _eod))
+      != sizeof(_eod)) {
     return -1;
   }
-  if (fsync(fd) != 0) {
+  return 0;
+}
+
+int queue_file_header_t::restore(int fd)
+{
+  off_t eod;
+  if (pread(fd, &eod, sizeof(eod), offsetof(queue_file_header_t, _eod))
+      != sizeof(eod)) {
     return -1;
   }
   _eod = eod;
@@ -187,14 +195,15 @@ void queue_share_t::release()
   pthread_mutex_unlock(&g_mutex);
 }
 
-static int copy_file_content(int fd, off_t begin, off_t end, off_t dest)
+static int copy_file_content(int src_fd, off_t begin, off_t end, int dest_fd,
+			     off_t dest)
 {
   char buf[65536];
   
   while (begin < end) {
     size_t bs = min(end - begin, sizeof(buf));
-    if (pread(fd, buf, bs, begin) != bs
-	|| pwrite(fd, buf, bs, dest) != bs) {
+    if (pread(src_fd, buf, bs, begin) != bs
+	|| pwrite(dest_fd, buf, bs, dest) != bs) {
       return -1;
     }
     begin += bs;
@@ -209,34 +218,75 @@ void queue_share_t::unlock_reader()
   lock();
   
   if (--num_readers == 0) {
-    off_t delta;
-    if (end() >= COMPACTION_SIZE
-	&& end() - begin() <= (delta = begin() - sizeof(queue_file_header_t))) {
-      /* copy data to top */
-      if (copy_file_content(fd, begin(), end(), sizeof(queue_file_header_t)) ==
-	  -1
-	  || fsync(fd) == -1
-	  || _header.set_eod(fd, end() - delta) == -1) {
-	return; // maybe we should log this error
+    if (DO_COMPACT(end() - sizeof(_header), begin() - sizeof(_header))) {
+      goto COMPACT;
+    }
+  }
+  
+  unlock();
+  return;
+  
+ COMPACT:
+  {
+    /* open new file */
+    char filename[FN_REFLEN], tmp_filename[FN_REFLEN];
+    int tmp_fd;
+    queue_file_header_t hdr;
+    off_t delta = begin() - sizeof(hdr);
+    fn_format(filename, table_name, "", Q4M,
+	      MY_REPLACE_EXT | MY_UNPACK_FILENAME);
+    fn_format(tmp_filename, table_name, "", Q4T,
+	      MY_REPLACE_EXT | MY_UNPACK_FILENAME);
+    if ((tmp_fd = open(tmp_filename, O_CREAT | O_TRUNC | O_RDWR, 0660))
+	== -1) {
+      goto ERR_RETURN;
+    }
+    /* write data and sync */
+    switch (mode) {
+    case e_volatile:
+      /* write header with eod pointing to top */
+      if (write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)
+	  || fsync(tmp_fd) != 0) {
+	goto ERR_OPEN;
       }
-      /* adjust member variables */
-      first_row = sizeof(queue_file_header_t);
+      break;
+    default:
+      hdr.set_eod(end() - delta);
+      if (write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)
+	  || copy_file_content(fd, begin(), end(), tmp_fd, sizeof(hdr)) != 0
+	  || fsync(tmp_fd) != 0) {
+	goto ERR_OPEN;
+      }
+      break;
+    }
+    /* rename */
+    if (rename(tmp_filename, filename) != 0) {
+      goto ERR_OPEN;
+    }
+    /* replace fd */
+    close(fd);
+    fd = tmp_fd;
+    { /* adjust offsets */
+      first_row -= delta;
+      _header.set_eod(end() - delta);
       for (queue_rows_owned_t::iterator i = rows_owned.begin();
 	   i != rows_owned.end();
 	   ++i) {
 	i->second -= delta;
       }
-      if (cache.off != 0) {
-	cache.off -= delta;
-      }
-      /* truncate file */
-      if (ftruncate(fd, end()) == -1) {
-	return; // as above
-      }
+      cache.off = 0; /* invalidate, since it may go below sizeof(_header) */
     }
+    /* done */
+    unlock();
+    return;
+    
+  ERR_OPEN:
+    close(tmp_fd);
+    unlink(tmp_filename);
+  ERR_RETURN:
+    unlock();
+    return;
   }
-  
-  unlock();
 }
 
 off_t queue_share_t::reset_owner(pthread_t owner)
@@ -388,13 +438,27 @@ int queue_share_t::write_commit()
   write_file(row, _header.eod(), write_buf.size());
   write_buf.clear();
   /* sync data */
-  if (fsync(fd) != 0) {
-    return -1;
+  switch (mode) {
+  case e_sync:
+    if (fsync(fd) != 0) {
+      return -1;
+    }
+    break;
   }
   /* update eod */
-  return _header.set_eod(fd,
-			 _header.eod() + row->size()
-			 + queue_row_t::header_size());
+  _header.set_eod(_header.eod() + row->size() + queue_row_t::header_size());
+  /* write eod */
+  switch (mode) {
+  case e_sync:
+    if (_header.write(fd) != 0 || fsync(fd) != 0) {
+      if (_header.restore(fd) != 0) {
+	// this is very bad, cannot read from table
+      }
+      return -1;
+    }
+    break;
+  }
+  return 0;
 }
 
 int queue_share_t::erase_row(off_t off)
@@ -409,8 +473,12 @@ int queue_share_t::erase_row(off_t off)
   if (write_file(row, off, queue_row_t::header_size()) != 0) {
     return -1;
   }
-  if (fsync(fd) != 0) {
-    return -1;
+  switch (mode) {
+  case e_sync:
+    if (fsync(fd) != 0) {
+      return -1;
+    }
+    break;
   }
   if (off == first_row) {
     if (next(&off) != 0) {
@@ -681,6 +749,9 @@ int ha_queue::create(const char *name, TABLE *table_arg,
   }
   if (lseek(fd, EXPAND_BY - 1, SEEK_SET) == -1
       || write(fd, "", 1) != 1) {
+    goto ERROR;
+  }
+  if (fsync(fd) != 0) {
     goto ERROR;
   }
   ::close(fd);
