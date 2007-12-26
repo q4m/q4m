@@ -53,7 +53,16 @@ using namespace std;
 #define Q4T ".Q4T"
 
 static HASH open_tables;
-static pthread_mutex_t g_mutex;
+#ifdef SAFE_MUTEX
+static pthread_mutex_t g_mutex = {
+  PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP,
+  PTHREAD_MUTEX_INITIALIZER,
+  __FILE__,
+  __LINE__
+};
+#else
+static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 /* if non-NULL, access is restricted to the rows owned, and it points
  * to queue_share_t
@@ -581,7 +590,6 @@ static int init(void *p)
 {
   handlerton* queue_hton = (handlerton *)p;
   
-  pthread_mutex_init(&g_mutex, MY_MUTEX_INIT_FAST);
   pthread_key_create(&share_key, NULL);
   hash_init(&open_tables, system_charset_info, 32, 0, 0,
 	    reinterpret_cast<hash_get_key>(queue_share_t::get_share_key), 0, 0);
@@ -597,7 +605,6 @@ static int init(void *p)
 static int deinit(void *p)
 {
   hash_free(&open_tables);
-  pthread_mutex_destroy(&g_mutex);
   
   return 0;
 }
@@ -743,7 +750,7 @@ int ha_queue::create(const char *name, TABLE *table_arg,
   int fd;
   
   fn_format(filename, name, "", Q4M, MY_REPLACE_EXT | MY_UNPACK_FILENAME);
-  if ((fd = ::open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_EXLOCK, 0660))
+  if ((fd = ::open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0660))
       == -1) {
     return HA_ERR_GENERIC;
   }
