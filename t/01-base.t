@@ -30,7 +30,7 @@ is_deeply(
 );
 
 for (my $i = 0; $i < $TEST_ROWS / 2; $i++) {
-    my $r = ($i * 2) % $TEST_ROWS;
+    my $r = ($i * 11) % $TEST_ROWS;
     ok($dbh->do("delete from q4m_t where v=$r"));
     delete $exp{$r};
     is_deeply(

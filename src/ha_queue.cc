@@ -181,6 +181,7 @@ void queue_share_t::release()
   pthread_mutex_lock(&g_mutex);
   
   if (--use_count == 0) {
+    hash_delete(&open_tables, reinterpret_cast<uchar*>(this));
     close(fd);
     pthread_cond_destroy(&queue_cond);
     rows_owned.~list();
