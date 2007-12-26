@@ -24,6 +24,10 @@ class queue_row_t {
   unsigned _size; /* lower 2 bits used for flags, removed, and reserved */
   uchar _bytes[1];
 public:
+  queue_row_t(unsigned size, bool removed = false) {
+    assert((size & 3) == 0);
+    _size = size | removed;
+  }
   unsigned size() const {
     return _size & 0xfffffffc;
   }
@@ -34,17 +38,11 @@ public:
     _size |= 1;
   }
   uchar *bytes() { return _bytes; }
-  void init_header(unsigned size) {
-    assert((size & 3) == 0);
-    _size = size;
-  }
   static size_t header_size() {
     return offsetof(queue_row_t, _bytes[0]);
   }
 private:
-  queue_row_t();
   queue_row_t(const queue_row_t&);
-  ~queue_row_t();
   queue_row_t& operator=(const queue_row_t&);
 };
 
@@ -115,7 +113,7 @@ public:
   off_t reset_owner(pthread_t owner);
   /* functions below requires lock */
   ssize_t read_direct(void *data, off_t off, size_t size);
-  void *read_cache(off_t off, size_t size, bool use_syscall);
+  const void *read_cache(off_t off, size_t size, bool use_syscall);
   int write_file(const void *data, off_t off, size_t size);
   off_t begin() { return first_row; }
   off_t end() { return header()->eod(); }

@@ -143,15 +143,13 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   }
   /* determine first row position */
   if ((share->first_row = sizeof(queue_file_header_t))
-      == share->header()->eod()) {
-    queue_row_t* row =
-      reinterpret_cast<queue_row_t*>(share->read_cache(share->first_row, 4,
-						       true));
-    if (row == NULL) {
-      goto ERR_AFTER_FILEOPEN;
-    }
-    if (row->is_removed() && share->next(&share->first_row) != 0) {
-      goto ERR_AFTER_FILEOPEN;
+      != share->header()->eod()) {
+    const queue_row_t *row;
+    if ((row = static_cast<const queue_row_t*>(share->read_cache(share->first_row, 4, true)))
+	== NULL) {
+      if (row->is_removed() && share->next(&share->first_row) != 0) {
+	goto ERR_AFTER_FILEOPEN;
+      }
     }
   }
   
@@ -176,7 +174,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
  ERR_RETURN:
   pthread_mutex_unlock(&g_mutex);
   return NULL;
-}
+  }
 
 void queue_share_t::release()
 {
@@ -313,7 +311,7 @@ ssize_t queue_share_t::read_direct(void *data, off_t off, size_t size)
   return pread(fd, data, size, off);
 }
 
-void *queue_share_t::read_cache(off_t off, size_t size, bool use_syscall)
+const void *queue_share_t::read_cache(off_t off, size_t size, bool use_syscall)
 {
   if (size > sizeof(cache.buf)) {
     return NULL;
@@ -356,11 +354,9 @@ int queue_share_t::next(off_t *off)
   if (*off == header()->eod()) {
     // eof
   } else {
-    queue_row_t *row =
-      reinterpret_cast<queue_row_t*>(read_cache(*off,
-						queue_row_t::header_size(),
-						true));
-    if (row == NULL) {
+    const queue_row_t *row;
+    if ((row = static_cast<const queue_row_t*>(read_cache(*off, queue_row_t::header_size(), true)))
+	 == NULL) {
       return -1;
     }
     *off += queue_row_t::header_size() + row->size();
@@ -368,17 +364,14 @@ int queue_share_t::next(off_t *off)
       if (*off == header()->eod()) {
 	break;
       }
-      row =
-	reinterpret_cast<queue_row_t*>(read_cache(*off,
-						  queue_row_t::header_size(),
-						  true));
-      if (row == NULL) {
+      if ((row = static_cast<const queue_row_t*>(read_cache(*off, queue_row_t::header_size(), true)))
+	   == NULL) {
 	return -1;
       }
       if (! row->is_removed()) {
 	break;
       }
-      *off += row->size();
+      *off += queue_row_t::header_size() + row->size();
     }
   }
   
@@ -425,7 +418,7 @@ int queue_share_t::write_commit()
   }
   /* setup header */
   queue_row_t *row = reinterpret_cast<queue_row_t*>(&write_buf.front());
-  row->init_header(write_buf.size() - queue_row_t::header_size());
+  new (row) queue_row_t(write_buf.size() - queue_row_t::header_size());
   /* extend the file by certain amount for speed */
   if (_header.eod() / EXPAND_BY
       != (_header.eod() + write_buf.size()) / EXPAND_BY) {
@@ -463,14 +456,14 @@ int queue_share_t::write_commit()
 
 int queue_share_t::erase_row(off_t off)
 {
-  queue_row_t *row =
-    static_cast<queue_row_t*>(read_cache(off, queue_row_t::header_size(),
-					 true));
-  if (row == NULL) {
+  const queue_row_t *orig_row;
+  
+  if ((orig_row = static_cast<const queue_row_t*>(read_cache(off, queue_row_t::header_size(), true)))
+      == NULL) {
     return -1;
   }
-  row->set_is_removed();
-  if (write_file(row, off, queue_row_t::header_size()) != 0) {
+  queue_row_t new_row_header(orig_row->size(), true);
+  if (write_file(&new_row_header, off, queue_row_t::header_size()) != 0) {
     return -1;
   }
   switch (mode) {
