@@ -10,7 +10,7 @@ AC_PROG_CPP
 AC_PROG_GCC_TRADITIONAL
 AC_PROG_LIBTOOL
 LIBTOOL="$LIBTOOL --preserve-dup-deps"
-AC_SUBST(LIBTOOL)dnl
+AC_SUBST(LIBTOOL)
 
 sinclude(config/ac_mysql.m4)
 sinclude(config/ac_system.m4)
@@ -27,6 +27,11 @@ else
   CFLAGS="-Xa -xstrconst -mt -D_FORTEC_ -fast -m64"
   CXXFLAGS="$CXXFLAGS -noex -mt -D_FORTEC_ -fast -m64"
   DTRACEFLAGS="-64"
+fi
+
+UNAME=`uname -s`
+if test "$UNAME" = "Darwin" ; then
+   AC_DEFINE([FDATASYNC_USE_FCNTL],1,[use fcntl for fdatasysnc])
 fi
 
 AC_C_CONST

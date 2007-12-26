@@ -16,6 +16,7 @@
  */
 
 extern "C" {
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 }
@@ -42,6 +43,10 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 
 using namespace std;
 
+#ifdef FDATASYNC_USE_FCNTL
+#define  fdatasync(fd) fcntl((fd), F_FULLFSYNC, 0)
+#endif
+
 #define DO_COMPACT(all, free) ((all) >= 4*1024*1024 && (free) * 2 >= (all))
 #define EXPAND_BY (65536)
 #define Q4M ".Q4M"
@@ -55,6 +60,10 @@ static pthread_mutex_t g_mutex;
  */
 static pthread_key_t share_key;
 
+
+#ifdef SYNC_FILE
+#  define fdatasync(x) SYNC_FILE(x)
+#endif
 
 queue_file_header_t::queue_file_header_t()
   : _magic(MAGIC), _padding1(0), _eod(sizeof(queue_file_header_t))
@@ -245,7 +254,7 @@ void queue_share_t::unlock_reader()
     case e_volatile:
       /* write header with eod pointing to top */
       if (write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)
-	  || fsync(tmp_fd) != 0) {
+	  || fdatasync(tmp_fd) != 0) {
 	goto ERR_OPEN;
       }
       break;
@@ -253,11 +262,12 @@ void queue_share_t::unlock_reader()
       hdr.set_eod(end() - delta);
       if (write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)
 	  || copy_file_content(fd, begin(), end(), tmp_fd, sizeof(hdr)) != 0
-	  || fsync(tmp_fd) != 0) {
+	  || fdatasync(tmp_fd) != 0) {
 	goto ERR_OPEN;
       }
       break;
     }
+    // TODO: we should mark that Q4T is ready, then sync -> rename -> sync
     /* rename */
     if (rename(tmp_filename, filename) != 0) {
       goto ERR_OPEN;
@@ -434,7 +444,7 @@ int queue_share_t::write_commit()
   /* sync data */
   switch (mode) {
   case e_sync:
-    if (fsync(fd) != 0) {
+    if (fdatasync(fd) != 0) {
       return -1;
     }
     break;
@@ -444,7 +454,7 @@ int queue_share_t::write_commit()
   /* write eod */
   switch (mode) {
   case e_sync:
-    if (_header.write(fd) != 0 || fsync(fd) != 0) {
+    if (_header.write(fd) != 0 || fdatasync(fd) != 0) {
       if (_header.restore(fd) != 0) {
 	// this is very bad, cannot read from table
       }
@@ -469,7 +479,7 @@ int queue_share_t::erase_row(off_t off)
   }
   switch (mode) {
   case e_sync:
-    if (fsync(fd) != 0) {
+    if (fdatasync(fd) != 0) {
       return -1;
     }
     break;
@@ -745,7 +755,7 @@ int ha_queue::create(const char *name, TABLE *table_arg,
       || write(fd, "", 1) != 1) {
     goto ERROR;
   }
-  if (fsync(fd) != 0) {
+  if (fdatasync(fd) != 0) {
     goto ERROR;
   }
   ::close(fd);
