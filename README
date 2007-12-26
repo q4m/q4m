@@ -1,6 +1,6 @@
 Q4M - a Message Queue for MySQL
 
-Dec. 21 2007
+Dec. 27 2007
 Kazuho Oku
 Cybozu Labs, Inc.
 
@@ -22,8 +22,10 @@ Inc., and is licensed under GPLv2.
 
 * LIMITATIONS
 
-- table contents are not saved onto disk
-  - wait for updates
+- does not support UPDATE (only supports SELECT,DELETE,INSERT)
+  - since Q4M is a queue :-)
+- does not (yet) support BLOBS
+- no transactions
 - no indexes support
   - simplicity for speed
   - is it neressary, when we can create any number of tables=queues?
