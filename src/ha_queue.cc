@@ -74,10 +74,6 @@ static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_key_t share_key;
 
 
-#ifdef SYNC_FILE
-#  define fdatasync(x) SYNC_FILE(x)
-#endif
-
 queue_file_header_t::queue_file_header_t()
   : _magic(MAGIC), _padding1(0), _eod(sizeof(queue_file_header_t))
 {
