@@ -43,10 +43,6 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 
 using namespace std;
 
-#ifdef FDATASYNC_USE_FCNTL
-#define  fdatasync(fd) fcntl((fd), F_FULLFSYNC, 0)
-#endif
-
 #define DO_COMPACT(all, free) ((all) >= 4*1024*1024 && (free) * 2 >= (all))
 #define EXPAND_BY (65536)
 #define Q4M ".Q4M"
@@ -74,19 +70,41 @@ static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_key_t share_key;
 
 
+static void kill_proc(const char *msg)
+{
+  write(2, msg, strlen(msg));
+  abort();
+  static char *np = NULL;
+  if (*np) {
+    *np = NULL;
+  }
+}
+
+static void sync_file(int fd)
+{
+  if (
+#ifdef FDATASYNC_USE_FCNTL
+      fcntl(fd, F_FULLFSYNC, 0) != 0
+#else
+      fdatasync(fd) != 0
+#endif
+      ) {
+    kill_proc("failed to sync disk\n");
+  }
+}
+
 queue_file_header_t::queue_file_header_t()
   : _magic(MAGIC), _padding1(0), _eod(sizeof(queue_file_header_t))
 {
   memset(_padding2, 0, sizeof(_padding2));
 }
 
-int queue_file_header_t::write(int fd)
+void queue_file_header_t::write(int fd)
 {
   if (pwrite(fd, &_eod, sizeof(_eod), offsetof(queue_file_header_t, _eod))
       != sizeof(_eod)) {
-    return -1;
+    kill_proc("failed to update header\n");
   }
-  return 0;
 }
 
 int queue_file_header_t::restore(int fd)
@@ -355,9 +373,7 @@ int queue_share_t::write_row(queue_row_t *row, bool sync)
   if (sync) {
     switch (mode) {
     case e_sync:
-      if (fdatasync(fd) != 0) {
-	return -1;
-      }
+      sync_file(fd);
       break;
     }
   }
@@ -367,12 +383,8 @@ int queue_share_t::write_row(queue_row_t *row, bool sync)
   if (sync) {
     switch (mode) {
     case e_sync:
-      if (_header.write(fd) != 0 || fdatasync(fd) != 0) {
-	if (_header.restore(fd) != 0) {
-	  // this is very bad, cannot read from table
-	}
-	return -1;
-      }
+      _header.write(fd);
+      sync_file(fd);
       break;
     }
   }
@@ -394,9 +406,7 @@ int queue_share_t::erase_row(off_t off, bool sync)
   if (sync) {
     switch (mode) {
     case e_sync:
-      if (fdatasync(fd) != 0) {
-	return -1;
-      }
+      sync_file(fd);
       break;
     }
   }
@@ -409,21 +419,17 @@ int queue_share_t::erase_row(off_t off, bool sync)
   return 0;
 }
 
-int queue_share_t::sync() {
+void queue_share_t::sync(bool update_header)
+{
   switch (mode) {
   case e_sync:
-    if (fdatasync(fd) != 0) {
-      return -1;
-    }
-    if (_header.write(fd) != 0 || fdatasync(fd) != 0) {
-      if (_header.restore(fd) != 0) {
-	// this is very bad, cannot read from table
-      }
-      return -1;
+    sync_file(fd);
+    if (update_header) {
+      _header.write(fd);
+      sync_file(fd);
     }
     break;
   }
-  return 0;
 }
 
 pthread_t queue_share_t::find_owner(off_t off)
@@ -491,24 +497,27 @@ int queue_share_t::compact()
   switch (mode) {
   case e_volatile:
     /* write header with eod pointing to top */
-    if (write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)
-	|| fdatasync(tmp_fd) != 0) {
+    if (write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
       goto ERR_OPEN;
     }
+    sync_file(tmp_fd);
     break;
   default:
     hdr.set_eod(end() - delta);
     if (write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)
-	|| copy_file_content(fd, begin(), end(), tmp_fd, sizeof(hdr)) != 0
-	|| fdatasync(tmp_fd) != 0) {
+	|| copy_file_content(fd, begin(), end(), tmp_fd, sizeof(hdr)) != 0) {
       goto ERR_OPEN;
     }
+    sync_file(tmp_fd);
     break;
   }
-  // TODO: we should mark that Q4T is ready, then sync -> rename -> sync
   /* rename */
   if (rename(tmp_filename, filename) != 0) {
     goto ERR_OPEN;
+  }
+  // is the directory entry synced with fsync?
+  if (fsync(tmp_fd) != 0) {
+    kill_proc("failed to sync disk\n");
   }
   /* replace fd */
   close(fd);
@@ -773,9 +782,7 @@ int ha_queue::create(const char *name, TABLE *table_arg,
       || write(fd, "", 1) != 1) {
     goto ERROR;
   }
-  if (fdatasync(fd) != 0) {
-    goto ERROR;
-  }
+  sync_file(fd);
   ::close(fd);
   return 0;
   
@@ -792,20 +799,16 @@ void ha_queue::start_bulk_insert(ha_rows rows __attribute__((unused)))
 
 int ha_queue::end_bulk_insert()
 {
-  int ret = 0;
-  
   is_bulk_insert = false;
   
   if (is_dirty) {
     is_dirty = false;
     share->lock();
-    if (share->sync() != 0) {
-      ret = HA_ERR_GENERIC; // ????
-    }
+    share->sync(true);
     share->unlock();
   }
   
-  return ret;
+  return 0;
 }
 
 int ha_queue::write_row(uchar *buf)

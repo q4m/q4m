@@ -62,7 +62,7 @@ public:
   unsigned magic() const { return _magic; }
   off_t eod() const { return _eod; }
   void set_eod(off_t e) { _eod = e; }
-  int write(int fd);
+  void write(int fd);
   int restore(int fd);
 };
 
@@ -122,7 +122,7 @@ public:
   off_t get_owned_row(pthread_t owner, bool remove = false);
   int write_row(queue_row_t *row, bool sync);
   int erase_row(off_t off, bool sync);
-  int sync();
+  void sync(bool update_header);
   pthread_t find_owner(off_t off);
   off_t assign_owner(pthread_t owner);
 private:
