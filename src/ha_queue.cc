@@ -42,7 +42,7 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 
 using namespace std;
 
-#define DO_COMPACT(all, free) ((all) >= 4 && (free) * 2 >= (all))
+#define DO_COMPACT(all, free) ((all) >= 4*1024*1024 && (free) * 2 >= (all))
 #define EXPAND_BY (65536)
 #define Q4M ".Q4M"
 #define Q4T ".Q4T"
