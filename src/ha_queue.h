@@ -175,7 +175,7 @@ class ha_queue: public handler
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type);     ///< required
   
-  void start_bulk_insert();
+  void start_bulk_insert(ha_rows rows);
   int end_bulk_insert();
   
   int write_row(uchar *buf);

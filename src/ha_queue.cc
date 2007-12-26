@@ -785,7 +785,7 @@ int ha_queue::create(const char *name, TABLE *table_arg,
   return HA_ERR_GENERIC;
 }
 
-void ha_queue::start_bulk_insert()
+void ha_queue::start_bulk_insert(ha_rows rows __attribute__((unused)))
 {
   is_bulk_insert = true;
 }
