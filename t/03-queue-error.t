@@ -71,6 +71,7 @@ if ($pid == 0) {
 }
 sleep 3;
 kill 9, $pid;
+sleep 2;
 $dbh = dbi_connect();
 is_deeply(
     $dbh->selectall_arrayref("select * from q4m_t"),
