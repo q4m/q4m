@@ -23,29 +23,47 @@ class queue_share_t;
 // forget about endianness, for now :-)
 
 class queue_row_t {
-  unsigned _size; /* upper 2 bits used for flags, removed, and reserved */
+  /* size is stored in the lower 30 bits, while upper 2 bits are used for
+   * attributes.  also, lower 30 bits of checksum will be stored instead
+   * of a size of a value if attr==attr_is_checksum, in which case there
+   * would be no data */
+  unsigned _size;
   uchar _bytes[1];
 public:
-  queue_row_t() : _size(0) {}
-  queue_row_t(unsigned size, bool removed = false) {
-    assert(size <= 0x3fffffff);
-    _size = (removed ? 0x80000000 : 0) | size;
+  enum {
+    type_mask     = 0xc0000000,
+    type_row      = 0x00000000,
+    type_removed  = 0x80000000,
+    type_checksum = 0x40000000,
+    size_mask     = ~type_mask,
+    max_size      = ~type_mask
+  };
+  queue_row_t() {} // build uninitialized
+  queue_row_t(unsigned size_or_mask, unsigned type = type_row) {
+    assert((size_or_mask & type_mask) == 0);
+    _size = size_or_mask | type;
   }
   unsigned size() const {
-    return _size & 0x3fffffff;
+    // NOTE: does not check if the row isn't checksum
+    return _size & size_mask;
   }
-  bool is_removed() const {
-    return (_size & 0x80000000) != 0;
+  unsigned checksum() const {
+    return size();
   }
-  void set_is_removed() {
-    _size |= 0x80000000;
+  unsigned type() const {
+    return _size & type_mask;
+  }
+  void set_type(unsigned type) {
+    assert((type & size_mask) == 0);
+    _size = (_size & size_mask) | type;
   }
   uchar *bytes() { return _bytes; }
   static size_t header_size() {
     return offsetof(queue_row_t, _bytes[0]);
   }
   off_t next(off_t off) {
-    return off + header_size() + size();
+    return off + header_size()
+      + (type() != type_checksum ? size() : 0);
   }
 private:
   queue_row_t(const queue_row_t&);
@@ -57,14 +75,19 @@ public:
   static const unsigned MAGIC = 0x6d393031;
 private:
   unsigned _magic;
-  unsigned _padding1;
-  off_t    _eod;
-  unsigned _padding2[(4096 - sizeof(unsigned) * 2 - sizeof(off_t)) / sizeof(unsigned)];
+  unsigned _attr;
+  off_t    _end;
+  off_t    _begin;
+  unsigned _padding[(4096 - sizeof(unsigned) * 2 - sizeof(off_t) * 2) / sizeof(unsigned)];
 public:
   queue_file_header_t();
   unsigned magic() const { return _magic; }
-  off_t eod() const { return _eod; }
-  void set_eod(off_t e) { _eod = e; }
+  unsigned attr() const { return _attr; }
+  
+  off_t end() const { return _end; }
+  void set_end(off_t e) { _end = e; }
+  off_t begin() const { return _begin; }
+  void set_begin(off_t b) { _begin = b; }
   void write(int fd);
 };
 
@@ -84,7 +107,6 @@ class queue_share_t {
   } mode;
   
   int fd;
-  off_t first_row;
   queue_file_header_t _header;
   
   struct {
@@ -117,12 +139,24 @@ public:
   /* functions below requires lock */
   const void *read_cache(off_t off, ssize_t size, bool populate_cache);
   ssize_t read(void *data, off_t off, ssize_t size, bool populate_cache);
-  int write(const void *data, off_t off, size_t size);
-  off_t begin() { return first_row; }
-  off_t end() { return header()->eod(); }
+  void update_cache(const void *data, off_t off, size_t size) {
+    if (cache.off + sizeof(cache.buf) <= off || off + size <= cache.off) {
+      // nothing to do
+    } else if (cache.off <= off) {
+      memcpy(cache.buf + off - cache.off,
+	     data,
+	     min(size, sizeof(cache.buf) - (off - cache.off)));
+    } else {
+      memcpy(cache.buf,
+	     static_cast<const char*>(data) + cache.off - off,
+	     min(size - (cache.off - off), sizeof(cache.buf)));
+    }
+  }
+  int writev(const iovec *iov, int iovcnt, ssize_t len);
+  int pwrite(const void *data, off_t off, size_t size);
   int next(off_t *off);
   off_t get_owned_row(pthread_t owner, bool remove = false);
-  int write_row(queue_row_t *row, bool sync);
+  int write_rows(queue_row_t **row, int cnt);
   int erase_row(off_t off, bool sync);
   void sync(bool update_header);
   pthread_t find_owner(off_t off);
@@ -143,7 +177,7 @@ class ha_queue: public handler
   off_t pos;
   queue_row_t *row;
   size_t row_max_size; /* not including header */
-  bool is_bulk_insert, is_dirty;
+  std::vector<queue_row_t*>* bulk_insert_rows;
   
  public:
   ha_queue(handlerton *hton, TABLE_SHARE *table_arg);
@@ -177,6 +211,7 @@ class ha_queue: public handler
 
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type);     ///< required
+  uint8 table_cache_type() { return HA_CACHE_TBL_NOCACHE; }
   
   void start_bulk_insert(ha_rows rows);
   int end_bulk_insert();
@@ -187,18 +222,26 @@ class ha_queue: public handler
  private:
   int prepare_row_buffer(size_t sz) {
     void *pt;
-    if (row_max_size < sz) {
+    if (row == NULL) {
+      if ((pt = my_malloc(queue_row_t::header_size() + sz, MYF(0)))
+	  == NULL) {
+	return -1;
+      }
+    } else if (row_max_size < sz) {
       if ((pt = my_realloc(row, queue_row_t::header_size() + sz, MYF(0)))
 	  == NULL) {
 	return -1;
       }
-      row = static_cast<queue_row_t*>(pt);
-      row_max_size = sz;
+    } else {
+      return 0;
     }
+    row = static_cast<queue_row_t*>(pt);
+    row_max_size = sz;
     return 0;
   }
   void unpack_row(uchar *buf);
   int pack_row(uchar *buf);
+  void free_bulk_insert_rows();
 };
 
 #undef queue_end
