@@ -63,7 +63,6 @@ public:
   off_t eod() const { return _eod; }
   void set_eod(off_t e) { _eod = e; }
   void write(int fd);
-  int restore(int fd);
 };
 
 typedef std::list<std::pair<pthread_t, off_t> > queue_rows_owned_t;
@@ -115,7 +114,7 @@ public:
   /* functions below requires lock */
   const void *read_cache(off_t off, ssize_t size, bool populate_cache);
   ssize_t read(void *data, off_t off, ssize_t size, bool populate_cache);
-  int write_file(const void *data, off_t off, size_t size);
+  int write(const void *data, off_t off, size_t size);
   off_t begin() { return first_row; }
   off_t end() { return header()->eod(); }
   int next(off_t *off);

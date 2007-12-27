@@ -107,17 +107,6 @@ void queue_file_header_t::write(int fd)
   }
 }
 
-int queue_file_header_t::restore(int fd)
-{
-  off_t eod;
-  if (pread(fd, &eod, sizeof(eod), offsetof(queue_file_header_t, _eod))
-      != sizeof(eod)) {
-    return -1;
-  }
-  _eod = eod;
-  return 0;
-}
-
 uchar* queue_share_t::get_share_key(queue_share_t *share, size_t *length,
 				    my_bool not_used __attribute__((unused)))
 {
@@ -289,7 +278,7 @@ ssize_t queue_share_t::read(void *data, off_t off, ssize_t size,
   return pread(fd, data, size, off);
 }
 
-int queue_share_t::write_file(const void *data, off_t off, size_t size)
+int queue_share_t::write(const void *data, off_t off, size_t size)
 {
    if (pwrite(fd, data, size, off) != size) {
     return -1;
@@ -361,13 +350,13 @@ int queue_share_t::write_row(queue_row_t *row, bool sync)
     if (lseek(fd, ((_header.eod() + wlen) / EXPAND_BY + 1) * EXPAND_BY - 1,
 	      SEEK_SET)
 	== -1 ||
-	write(fd, "", 1) != 1) {
+	::write(fd, "", 1) != 1) {
       return -1;
     }
   }
   /* write */
-  if (write_file(row, _header.eod(), wlen) == -1) {
-    return -1;
+  if (write(row, _header.eod(), wlen) == -1) {
+    kill_proc("failed to write data to allocate file area\n");
   }
   /* sync data */
   if (sync) {
@@ -393,14 +382,14 @@ int queue_share_t::write_row(queue_row_t *row, bool sync)
 
 int queue_share_t::erase_row(off_t off, bool sync)
 {
-  queue_row_t orig_row;
+  queue_row_t row;
   
-  if (read(&orig_row, off, queue_row_t::header_size(), false)
+  if (read(&row, off, queue_row_t::header_size(), false)
       != queue_row_t::header_size()) {
     return -1;
   }
-  queue_row_t new_row_header(orig_row.size(), true);
-  if (write_file(&new_row_header, off, queue_row_t::header_size()) != 0) {
+  row.set_is_removed();
+  if (write(&row, off, queue_row_t::header_size()) != 0) {
     return -1;
   }
   if (sync) {
@@ -497,14 +486,14 @@ int queue_share_t::compact()
   switch (mode) {
   case e_volatile:
     /* write header with eod pointing to top */
-    if (write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+    if (::write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
       goto ERR_OPEN;
     }
     sync_file(tmp_fd);
     break;
   default:
     hdr.set_eod(end() - delta);
-    if (write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)
+    if (::write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)
 	|| copy_file_content(fd, begin(), end(), tmp_fd, sizeof(hdr)) != 0) {
       goto ERR_OPEN;
     }
@@ -693,7 +682,7 @@ int ha_queue::rnd_next(uchar *buf)
       }
     } else {
       if (share->next(&pos) != 0) {
-	err = HA_ERR_GENERIC; // what's the appropriate error code?
+	err = HA_ERR_CRASHED_ON_USAGE;
 	goto EXIT;
       } else if (pos == share->end()) {
 	goto EXIT;
@@ -701,7 +690,7 @@ int ha_queue::rnd_next(uchar *buf)
     }
     while (share->find_owner(pos) != 0) {
       if (share->next(&pos) != 0) {
-	err = HA_ERR_GENERIC; // ????
+	err = HA_ERR_CRASHED_ON_USAGE;
 	goto EXIT;
       }
       if (pos == share->end()) {
@@ -713,7 +702,7 @@ int ha_queue::rnd_next(uchar *buf)
   /* read data to row buffer */
   if (share->read(row, pos, queue_row_t::header_size(), true)
       != queue_row_t::header_size()) {
-    err = HA_ERR_GENERIC; // ????
+    err = HA_ERR_CRASHED_ON_USAGE;
     goto EXIT;
   }
   if (share->read(row->bytes(), pos + queue_row_t::header_size(), row->size(),
@@ -772,7 +761,7 @@ int ha_queue::create(const char *name, TABLE *table_arg,
   fn_format(filename, name, "", Q4M, MY_REPLACE_EXT | MY_UNPACK_FILENAME);
   if ((fd = ::open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0660))
       == -1) {
-    return HA_ERR_GENERIC;
+    return HA_ERR_GENERIC; // ????
   }
   queue_file_header_t header;
   if (write(fd, &header, sizeof(header)) != sizeof(header)) {
@@ -789,7 +778,7 @@ int ha_queue::create(const char *name, TABLE *table_arg,
  ERROR:
   ::close(fd);
   unlink(filename);
-  return HA_ERR_GENERIC;
+  return HA_ERR_RECORD_FILE_FULL;
 }
 
 void ha_queue::start_bulk_insert(ha_rows rows __attribute__((unused)))
@@ -813,7 +802,6 @@ int ha_queue::end_bulk_insert()
 
 int ha_queue::write_row(uchar *buf)
 {
-  unsigned link_to;
   int ret = 0;
   
   pack_row(buf);
@@ -822,7 +810,7 @@ int ha_queue::write_row(uchar *buf)
   if (share->write_row(row, is_bulk_insert) == 0) {
     is_dirty = is_bulk_insert;
   } else {
-    ret = HA_ERR_GENERIC; // ????
+    ret = HA_ERR_RECORD_FILE_FULL;
   }
   share->unlock();
   
