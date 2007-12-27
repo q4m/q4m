@@ -714,6 +714,7 @@ int ha_queue::rnd_next(uchar *buf)
   if (share->read(row->bytes(), pos + queue_row_t::header_size(), row->size(),
 		  false)
       != row->size()) {
+    err = HA_ERR_CRASHED_ON_USAGE;
     goto EXIT;
   }
   
@@ -729,11 +730,28 @@ int ha_queue::rnd_next(uchar *buf)
 
 void ha_queue::position(const uchar *record)
 {
+  my_store_ptr(ref, sizeof(pos), pos);
 }
 
-int ha_queue::rnd_pos(uchar * buf, uchar *pos)
+int ha_queue::rnd_pos(uchar *buf, uchar *_pos)
 {
-  return HA_ERR_WRONG_COMMAND;
+  pos = static_cast<off_t>(my_get_ptr(_pos, sizeof(pos)));
+  
+  /* we should return the row even if it had the deleted flag set during the
+   * execution by other threads
+   */
+  if (share->read(row, pos, queue_row_t::header_size(), true)
+      != queue_row_t::header_size()) {
+    return HA_ERR_CRASHED_ON_USAGE;
+  }
+  if (share->read(row->bytes(), pos + queue_row_t::header_size(), row->size(),
+		  false)
+      != row->size()) {
+    return HA_ERR_CRASHED_ON_USAGE;
+  }
+  
+  unpack_row(buf);
+  return 0;
 }
 
 int ha_queue::info(uint flag)
