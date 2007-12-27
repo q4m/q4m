@@ -622,10 +622,19 @@ ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
   :handler(hton, table_arg),
    share(NULL),
    pos(),
-   row(NULL),
+   row(static_cast<queue_row_t*>(my_malloc(queue_row_t::header_size(), MYF(0)))),
+   row_max_size(0),
    is_bulk_insert(false),
    is_dirty(false)
 {
+  if (row == NULL) {
+    kill_proc("out of memory");
+  }
+}
+
+ha_queue::~ha_queue()
+{
+  my_free(reinterpret_cast<uchar*>(row), MYF(0));
 }
 
 static const char *ha_queue_exts[] = {
@@ -644,14 +653,12 @@ int ha_queue::open(const char *name, int mode, uint test_if_locked)
     return 1;
   }
   thr_lock_data_init(share->get_store_lock(), &lock, NULL);
-  row = reinterpret_cast<queue_row_t*>(my_malloc(queue_row_t::header_size() + table->s->reclength + 3, MYF(0)));
   
   return 0;
 }
 
 int ha_queue::close()
 {
-  my_free(reinterpret_cast<uchar*>(row), MYF(0));
   share->release();
   
   return 0;
@@ -709,6 +716,10 @@ int ha_queue::rnd_next(uchar *buf)
   if (share->read(row, pos, queue_row_t::header_size(), true)
       != queue_row_t::header_size()) {
     err = HA_ERR_CRASHED_ON_USAGE;
+    goto EXIT;
+  }
+  if (prepare_row_buffer(row->size()) != 0) {
+    err = HA_ERR_OUT_OF_MEM;
     goto EXIT;
   }
   if (share->read(row->bytes(), pos + queue_row_t::header_size(), row->size(),
@@ -824,10 +835,11 @@ int ha_queue::end_bulk_insert()
 
 int ha_queue::write_row(uchar *buf)
 {
+  if (pack_row(buf) != 0) {
+    return HA_ERR_OUT_OF_MEM;
+  }
+  
   int ret = 0;
-  
-  pack_row(buf);
-  
   share->lock();
   if (share->write_row(row, is_bulk_insert) == 0) {
     is_dirty = is_bulk_insert;
@@ -835,7 +847,6 @@ int ha_queue::write_row(uchar *buf)
     ret = HA_ERR_RECORD_FILE_FULL;
   }
   share->unlock();
-  
   if (ret == 0) {
     share->wake_listener();
   }
@@ -876,8 +887,18 @@ void ha_queue::unpack_row(uchar *buf)
   }
 }
 
-void ha_queue::pack_row(uchar *buf)
+int ha_queue::pack_row(uchar *buf)
 {
+  size_t maxsize = table->s->reclength + table->s->fields * 2;
+  for (uint *ptr = table->s->blob_field, *end = ptr + table->s->blob_fields;
+       ptr != end;
+       ++ptr) {
+    maxsize += 2 + ((Field_blob*)table->field[*ptr])->get_length();
+  }
+  
+  if (prepare_row_buffer(maxsize) != 0) {
+    return -1;
+  }
   uchar *dst = row->bytes();
   
   memcpy(dst, buf, table->s->null_bytes);
@@ -888,6 +909,8 @@ void ha_queue::pack_row(uchar *buf)
     }
   }
   new (row) queue_row_t(dst - row->bytes(), false);
+  
+  return 0;
 }
 
 struct st_mysql_storage_engine queue_storage_engine = {

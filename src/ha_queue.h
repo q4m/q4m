@@ -139,11 +139,12 @@ class ha_queue: public handler
   
   off_t pos;
   queue_row_t *row;
+  size_t row_max_size; /* not including header */
   bool is_bulk_insert, is_dirty;
   
  public:
   ha_queue(handlerton *hton, TABLE_SHARE *table_arg);
-  ~ha_queue() {}
+  ~ha_queue();
   
   const char *table_type() const {
     return "QUEUE";
@@ -181,8 +182,20 @@ class ha_queue: public handler
   int update_row(const uchar *old_data, uchar *new_data);
   int delete_row(const uchar *buf);
  private:
+  int prepare_row_buffer(size_t sz) {
+    void *pt;
+    if (row_max_size < sz) {
+      if ((pt = my_realloc(row, queue_row_t::header_size() + sz, MYF(0)))
+	  == NULL) {
+	return -1;
+      }
+      row = static_cast<queue_row_t*>(pt);
+      row_max_size = sz;
+    }
+    return 0;
+  }
   void unpack_row(uchar *buf);
-  void pack_row(uchar *buf);
+  int pack_row(uchar *buf);
 };
 
 #undef queue_end

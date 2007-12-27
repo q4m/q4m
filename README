@@ -22,11 +22,10 @@ Inc., and is licensed under GPLv2.
 
 * LIMITATIONS
 
-- does not support UPDATE (only supports SELECT,DELETE,INSERT)
+- does not support REPLACE,UPDATE (only supports SELECT,DELETE,INSERT)
   - since Q4M is a queue :-)
-- does not (yet) support BLOBS
 - no transactions
-- no indexes support
+- no indexes
   - simplicity for speed
   - is it neressary, when we can create any number of tables=queues?
 
