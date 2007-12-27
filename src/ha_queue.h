@@ -44,6 +44,9 @@ public:
   static size_t header_size() {
     return offsetof(queue_row_t, _bytes[0]);
   }
+  off_t next(off_t off) {
+    return off + header_size() + size();
+  }
 private:
   queue_row_t(const queue_row_t&);
   queue_row_t& operator=(const queue_row_t&);

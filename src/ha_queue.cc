@@ -311,7 +311,7 @@ int queue_share_t::next(off_t *off)
 	!= queue_row_t::header_size()) {
       return -1;
     }
-    *off += queue_row_t::header_size() + row.size();
+    *off = row.next(*off);
     while (1) {
       if (*off == header()->eod()) {
 	break;
@@ -323,7 +323,7 @@ int queue_share_t::next(off_t *off)
       if (! row.is_removed()) {
 	break;
       }
-      *off += queue_row_t::header_size() + row.size();
+      *off = row.next(*off);
     }
   }
   
@@ -347,7 +347,8 @@ off_t queue_share_t::get_owned_row(pthread_t owner, bool remove)
 
 int queue_share_t::write_row(queue_row_t *row, bool sync)
 {
-  size_t wlen = queue_row_t::header_size() + row->size();
+  off_t wlen = row->next(0);
+  assert(wlen <= INT_MAX); // max of ssize_t on 32-bit systems
   
   /* extend the file by certain amount for speed */
   if ((_header.eod() - 1) / EXPAND_BY != (_header.eod() + wlen) / EXPAND_BY) {
