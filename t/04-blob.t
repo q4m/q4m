@@ -10,7 +10,7 @@ BEGIN {
     $TEST_ROWS = $ENV{TEST_ROWS} || 1024;
 };
 
-use Test::More tests => $TEST_ROWS * 3 + 4;
+use Test::More tests => $TEST_ROWS * 2 + 2;
 
 my $dbh = DBI->connect(
     $ENV{DBI} || 'dbi:mysql:database=test;host=localhost',
@@ -19,19 +19,16 @@ my $dbh = DBI->connect(
 ) or die 'connection failed:';
 
 ok($dbh->do('drop table if exists q4m_t'));
-ok($dbh->do('create table q4m_t (v int not null) engine=queue'));
+ok($dbh->do('create table q4m_t (s mediumtext) engine=queue'));
+
+my @rows;
 
 for (my $i = 0; $i < $TEST_ROWS; $i++) {
-    ok($dbh->do("insert into q4m_t (v) values ($i)"));
-    ok($dbh->do("select queue_wait('test.q4m_t')"));
+    my $row = '0123456789abcdef' x $i;
+    ok($dbh->do("insert into q4m_t (s) values ('$row')"));
+    push @rows, [ $row ];
     is_deeply(
         $dbh->selectall_arrayref('select * from q4m_t'),
-        [ [ $i ] ],
+        \@rows,
     );
 }
-
-ok($dbh->do('select queue_end()'));
-is_deeply(
-    $dbh->selectall_arrayref('select * from q4m_t'),
-    [],
-);

@@ -1,13 +1,16 @@
 #! /usr/bin/perl
 
-use Test::More tests => 2051;
-
 use strict;
 use warnings;
 
 use DBI;
 
-my $TEST_ROWS = 1024;
+my $TEST_ROWS;
+BEGIN {
+    $TEST_ROWS = $ENV{TEST_ROWS} || 1024;
+};
+
+use Test::More tests => $TEST_ROWS * 2 + 3;
 
 my $dbh = DBI->connect(
     $ENV{DBI} || 'dbi:mysql:database=test;host=localhost',
