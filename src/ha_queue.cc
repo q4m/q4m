@@ -25,6 +25,8 @@ extern "C" {
 #include <list>
 #include <vector>
 
+#define MYSQL_SERVER
+
 #include "mysql_priv.h"
 #undef PACKAGE
 #undef VERSION
@@ -48,7 +50,7 @@ using namespace std;
 #define Q4M ".Q4M"
 #define Q4T ".Q4T"
 
-static HASH open_tables;
+static HASH queue_open_tables;
 #ifdef SAFE_MUTEX
 static pthread_mutex_t g_mutex = {
 #ifdef PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP
@@ -63,6 +65,8 @@ static pthread_mutex_t g_mutex = {
 #else
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
+
+static handlerton *queue_hton;
 
 /* if non-NULL, access is restricted to the rows owned, and it points
  * to queue_share_t
@@ -126,7 +130,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   table_name_length = strlen(table_name);
   
   /* return the one, if found (after incrementing refcount) */
-  if ((share = reinterpret_cast<queue_share_t*>(hash_search(&open_tables, reinterpret_cast<const uchar*>(table_name), table_name_length)))
+  if ((share = reinterpret_cast<queue_share_t*>(hash_search(&queue_open_tables, reinterpret_cast<const uchar*>(table_name), table_name_length)))
       != NULL) {
     ++share->use_count;
     pthread_mutex_unlock(&g_mutex);
@@ -177,7 +181,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   }
   
   /* add to open_tables */
-  if (my_hash_insert(&open_tables, reinterpret_cast<uchar*>(share))) {
+  if (my_hash_insert(&queue_open_tables, reinterpret_cast<uchar*>(share))) {
     goto ERR_AFTER_FILEOPEN;
   }
     
@@ -203,7 +207,7 @@ void queue_share_t::release()
   pthread_mutex_lock(&g_mutex);
   
   if (--use_count == 0) {
-    hash_delete(&open_tables, reinterpret_cast<uchar*>(this));
+    hash_delete(&queue_open_tables, reinterpret_cast<uchar*>(this));
     close(fd);
     pthread_cond_destroy(&queue_cond);
     rows_owned.~list();
@@ -591,10 +595,11 @@ handler *create_handler(handlerton *hton, TABLE_SHARE *table,
 
 static int init(void *p)
 {
-  handlerton* queue_hton = (handlerton *)p;
+  
+  queue_hton = (handlerton *)p;
   
   pthread_key_create(&share_key, NULL);
-  hash_init(&open_tables, system_charset_info, 32, 0, 0,
+  hash_init(&queue_open_tables, system_charset_info, 32, 0, 0,
 	    reinterpret_cast<hash_get_key>(queue_share_t::get_share_key), 0, 0);
   
   queue_hton->state = SHOW_OPTION_YES;
@@ -607,7 +612,8 @@ static int init(void *p)
 
 static int deinit(void *p)
 {
-  hash_free(&open_tables);
+  hash_free(&queue_open_tables);
+  queue_hton = NULL;
   
   return 0;
 }
@@ -742,8 +748,6 @@ THR_LOCK_DATA **ha_queue::store_lock(THD *thd,
 				     THR_LOCK_DATA **to,
 				     enum thr_lock_type lock_type)
 {
-  *ha_data(thd) = reinterpret_cast<void*>(1); // so that close_conn gets called
-  
   if (lock_type != TL_IGNORE && lock.type == TL_UNLOCK) {
     lock.type=lock_type;
   }
@@ -938,6 +942,11 @@ void queue_wait_deinit(UDF_INIT *initid __attribute__((unused)))
 long long queue_wait(UDF_INIT *initid, UDF_ARGS *args __attribute__((unused)),
 		     char *is_null, char *error)
 {
+  /* set ha_data so that close_conn gets called,
+   * should correspond to the implementation of handle::ha_data
+   */
+  current_thd->ha_data[queue_hton->slot] = reinterpret_cast<void*>(1);
+  
   erase_owned();
   
   queue_wait_t *info = reinterpret_cast<queue_wait_t*>(initid->ptr);
