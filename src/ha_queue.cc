@@ -841,7 +841,7 @@ int ha_queue::write_row(uchar *buf)
   
   int ret = 0;
   share->lock();
-  if (share->write_row(row, is_bulk_insert) == 0) {
+  if (share->write_row(row, ! is_bulk_insert) == 0) {
     is_dirty = is_bulk_insert;
   } else {
     ret = HA_ERR_RECORD_FILE_FULL;
