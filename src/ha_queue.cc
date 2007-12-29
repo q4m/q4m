@@ -360,6 +360,8 @@ int queue_share_t::write_rows(queue_row_t **rows, int cnt)
     wlen += iov[i].iov_len = rows[i]->next(0);
   }
   
+  /* lock */
+  lock();
   /* extend the file by certain amount for speed */
   if ((_header.end() - 1) / EXPAND_BY != (_header.end() + wlen) / EXPAND_BY) {
     if (lseek(fd, ((_header.end() + wlen) / EXPAND_BY + 1) * EXPAND_BY - 1,
@@ -367,6 +369,7 @@ int queue_share_t::write_rows(queue_row_t **rows, int cnt)
 	== -1
 	|| ::write(fd, "", 1) != 1
 	|| lseek(fd, _header.end(), SEEK_SET) == -1) {
+      unlock();
       delete [] iov;
       return -1;
     }
@@ -376,6 +379,8 @@ int queue_share_t::write_rows(queue_row_t **rows, int cnt)
   if (writev(iov, cnt, wlen) != 0) {
     kill_proc("failed to write data to allocate file area\n");
   }
+  /* unlock */
+  unlock();
   /* sync data */
   switch (mode) {
   case e_sync:
@@ -383,37 +388,46 @@ int queue_share_t::write_rows(queue_row_t **rows, int cnt)
     break;
   }
   /* update end */
+  lock();
   _header.set_end(_header.end() + wlen);
+  unlock();
   
   delete [] iov;
   return 0;
 }
 
-int queue_share_t::erase_row(off_t off, bool sync)
+int queue_share_t::erase_row(off_t off, bool already_locked)
 {
   queue_row_t row;
   
+  if (! already_locked) {
+    lock();
+  }
   if (read(&row, off, queue_row_t::header_size(), false)
       != queue_row_t::header_size()) {
+    unlock();
     return -1;
   }
   row.set_type(queue_row_t::type_removed);
-  if (pwrite(&row, off, queue_row_t::header_size()) == -1) {
+  if (pwrite(&row, off, queue_row_t::header_size()) != 0) {
+    unlock();
     return -1;
   }
-  if (sync) {
-    switch (mode) {
-    case e_sync:
-      sync_file(fd);
-      break;
-    }
+  unlock();
+  switch (mode) {
+  case e_sync:
+    sync_file(fd);
+    break;
   }
+  lock();
   if (off == _header.begin()) {
     if (next(&off) != 0) {
       return -1;
     }
     _header.set_begin(off);
   }
+  unlock();
+  
   return 0;
 }
 
@@ -564,7 +578,7 @@ static void erase_owned()
     share->lock();
     off_t off = share->get_owned_row(pthread_self(), true);
     share->erase_row(off, true);
-    share->unlock();
+    // unlock in erase_row
     share->release();
     pthread_setspecific(share_key, NULL);
   }
@@ -829,13 +843,11 @@ int ha_queue::end_bulk_insert()
   
   if (bulk_insert_rows != NULL) {
     if (bulk_insert_rows->size() != 0) {
-      share->lock();
       if (share->write_rows(&bulk_insert_rows->front(),
 			    bulk_insert_rows->size())
 	  != 0) {
 	ret = HA_ERR_RECORD_FILE_FULL;
       }
-      share->unlock();
       if (ret == 0) {
 	for (size_t i = 0; i < bulk_insert_rows->size(); i++) {
 	  share->wake_listener();
@@ -863,16 +875,11 @@ int ha_queue::write_row(uchar *buf)
     return 0;
   }
 
-  int ret = 0;
-  share->lock();
   if (share->write_rows(&row, 1) != 0) {
-    ret = HA_ERR_RECORD_FILE_FULL;
+    return HA_ERR_RECORD_FILE_FULL;
   }
-  share->unlock();
-  if (ret == 0) {
-    share->wake_listener();
-  }
-  return ret;
+  share->wake_listener();
+  return 0;
 }
 
 int ha_queue::update_row(const uchar *old_data __attribute__((unused)),
@@ -891,8 +898,8 @@ int ha_queue::delete_row(const uchar *buf __attribute__((unused)))
     return HA_ERR_RECORD_DELETED;
   }
   share->erase_row(pos, true);
+  // unlock in erase_row
   
-  share->unlock();
   return 0;
 }
 
