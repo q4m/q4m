@@ -136,6 +136,8 @@ public:
   THR_LOCK *get_store_lock() { return &store_lock; }
   const queue_file_header_t *header() const { return &_header; }
   off_t reset_owner(pthread_t owner);
+  int write_rows(queue_row_t **row, int cnt);
+  int erase_row(off_t off, bool already_locked);
   /* functions below requires lock */
   const void *read_cache(off_t off, ssize_t size, bool populate_cache);
   ssize_t read(void *data, off_t off, ssize_t size, bool populate_cache);
@@ -156,8 +158,6 @@ public:
   int pwrite(const void *data, off_t off, size_t size);
   int next(off_t *off);
   off_t get_owned_row(pthread_t owner, bool remove = false);
-  int write_rows(queue_row_t **row, int cnt);
-  int erase_row(off_t off, bool sync);
   void sync(bool update_header);
   pthread_t find_owner(off_t off);
   off_t assign_owner(pthread_t owner);
