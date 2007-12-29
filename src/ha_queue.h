@@ -98,7 +98,7 @@ class queue_share_t {
   char *table_name;
   uint table_name_length;
   
-  pthread_mutex_t mutex;
+  pthread_mutex_t mutex, append_mutex;
   THR_LOCK store_lock;
   
   enum {

@@ -153,6 +153,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   strmov(share->table_name, table_name);
   share->table_name_length = table_name_length;
   pthread_mutex_init(&share->mutex, MY_MUTEX_INIT_FAST);
+  pthread_mutex_init(&share->append_mutex, MY_MUTEX_INIT_FAST);
   thr_lock_init(&share->store_lock);
   share->cache.off = 0;
   new (&share->rows_owned) queue_rows_owned_t();
@@ -192,6 +193,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   pthread_cond_destroy(&share->queue_cond);
   share->rows_owned.~list();
   thr_lock_delete(&share->store_lock);
+  pthread_mutex_destroy(&share->append_mutex);
   pthread_mutex_destroy(&share->mutex);
   my_free(reinterpret_cast<uchar*>(share), MYF(0));
  ERR_RETURN:
@@ -212,6 +214,7 @@ void queue_share_t::release()
     pthread_cond_destroy(&queue_cond);
     rows_owned.~list();
     thr_lock_delete(&store_lock);
+    pthread_mutex_destroy(&append_mutex);
     pthread_mutex_destroy(&mutex);
     my_free(reinterpret_cast<uchar*>(this), MYF(0));
   }
@@ -360,6 +363,9 @@ int queue_share_t::write_rows(queue_row_t **rows, int cnt)
     wlen += iov[i].iov_len = rows[i]->next(0);
   }
   
+  /* writer lock */
+  pthread_mutex_lock(&append_mutex);
+  
   /* lock */
   lock();
   /* extend the file by certain amount for speed */
@@ -370,6 +376,7 @@ int queue_share_t::write_rows(queue_row_t **rows, int cnt)
 	|| ::write(fd, "", 1) != 1
 	|| lseek(fd, _header.end(), SEEK_SET) == -1) {
       unlock();
+      pthread_mutex_unlock(&append_mutex);
       delete [] iov;
       return -1;
     }
@@ -391,6 +398,9 @@ int queue_share_t::write_rows(queue_row_t **rows, int cnt)
   lock();
   _header.set_end(_header.end() + wlen);
   unlock();
+  
+  /* writer unlock */
+  pthread_mutex_unlock(&append_mutex);
   
   delete [] iov;
   return 0;
