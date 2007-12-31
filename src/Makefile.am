@@ -1,4 +1,4 @@
-EXTRA_DIST=	ha_queue.h
+EXTRA_DIST=	ha_queue.h adler32.c
 INCLUDES=	$(MYSQL_INC)
 noinst_HEADER=	ha_queue.h
 

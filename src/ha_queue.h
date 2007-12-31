@@ -24,9 +24,9 @@ class queue_share_t;
 
 class queue_row_t {
   /* size is stored in the lower 30 bits, while upper 2 bits are used for
-   * attributes.  also, lower 30 bits of checksum will be stored instead
-   * of a size of a value if attr==attr_is_checksum, in which case there
-   * would be no data */
+   * attributes.  if type == type_checksum, lower 30 bits adler32 is stored
+   * in _size, and size of the checksum is stored in the body in type off_t.
+   */
   unsigned _size;
   uchar _bytes[1];
 public:
@@ -39,9 +39,9 @@ public:
     max_size      = ~type_mask
   };
   queue_row_t() {} // build uninitialized
-  queue_row_t(unsigned size_or_mask, unsigned type = type_row) {
-    assert((size_or_mask & type_mask) == 0);
-    _size = size_or_mask | type;
+  queue_row_t(unsigned size) {
+    assert((size & type_mask) == 0);
+    _size = size | type_row;
   }
   unsigned size() const {
     // NOTE: does not check if the row isn't checksum
@@ -61,10 +61,16 @@ public:
   static size_t header_size() {
     return offsetof(queue_row_t, _bytes[0]);
   }
+  static size_t checksum_size() {
+    return header_size() + sizeof(off_t);
+  }
   off_t next(off_t off) {
     return off + header_size()
-      + (type() != type_checksum ? size() : 0);
+      + (type() != type_checksum ? size() : sizeof(off_t));
   }
+  off_t validate_checksum(int fd, off_t off);
+  // my_free should be used on deallocation
+  static queue_row_t *create_checksum(const iovec* iov, int iovcnt);
 private:
   queue_row_t(const queue_row_t&);
   queue_row_t& operator=(const queue_row_t&);
@@ -72,18 +78,21 @@ private:
 
 class queue_file_header_t {
 public:
-  static const unsigned MAGIC = 0x6d393031;
+  enum {
+    MAGIC         = 0x304d3451, // 'Q4M0' in little endian
+    attr_is_dirty = 0x1
+  };
 private:
   unsigned _magic;
   unsigned _attr;
   off_t    _end;
   off_t    _begin;
-  unsigned _padding[(4096 - sizeof(unsigned) * 2 - sizeof(off_t) * 2) / sizeof(unsigned)];
+  unsigned _padding[(1024 - sizeof(unsigned) * 2 - sizeof(off_t) * 2) / sizeof(unsigned)];
 public:
   queue_file_header_t();
   unsigned magic() const { return _magic; }
   unsigned attr() const { return _attr; }
-  
+  void set_attr(unsigned a) { _attr = a; }
   off_t end() const { return _end; }
   void set_end(off_t e) { _end = e; }
   off_t begin() const { return _begin; }
@@ -120,6 +129,7 @@ class queue_share_t {
   int num_readers;
   
 public:
+  void fixup_header();
   static uchar *get_share_key(queue_share_t *share, size_t *length,
 			      my_bool not_used);
   static queue_share_t *get_share(const char* table_name);
@@ -158,7 +168,6 @@ public:
   int pwrite(const void *data, off_t off, size_t size);
   int next(off_t *off);
   off_t get_owned_row(pthread_t owner, bool remove = false);
-  void sync(bool update_header);
   pthread_t find_owner(off_t off);
   off_t assign_owner(pthread_t owner);
 private:

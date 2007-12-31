@@ -39,6 +39,7 @@ extern "C" {
 
 #include "ha_queue.h"
 #include <mysql/plugin.h>
+#include "adler32.c"
 
 extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 				 const char *table, const char *ext,
@@ -99,8 +100,53 @@ static void sync_file(int fd)
   }
 }
 
+off_t queue_row_t::validate_checksum(int fd, off_t off)
+{
+  off_t len;
+  
+  /* read checksum size */
+  off += queue_row_t::header_size();
+  if (::pread(fd, &len, sizeof(len), off) != sizeof(len)) {
+    return 0;
+  }
+  off += sizeof(len);
+  /* calc checksum */
+  uchar buf[4096];
+  uint32_t adler = 1;
+  while (len != 0) {
+    size_t bs = min(len, sizeof(buf));
+    if (::pread(fd, buf, bs, off) != bs) {
+      return 0;
+    }
+    adler = adler32(adler, buf, bs);
+    off += bs;
+    len -= bs;
+  }
+  /* compare checksum */
+  return size() == (adler & size_mask) ? off : 0;
+}
+
+queue_row_t *queue_row_t::create_checksum(const iovec* iov, int iovcnt)
+{
+  off_t sz = 0;
+  uint32_t adler = 1;
+  
+  for (int i = 0; i < iovcnt; i++) {
+    adler = adler32(adler, iov[i].iov_base, iov[i].iov_len);
+    sz += iov[i].iov_len;
+  }
+  
+  queue_row_t *row =
+    static_cast<queue_row_t*>(my_malloc(checksum_size(), MYF(0)));
+  assert(row != NULL);
+  row->_size = type_checksum | (adler & size_mask);
+  memcpy(row->_bytes, &sz, sizeof(off_t));
+  
+  return row;
+}
+
 queue_file_header_t::queue_file_header_t()
-  : _magic(MAGIC), _end(sizeof(queue_file_header_t)),
+  : _magic(MAGIC), _attr(0), _end(sizeof(queue_file_header_t)),
     _begin(sizeof(queue_file_header_t))
 {
   memset(_padding, 0, sizeof(_padding));
@@ -108,8 +154,7 @@ queue_file_header_t::queue_file_header_t()
 
 void queue_file_header_t::write(int fd)
 {
-  if (pwrite(fd, &_end, sizeof(_end), offsetof(queue_file_header_t, _end))
-      != sizeof(_end)) {
+  if (pwrite(fd, this, sizeof(*this), 0) != sizeof(*this)) {
     kill_proc("failed to update header\n");
   }
 }
@@ -119,6 +164,44 @@ uchar* queue_share_t::get_share_key(queue_share_t *share, size_t *length,
 {
   *length = share->table_name_length;
   return reinterpret_cast<uchar*>(share->table_name);
+}
+
+void queue_share_t::fixup_header()
+{
+  /* update end */
+  off_t off = _header.end();
+  while (1) {
+    queue_row_t row;
+    if (read(&row, off, queue_row_t::header_size(), true)
+	!= queue_row_t::header_size()) {
+      break;
+    }
+    if (row.type() != queue_row_t::type_checksum) {
+      break;
+    }
+    if ((off = row.validate_checksum(fd, off)) == 0) {
+      break;
+    }
+    _header.set_end(off);
+  }
+  /* update begin */
+  off = _header.begin();
+  while (off < _header.end()) {
+    queue_row_t row;
+    if (read(&row ,off, queue_row_t::header_size(), true)
+	!= queue_row_t::header_size()) {
+      kill_proc("I/O error\n");
+    }
+    if (row.type() == queue_row_t::type_row) {
+      break;
+    }
+    off = row.next(off);
+  }
+  _header.set_begin(off);
+  /* save */
+  _header.set_attr(_header.attr() & ~queue_file_header_t::attr_is_dirty);
+  _header.write(fd);
+  sync_file(fd);
 }
 
 queue_share_t *queue_share_t::get_share(const char *table_name)
@@ -173,7 +256,15 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   if (share->_header.magic() != queue_file_header_t::MAGIC) {
     goto ERR_AFTER_FILEOPEN;
   }
-  // TODO: check consistency and update begin, end, set dirty flag
+  /* sanity check */
+  if ((share->_header.attr() & queue_file_header_t::attr_is_dirty) != 0) {
+    share->fixup_header();
+  }
+  /* set dirty flag */
+  share->_header.set_attr(share->_header.attr()
+			  | queue_file_header_t::attr_is_dirty);
+  share->_header.write(share->fd);
+  sync_file(share->fd);
   /* seek to end position for inserts */
   if (lseek(share->fd, share->_header.end(), SEEK_SET) == -1) {
     goto ERR_AFTER_FILEOPEN;
@@ -209,7 +300,9 @@ void queue_share_t::release()
     hash_delete(&queue_open_tables, reinterpret_cast<uchar*>(this));
     _header.write(fd);
     sync_file(fd);
-    // TODO: clear dirty flag in header
+    _header.set_attr(_header.attr() & ~queue_file_header_t::attr_is_dirty);
+    _header.write(fd);
+    sync_file(fd);
     close(fd);
     pthread_cond_destroy(&queue_cond);
     rows_owned.~list();
@@ -354,14 +447,17 @@ off_t queue_share_t::get_owned_row(pthread_t owner, bool remove)
 
 int queue_share_t::write_rows(queue_row_t **rows, int cnt)
 {
-  iovec *iov = new iovec [cnt];
+  iovec *iov = new iovec [cnt + 1];
   off_t wlen = 0;
   
   /* fill in iovec */
   for (size_t i = 0; i < cnt; i++) {
-    iov[i].iov_base = rows[i];
-    wlen += iov[i].iov_len = rows[i]->next(0);
+    iov[i + 1].iov_base = rows[i];
+    wlen += iov[i + 1].iov_len = rows[i]->next(0);
   }
+  /* set checksum */
+  iov[0].iov_base = queue_row_t::create_checksum(iov + 1, cnt);
+  wlen += iov[0].iov_len = static_cast<queue_row_t*>(iov[0].iov_base)->next(0);
   
   /* writer lock */
   pthread_mutex_lock(&append_mutex);
@@ -377,13 +473,14 @@ int queue_share_t::write_rows(queue_row_t **rows, int cnt)
 	|| lseek(fd, _header.end(), SEEK_SET) == -1) {
       unlock();
       pthread_mutex_unlock(&append_mutex);
+      my_free(iov[0].iov_base, MYF(0));
       delete [] iov;
       return -1;
     }
   }
   /* write */
   assert(wlen < INT_MAX); // TODO: fix limitation for 32-bit systems
-  if (writev(iov, cnt, wlen) != 0) {
+  if (writev(iov, cnt + 1, wlen) != 0) {
     kill_proc("failed to write data to allocate file area\n");
   }
   /* unlock */
@@ -396,12 +493,16 @@ int queue_share_t::write_rows(queue_row_t **rows, int cnt)
   }
   /* update end */
   lock();
+  if (_header.begin() == _header.end()) {
+    _header.set_begin(_header.begin() + queue_row_t::checksum_size());
+  }
   _header.set_end(_header.end() + wlen);
   unlock();
   
   /* writer unlock */
   pthread_mutex_unlock(&append_mutex);
   
+  my_free(iov[0].iov_base, MYF(0));
   delete [] iov;
   return 0;
 }
@@ -432,6 +533,7 @@ int queue_share_t::erase_row(off_t off, bool already_locked)
   lock();
   if (off == _header.begin()) {
     if (next(&off) != 0) {
+      unlock();
       return -1;
     }
     _header.set_begin(off);
@@ -439,19 +541,6 @@ int queue_share_t::erase_row(off_t off, bool already_locked)
   unlock();
   
   return 0;
-}
-
-void queue_share_t::sync(bool update_header)
-{
-  switch (mode) {
-  case e_sync:
-    sync_file(fd);
-    if (update_header) {
-      _header.write(fd);
-      sync_file(fd);
-    }
-    break;
-  }
 }
 
 pthread_t queue_share_t::find_owner(off_t off)
