@@ -48,8 +48,8 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 
 using namespace std;
 
-#define DO_COMPACT(all, free) ((all) >= 4*1024*1024 && (free) * 2 >= (all))
-#define EXPAND_BY (65536)
+#define DO_COMPACT(all, free) ((all) >= 16777216 && (free) * 2 >= (all))
+#define EXPAND_BY (1048576)
 #define Q4M ".Q4M"
 #define Q4T ".Q4T"
 
@@ -188,7 +188,7 @@ void queue_share_t::fixup_header()
   off = _header.begin();
   while (off < _header.end()) {
     queue_row_t row;
-    if (read(&row ,off, queue_row_t::header_size(), true)
+    if (read(&row, off, queue_row_t::header_size(), true)
 	!= queue_row_t::header_size()) {
       kill_proc("I/O error\n");
     }
@@ -242,6 +242,10 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   new (&share->rows_owned) queue_rows_owned_t();
   pthread_cond_init(&share->queue_cond, NULL);
   share->num_readers = 0;
+  pthread_cond_init(&share->writer_cond, NULL);
+  share->writer_exit = false;
+  share->append_list = new append_list_t();
+  share->remove_list = new remove_list_t();
   /* open file */
   fn_format(filename, share->table_name, "", Q4M,
 	    MY_REPLACE_EXT | MY_UNPACK_FILENAME);
@@ -269,18 +273,29 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   if (lseek(share->fd, share->_header.end(), SEEK_SET) == -1) {
     goto ERR_AFTER_FILEOPEN;
   }
+  /* start writer thread */
+  if (pthread_create(&share->writer_thread, NULL, _writer_start, share) != 0) {
+    goto ERR_AFTER_FILEOPEN;
+  }
   /* add to open_tables */
   if (my_hash_insert(&queue_open_tables, reinterpret_cast<uchar*>(share))) {
-    goto ERR_AFTER_FILEOPEN;
+    goto ERR_AFTER_WRITER_START;
   }
   
   /* success */
   pthread_mutex_unlock(&g_mutex);
   return share;
   
+ ERR_AFTER_WRITER_START:
+  share->writer_exit = true;
+  pthread_cond_signal(&share->writer_cond);
+  pthread_join(share->writer_thread, NULL);
  ERR_AFTER_FILEOPEN:
   close(share->fd);
  ERR_ON_FILEOPEN:
+  delete share->remove_list;
+  delete share->append_list;
+  pthread_cond_destroy(&share->writer_cond);
   pthread_cond_destroy(&share->queue_cond);
   share->rows_owned.~list();
   thr_lock_delete(&share->store_lock);
@@ -298,12 +313,20 @@ void queue_share_t::release()
   
   if (--use_count == 0) {
     hash_delete(&queue_open_tables, reinterpret_cast<uchar*>(this));
+    writer_exit = true;
+    pthread_cond_signal(&writer_cond);
+    if (pthread_join(writer_thread, NULL) != 0) {
+      kill_proc("failed to join writer thread\n");
+    }
     _header.write(fd);
     sync_file(fd);
     _header.set_attr(_header.attr() & ~queue_file_header_t::attr_is_dirty);
     _header.write(fd);
     sync_file(fd);
     close(fd);
+    delete remove_list;
+    delete append_list;
+    pthread_cond_destroy(&writer_cond);
     pthread_cond_destroy(&queue_cond);
     rows_owned.~list();
     thr_lock_delete(&store_lock);
@@ -320,10 +343,7 @@ void queue_share_t::unlock_reader()
   lock();
   
   if (--num_readers == 0) {
-    if (DO_COMPACT(_header.end() - sizeof(_header),
-		   _header.begin() - sizeof(_header))) {
-      compact(); // how should we handle the error?
-    }
+    pthread_cond_signal(&writer_cond);
   }
   
   unlock();
@@ -346,6 +366,21 @@ off_t queue_share_t::reset_owner(pthread_t owner)
   
   unlock();
   return off;
+}
+
+int queue_share_t::write_rows(queue_row_t **rows, int cnt)
+{
+  append_t a(rows, cnt);
+  
+  pthread_mutex_lock(&mutex);
+  append_list->push_back(&a);
+  pthread_cond_signal(&writer_cond);
+  do {
+    pthread_cond_wait(&a.cond, &mutex);
+  } while (a.err == -1);
+  pthread_mutex_unlock(&mutex);
+  
+  return a.err;
 }
 
 const void *queue_share_t::read_cache(off_t off, ssize_t size,
@@ -377,28 +412,6 @@ ssize_t queue_share_t::read(void *data, off_t off, ssize_t size,
     return size;
   }
   return pread(fd, data, size, off);
-}
-
-int queue_share_t::writev(const iovec* iov, int iovcnt, ssize_t len)
-{
-  if (::writev(fd, iov, iovcnt) != len) {
-    return -1;
-  }
-  off_t off = _header.end();
-  for (int i = 0; i < iovcnt; i++) {
-    update_cache(iov[i].iov_base, off, iov[i].iov_len);
-    off += iov[i].iov_len;
-  }
-  return 0;
-}
-
-int queue_share_t::pwrite(const void *data, off_t off, size_t size)
-{
-  if (::pwrite(fd, data, size, off) != size) {
-    return -1;
-  }
-  update_cache(data, off, size);
-  return 0;
 }
 
 int queue_share_t::next(off_t *off)
@@ -445,102 +458,17 @@ off_t queue_share_t::get_owned_row(pthread_t owner, bool remove)
   return 0;
 }
 
-int queue_share_t::write_rows(queue_row_t **rows, int cnt)
+int queue_share_t::remove_rows(off_t *offsets, int cnt)
 {
-  iovec *iov = new iovec [cnt + 1];
-  off_t wlen = 0;
+  remove_t r(offsets, cnt);
   
-  /* fill in iovec */
-  for (size_t i = 0; i < cnt; i++) {
-    iov[i + 1].iov_base = rows[i];
-    wlen += iov[i + 1].iov_len = rows[i]->next(0);
-  }
-  /* set checksum */
-  iov[0].iov_base = queue_row_t::create_checksum(iov + 1, cnt);
-  wlen += iov[0].iov_len = static_cast<queue_row_t*>(iov[0].iov_base)->next(0);
+  remove_list->push_back(&r);
+  pthread_cond_signal(&writer_cond);
+  do {
+    pthread_cond_wait(&r.cond, &mutex);
+  } while (r.err == -1);
   
-  /* writer lock */
-  pthread_mutex_lock(&append_mutex);
-  
-  /* lock */
-  lock();
-  /* extend the file by certain amount for speed */
-  if ((_header.end() - 1) / EXPAND_BY != (_header.end() + wlen) / EXPAND_BY) {
-    if (lseek(fd, ((_header.end() + wlen) / EXPAND_BY + 1) * EXPAND_BY - 1,
-	      SEEK_SET)
-	== -1
-	|| ::write(fd, "", 1) != 1
-	|| lseek(fd, _header.end(), SEEK_SET) == -1) {
-      unlock();
-      pthread_mutex_unlock(&append_mutex);
-      my_free(iov[0].iov_base, MYF(0));
-      delete [] iov;
-      return -1;
-    }
-  }
-  /* write */
-  assert(wlen < INT_MAX); // TODO: fix limitation for 32-bit systems
-  if (writev(iov, cnt + 1, wlen) != 0) {
-    kill_proc("failed to write data to allocate file area\n");
-  }
-  /* unlock */
-  unlock();
-  /* sync data */
-  switch (mode) {
-  case e_sync:
-    sync_file(fd);
-    break;
-  }
-  /* update end */
-  lock();
-  if (_header.begin() == _header.end()) {
-    _header.set_begin(_header.begin() + queue_row_t::checksum_size());
-  }
-  _header.set_end(_header.end() + wlen);
-  unlock();
-  
-  /* writer unlock */
-  pthread_mutex_unlock(&append_mutex);
-  
-  my_free(iov[0].iov_base, MYF(0));
-  delete [] iov;
-  return 0;
-}
-
-int queue_share_t::erase_row(off_t off, bool already_locked)
-{
-  queue_row_t row;
-  
-  if (! already_locked) {
-    lock();
-  }
-  if (read(&row, off, queue_row_t::header_size(), false)
-      != queue_row_t::header_size()) {
-    unlock();
-    return -1;
-  }
-  row.set_type(queue_row_t::type_removed);
-  if (pwrite(&row, off, queue_row_t::header_size()) != 0) {
-    unlock();
-    return -1;
-  }
-  unlock();
-  switch (mode) {
-  case e_sync:
-    sync_file(fd);
-    break;
-  }
-  lock();
-  if (off == _header.begin()) {
-    if (next(&off) != 0) {
-      unlock();
-      return -1;
-    }
-    _header.set_begin(off);
-  }
-  unlock();
-  
-  return 0;
+  return r.err;
 }
 
 pthread_t queue_share_t::find_owner(off_t off)
@@ -568,6 +496,160 @@ off_t queue_share_t::assign_owner(pthread_t owner)
     }
   }
   return 0;
+}
+
+static void close_append_list(queue_share_t::append_list_t *l, int err)
+{
+  for (queue_share_t::append_list_t::iterator i= l->begin();
+       i != l->end();
+       ++i) {
+    (*i)->err = err;
+    pthread_cond_signal(&(*i)->cond);
+  }
+  delete l;
+}
+
+int queue_share_t::writer_do_append(append_list_t *l)
+{
+  /* build iovec */
+  vector<iovec> iov;
+  off_t total_len = 0;
+  iov.push_back(iovec());
+  for (append_list_t::iterator i = l->begin(); i != l->end(); ++i) {
+    for (int j = 0; j < (*i)->cnt; j++) {
+      iov.push_back(iovec());
+      iov.back().iov_base = (*i)->rows[j];
+      total_len += iov.back().iov_len = (*i)->rows[j]->next(0);
+    }
+  }
+  iov[0].iov_base =
+    queue_row_t::create_checksum(&iov.front() + 1, iov.size() - 1);
+  total_len += iov[0].iov_len =
+    static_cast<queue_row_t*>(iov[0].iov_base)->next(0);
+  /* TODO: fix this limitation on 32-bit archs.  note that it should be fixed
+   * in at a much higher level since we need to commit a SQL statement in a
+   * single system call under current file format */
+  assert(total_len < INT_MAX);
+  /* expand if necessary */
+  if ((_header.end() - 1) / EXPAND_BY
+      != (_header.end() + total_len) / EXPAND_BY) {
+    off_t new_len =
+      ((_header.end() + total_len) / EXPAND_BY + 1) * EXPAND_BY;
+    if (lseek(fd, new_len - 1, SEEK_SET) == -1
+	|| write(fd, "", 1) != 1
+	|| lseek(fd, _header.end(), SEEK_SET) == -1) {
+      /* expansion failed */
+      return HA_ERR_RECORD_FILE_FULL;
+    }
+  }
+  /* write and sync */
+  if (writev(fd, &iov.front(), iov.size()) != total_len) {
+    my_free(iov[0].iov_base, MYF(0));
+    return HA_ERR_CRASHED_ON_USAGE;
+  }
+  my_free(iov[0].iov_base, MYF(0));
+  sync_file(fd);
+  /* invalidate cache and update _begin, _end */
+  pthread_mutex_lock(&mutex);
+  cache.off = 0;
+  if (_header.begin() == _header.end()) {
+    _header.set_begin(_header.begin() + iov[0].iov_len);
+  }
+  _header.set_end(_header.end() + total_len);
+  pthread_mutex_unlock(&mutex);
+  
+  return 0;
+}
+
+void queue_share_t::writer_do_remove(remove_list_t* l)
+{
+  remove_list_t::iterator i;
+  int err = 0;
+  
+  for (remove_list_t::iterator i = l->begin(); i != l->end(); ++i) {
+    pthread_mutex_lock(&mutex);
+    for (int j = 0; err == 0 && j < (*i)->cnt; j++) {
+      queue_row_t row;
+      off_t off = (*i)->offsets[j];
+      if (read(&row, off, queue_row_t::header_size(), false)
+	  == queue_row_t::header_size()) {
+	row.set_type(queue_row_t::type_removed);
+	if (pwrite(fd, &row, queue_row_t::header_size(), off)
+	    != queue_row_t::header_size()) {
+	  err = HA_ERR_CRASHED_ON_USAGE;
+	}
+	update_cache(&row, off, queue_row_t::header_size());
+	if (_header.begin() == off) {
+	  if (next(&off) == 0) {
+	    _header.set_begin(off);
+	  } else {
+	    err = HA_ERR_CRASHED_ON_USAGE;
+	  }
+	}
+      } else {
+	err = HA_ERR_CRASHED_ON_USAGE;
+      }
+    }
+    pthread_mutex_unlock(&mutex);
+    (*i)->err = err;
+    pthread_cond_signal(&(*i)->cond);
+  }
+}
+
+void *queue_share_t::writer_start()
+{
+  pthread_mutex_lock(&mutex);
+  
+  while (1) {
+    remove_list_t *rl = NULL;
+    append_list_t *al = NULL;
+    int err = 0;
+    /* wait for signal if we do not have any pending writes */
+    while (remove_list->size() == 0 && append_list->size() == 0) {
+      if (writer_exit) {
+	goto EXIT;
+      } else if (num_readers == 0
+		 && DO_COMPACT(_header.end() - sizeof(_header),
+			       _header.begin() - sizeof(_header))) {
+	compact();
+      } else {
+	pthread_cond_wait(&writer_cond, &mutex);
+      }
+    }
+    /* detach operation lists */
+    if (remove_list->size() != 0) {
+      rl = remove_list;
+      remove_list = new remove_list_t();
+    }
+    if (append_list->size() != 0) {
+      al = append_list;
+      append_list = new append_list_t();
+    }
+    /* do the task and send back the results
+     * TODO: we should use a different log file for storing removals since
+     * multiple removes need to be commited via a single system call */
+    if (rl != NULL || al != NULL) {
+      pthread_mutex_unlock(&mutex);
+      int err = 0;
+      if (rl != NULL) {
+	writer_do_remove(rl);
+	delete rl;
+      }
+      if (al != NULL) {
+	if ((err = writer_do_append(al)) != 0) {
+	  sync_file(fd);
+	}
+	close_append_list(al, err);
+      } else {
+	sync_file(fd);
+      }
+      pthread_mutex_lock(&mutex);
+    }
+  }
+  
+ EXIT:
+  pthread_mutex_unlock(&mutex);
+  return NULL;
 }
 
 static int copy_file_content(int src_fd, off_t begin, off_t end, int dest_fd)
@@ -676,8 +758,8 @@ static void erase_owned()
       != NULL) {
     share->lock();
     off_t off = share->get_owned_row(pthread_self(), true);
-    share->erase_row(off, true);
-    // unlock in erase_row
+    share->remove_rows(&off, 1);
+    share->unlock();
     share->release();
     pthread_setspecific(share_key, NULL);
   }
@@ -736,12 +818,15 @@ ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
    pos(),
    row(NULL),
    row_max_size(0),
-   bulk_insert_rows(NULL)
+   bulk_insert_rows(NULL),
+   bulk_delete_rows(NULL)
 {
 }
 
 ha_queue::~ha_queue()
 {
+  delete bulk_delete_rows;
+  bulk_delete_rows = NULL;
   if (bulk_insert_rows != NULL) {
     free_bulk_insert_rows();
   }
@@ -942,12 +1027,9 @@ int ha_queue::end_bulk_insert()
   
   if (bulk_insert_rows != NULL) {
     if (bulk_insert_rows->size() != 0) {
-      if (share->write_rows(&bulk_insert_rows->front(),
-			    bulk_insert_rows->size())
-	  != 0) {
-	ret = HA_ERR_RECORD_FILE_FULL;
-      }
-      if (ret == 0) {
+      if ((ret = share->write_rows(&bulk_insert_rows->front(),
+				   bulk_insert_rows->size()))
+	  == 0) {
 	for (size_t i = 0; i < bulk_insert_rows->size(); i++) {
 	  share->wake_listener();
 	}
@@ -955,6 +1037,30 @@ int ha_queue::end_bulk_insert()
       free_bulk_insert_rows();
     }
   }
+  
+  return ret;
+}
+
+bool ha_queue::start_bulk_delete()
+{
+  assert(bulk_delete_rows == NULL);
+  bulk_delete_rows = new vector<off_t>();
+  return false;
+}
+
+int ha_queue::end_bulk_delete()
+{
+  int ret = 0;
+  
+  assert(bulk_delete_rows != NULL);
+  if (bulk_delete_rows->size() != 0) {
+    share->lock();
+    ret =
+      share->remove_rows(&bulk_delete_rows->front(), bulk_delete_rows->size());
+    share->unlock();
+  }
+  delete bulk_delete_rows;
+  bulk_delete_rows = NULL;
   
   return ret;
 }
@@ -973,11 +1079,11 @@ int ha_queue::write_row(uchar *buf)
     }
     return 0;
   }
-
-  if (share->write_rows(&row, 1) != 0) {
-    return HA_ERR_RECORD_FILE_FULL;
+  
+  int err = share->write_rows(&row, 1);
+  if (err == 0) {
+    share->wake_listener();
   }
-  share->wake_listener();
   return 0;
 }
 
@@ -989,17 +1095,22 @@ int ha_queue::update_row(const uchar *old_data __attribute__((unused)),
 
 int ha_queue::delete_row(const uchar *buf __attribute__((unused)))
 {
-  share->lock();
+  int err = 0;
   
-  pthread_t owner = share->find_owner(pos);
-  if (owner != 0 && owner != pthread_self()) {
+  if (bulk_delete_rows != NULL) {
+    bulk_delete_rows->push_back(pos);
+  } else {
+    share->lock();
+    pthread_t owner = share->find_owner(pos);
+    if (owner != 0 && owner != pthread_self()) {
+      share->unlock();
+      return HA_ERR_RECORD_DELETED;
+    }
+    err = share->remove_rows(&pos, 1);
     share->unlock();
-    return HA_ERR_RECORD_DELETED;
   }
-  share->erase_row(pos, true);
-  // unlock in erase_row
   
-  return 0;
+  return err;
 }
 
 void ha_queue::unpack_row(uchar *buf)

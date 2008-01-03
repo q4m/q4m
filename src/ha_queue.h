@@ -103,6 +103,42 @@ public:
 typedef std::list<std::pair<pthread_t, off_t> > queue_rows_owned_t;
 
 class queue_share_t {
+  
+ public:
+  struct append_t {
+    queue_row_t **rows;
+    int cnt;
+    int err; /* -1 if not completed, otherwise HA_ERR_XXX or 0 */
+    pthread_cond_t cond;
+    append_t(queue_row_t **r, int c)
+    : rows(r), cnt(c), err(-1) {
+      pthread_cond_init(&cond, NULL);
+    }
+    ~append_t() {
+      pthread_cond_destroy(&cond);
+    }
+  private:
+    append_t(const append_t&);
+    append_t& operator=(const append_t&);
+  };
+  typedef std::vector<append_t*> append_list_t;
+  
+  struct remove_t {
+    off_t *offsets;
+    int cnt;
+    int err; /* -1 if not completed, otherwise HA_ERR_XXX or 0 */
+    pthread_cond_t cond;
+    remove_t(off_t *o, int c)
+    : offsets(o), cnt(c), err(-1) {
+      pthread_cond_init(&cond, NULL);
+    }
+    ~remove_t() {
+      pthread_cond_destroy(&cond);
+    }
+  };
+  typedef std::vector<remove_t*> remove_list_t;
+  
+ private:
   uint use_count;
   char *table_name;
   uint table_name_length;
@@ -128,6 +164,12 @@ class queue_share_t {
   pthread_cond_t queue_cond;
   int num_readers;
   
+  pthread_t writer_thread;
+  pthread_cond_t writer_cond;
+  bool writer_exit;
+  append_list_t *append_list;
+  remove_list_t *remove_list;
+  
 public:
   void fixup_header();
   static uchar *get_share_key(queue_share_t *share, size_t *length,
@@ -147,7 +189,6 @@ public:
   const queue_file_header_t *header() const { return &_header; }
   off_t reset_owner(pthread_t owner);
   int write_rows(queue_row_t **row, int cnt);
-  int erase_row(off_t off, bool already_locked);
   /* functions below requires lock */
   const void *read_cache(off_t off, ssize_t size, bool populate_cache);
   ssize_t read(void *data, off_t off, ssize_t size, bool populate_cache);
@@ -164,13 +205,18 @@ public:
 	     min(size - (cache.off - off), sizeof(cache.buf)));
     }
   }
-  int writev(const iovec *iov, int iovcnt, ssize_t len);
-  int pwrite(const void *data, off_t off, size_t size);
   int next(off_t *off);
   off_t get_owned_row(pthread_t owner, bool remove = false);
+  int remove_rows(off_t *offsets, int cnt);
   pthread_t find_owner(off_t off);
   off_t assign_owner(pthread_t owner);
 private:
+  int writer_do_append(append_list_t *l);
+  void writer_do_remove(remove_list_t *l);
+  void *writer_start();
+  static void *_writer_start(void* self) {
+    static_cast<queue_share_t*>(self)->writer_start();
+  }
   int compact();
   queue_share_t();
   ~queue_share_t();
@@ -186,7 +232,8 @@ class ha_queue: public handler
   off_t pos;
   queue_row_t *row;
   size_t row_max_size; /* not including header */
-  std::vector<queue_row_t*>* bulk_insert_rows;
+  std::vector<queue_row_t*> *bulk_insert_rows;
+  std::vector<off_t> *bulk_delete_rows;
   
  public:
   ha_queue(handlerton *hton, TABLE_SHARE *table_arg);
@@ -224,6 +271,9 @@ class ha_queue: public handler
   
   void start_bulk_insert(ha_rows rows);
   int end_bulk_insert();
+  
+  bool start_bulk_delete();
+  int end_bulk_delete();
   
   int write_row(uchar *buf);
   int update_row(const uchar *old_data, uchar *new_data);
