@@ -29,10 +29,45 @@ else
   DTRACEFLAGS="-64"
 fi
 
-UNAME=`uname -s`
-if test "$UNAME" = "Darwin" ; then
-   AC_DEFINE([FDATASYNC_USE_FCNTL],1,[use fcntl for fdatasysnc])
+AC_ARG_WITH(debug,
+    [   --with-debug            enable debugging, should match the configuration
+                           used to compile mysql ],
+    [
+if test "$withval" = "yes"
+then
+    CFLAGS="$CFLAGS -g -DSAFE_MUTEX"
+    CXXFLAGS="$CXXFLAGS -g -DSAFE_MUTEX"
 fi
+],
+    [ with_debug=no ])
+
+AC_ARG_WITH(sync,
+    [   --with-sync=yes         commit to disk at checkpoints (default)
+   --with-sync=no          do not commit explicitly to disk
+   --with-sync=fsync       use fsync instead of fdatasync
+   --with-sync=fcntl       use fcntl(F_FULLFSYNC) instead of fdatasync ],
+    [  with_sync=$withval ],
+    [ with_sync=yes ])
+if test "$with_sync" = "yes"
+then
+    UNAME=`uname -s`
+    if test "$UNAME" = "Darwin" ; then
+        with_sync="fcntl"
+    else
+        with_sync="fdatasync"
+    fi
+fi
+case "$with_sync" in
+fcntl)
+    AC_DEFINE([FDATASYNC_USE_FCNTL],1,[use fcntl for fdatasysnc])
+    ;;
+fsync)
+    AC_DEFINE([FDATASYNC_USE_FSYNC],1,[use fsync instead of fdatasync])
+    ;;
+no)
+    AC_DEFINE([FDATASYNC_SKIP],1,[do not sync at checkpoints])
+    ;;
+esac
 
 AC_C_CONST
 AC_TYPE_SIZE_T

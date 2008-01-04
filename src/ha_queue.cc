@@ -48,7 +48,9 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 
 using namespace std;
 
-#define DO_COMPACT(all, free) ((all) >= 16777216 && (free) * 2 >= (all))
+#define COMPACT_THRESHOLD 16777216
+#define DO_COMPACT(all, free) \
+    ((all) >= COMPACT_THRESHOLD && (free) * 2 >= (all))
 #define EXPAND_BY (1048576)
 #define Q4M ".Q4M"
 #define Q4T ".Q4T"
@@ -92,6 +94,10 @@ static void sync_file(int fd)
   if (
 #ifdef FDATASYNC_USE_FCNTL
       fcntl(fd, F_FULLFSYNC, 0) != 0
+#elif defined(FDATASYNC_USE_FSYNC)
+      fsync(fd) != 0
+#elif defined(FDATASYNC_SKIP)
+      0
 #else
       fdatasync(fd) != 0
 #endif
@@ -236,7 +242,6 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   strmov(share->table_name, table_name);
   share->table_name_length = table_name_length;
   pthread_mutex_init(&share->mutex, MY_MUTEX_INIT_FAST);
-  pthread_mutex_init(&share->append_mutex, MY_MUTEX_INIT_FAST);
   thr_lock_init(&share->store_lock);
   share->cache.off = 0;
   new (&share->rows_owned) queue_rows_owned_t();
@@ -299,7 +304,6 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   pthread_cond_destroy(&share->queue_cond);
   share->rows_owned.~list();
   thr_lock_delete(&share->store_lock);
-  pthread_mutex_destroy(&share->append_mutex);
   pthread_mutex_destroy(&share->mutex);
   my_free(reinterpret_cast<uchar*>(share), MYF(0));
  ERR_RETURN:
@@ -330,7 +334,6 @@ void queue_share_t::release()
     pthread_cond_destroy(&queue_cond);
     rows_owned.~list();
     thr_lock_delete(&store_lock);
-    pthread_mutex_destroy(&append_mutex);
     pthread_mutex_destroy(&mutex);
     my_free(reinterpret_cast<uchar*>(this), MYF(0));
   }
@@ -341,11 +344,11 @@ void queue_share_t::release()
 void queue_share_t::unlock_reader()
 {
   lock();
-  
-  if (--num_readers == 0) {
+  if (--num_readers == 0
+      && DO_COMPACT(_header.end() - sizeof(_header),
+		    _header.begin() - sizeof(_header))) {
     pthread_cond_signal(&writer_cond);
   }
-  
   unlock();
 }
 
@@ -368,15 +371,15 @@ off_t queue_share_t::reset_owner(pthread_t owner)
   return off;
 }
 
-int queue_share_t::write_rows(queue_row_t **rows, int cnt)
+int queue_share_t::write_rows(queue_row_t **rows, int cnt, pthread_cond_t *cond)
 {
-  append_t a(rows, cnt);
+  append_t a(rows, cnt, cond);
   
   pthread_mutex_lock(&mutex);
   append_list->push_back(&a);
   pthread_cond_signal(&writer_cond);
   do {
-    pthread_cond_wait(&a.cond, &mutex);
+    pthread_cond_wait(cond, &mutex);
   } while (a.err == -1);
   pthread_mutex_unlock(&mutex);
   
@@ -389,7 +392,8 @@ const void *queue_share_t::read_cache(off_t off, ssize_t size,
   if (size > sizeof(cache.buf)) {
     return NULL;
   }
-  if (cache.off <= off && off + size <= cache.off + sizeof(cache.buf)) {
+  if (cache.off != 0
+      && cache.off <= off && off + size <= cache.off + sizeof(cache.buf)) {
     return cache.buf + off - cache.off;
   }
   if (! populate_cache) {
@@ -458,14 +462,14 @@ off_t queue_share_t::get_owned_row(pthread_t owner, bool remove)
   return 0;
 }
 
-int queue_share_t::remove_rows(off_t *offsets, int cnt)
+int queue_share_t::remove_rows(off_t *offsets, int cnt, pthread_cond_t *cond)
 {
-  remove_t r(offsets, cnt);
+  remove_t r(offsets, cnt, cond);
   
   remove_list->push_back(&r);
   pthread_cond_signal(&writer_cond);
   do {
-    pthread_cond_wait(&r.cond, &mutex);
+    pthread_cond_wait(cond, &mutex);
   } while (r.err == -1);
   
   return r.err;
@@ -504,7 +508,7 @@ static void close_append_list(queue_share_t::append_list_t *l, int err)
        i != l->end();
        ++i) {
     (*i)->err = err;
-    pthread_cond_signal(&(*i)->cond);
+    pthread_cond_signal((*i)->cond);
   }
   delete l;
 }
@@ -547,17 +551,19 @@ int queue_share_t::writer_do_append(append_list_t *l)
     my_free(iov[0].iov_base, MYF(0));
     return HA_ERR_CRASHED_ON_USAGE;
   }
-  my_free(iov[0].iov_base, MYF(0));
   sync_file(fd);
-  /* invalidate cache and update _begin, _end */
+  /* update begin, end, cache */
   pthread_mutex_lock(&mutex);
-  cache.off = 0;
   if (_header.begin() == _header.end()) {
     _header.set_begin(_header.begin() + iov[0].iov_len);
   }
-  _header.set_end(_header.end() + total_len);
+  for (vector<iovec>::const_iterator i = iov.begin(); i != iov.end(); ++i) {
+    update_cache(i->iov_base, _header.end(), i->iov_len);
+    _header.set_end(_header.end() + i->iov_len);
+  }
   pthread_mutex_unlock(&mutex);
   
+  my_free(iov[0].iov_base, MYF(0));
   return 0;
 }
 
@@ -567,6 +573,8 @@ void queue_share_t::writer_do_remove(remove_list_t* l)
   int err = 0;
   
   for (remove_list_t::iterator i = l->begin(); i != l->end(); ++i) {
+    /* lock mutex for each bulk delete, so as to make the deletion atomic to the
+     * deleter (would not be atomic for non-owner selects, but who cares :-o */
     pthread_mutex_lock(&mutex);
     for (int j = 0; err == 0 && j < (*i)->cnt; j++) {
       queue_row_t row;
@@ -592,7 +600,7 @@ void queue_share_t::writer_do_remove(remove_list_t* l)
     }
     pthread_mutex_unlock(&mutex);
     (*i)->err = err;
-    pthread_cond_signal(&(*i)->cond);
+    pthread_cond_signal((*i)->cond);
   }
 }
 
@@ -603,7 +611,6 @@ void *queue_share_t::writer_start()
   while (1) {
     remove_list_t *rl = NULL;
     append_list_t *al = NULL;
-    int err = 0;
     /* wait for signal if we do not have any pending writes */
     while (remove_list->size() == 0 && append_list->size() == 0) {
       if (writer_exit) {
@@ -625,26 +632,22 @@ void *queue_share_t::writer_start()
       al = append_list;
       append_list = new append_list_t();
     }
-    /* do the task and send back the results
-     * TODO: we should use a different log file for storing removals since
-     * multiple removes need to be commited via a single system call */
-    if (rl != NULL || al != NULL) {
-      pthread_mutex_unlock(&mutex);
+    /* do the task and send back the results */
+    pthread_mutex_unlock(&mutex);
+    if (rl != NULL) {
+      writer_do_remove(rl);
+      delete rl;
+    }
+    if (al != NULL) {
       int err = 0;
-      if (rl != NULL) {
-	writer_do_remove(rl);
-	delete rl;
-      }
-      if (al != NULL) {
-	if ((err = writer_do_append(al)) != 0) {
-	  sync_file(fd);
-	}
-	close_append_list(al, err);
-      } else {
+      if ((err = writer_do_append(al)) != 0) {
 	sync_file(fd);
       }
-      pthread_mutex_lock(&mutex);
+      close_append_list(al, err);
+    } else {
+      sync_file(fd);
     }
+    pthread_mutex_lock(&mutex);
   }
   
  EXIT:
@@ -692,7 +695,7 @@ int queue_share_t::compact()
       hdr.set_end(_header.end() - delta);
       break;
     }
-    if (::write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)
+    if (write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)
 	|| copy_file_content(fd, _header.begin(), _header.end(), tmp_fd) != 0) {
       goto ERR_OPEN;
     }
@@ -730,88 +733,6 @@ int queue_share_t::compact()
   return -1;
 }
 
-static queue_share_t* get_share_check(const char* db_table_name)
-{
-  char buf[FN_REFLEN];
-  char path[FN_REFLEN];
-
-  // copy to buf, split to db name and table name, and build filename
-  // FIXME: creates bogus name if db_table_name is too long (but no overruns)
-  strncpy(buf, db_table_name, FN_REFLEN - 1);
-  buf[FN_REFLEN - 1] = '\0';
-  char* tbl = strchr(buf, '.');
-  if (tbl == NULL)
-    return NULL;
-  *tbl++ = '\0';
-  if (*tbl == '\0')
-    return NULL;
-  build_table_filename(path, FN_REFLEN - 1, buf, tbl, "", 0);
-  
-  return queue_share_t::get_share(path);
-}
-
-static void erase_owned()
-{
-  queue_share_t *share;
-  
-  if ((share = static_cast<queue_share_t*>(pthread_getspecific(share_key)))
-      != NULL) {
-    share->lock();
-    off_t off = share->get_owned_row(pthread_self(), true);
-    share->remove_rows(&off, 1);
-    share->unlock();
-    share->release();
-    pthread_setspecific(share_key, NULL);
-  }
-}
-
-static int close_connection_handler(handlerton *hton, THD *thd)
-{
-  queue_share_t *share;
-  
-  if ((share = static_cast<queue_share_t*>(pthread_getspecific(share_key)))
-      != NULL) {
-    if (share->reset_owner(pthread_self()) != 0) {
-      share->wake_listener();
-    }
-    share->release();
-    pthread_setspecific(share_key, NULL);
-  }
-  
-  return 0;
-}
-
-handler *create_handler(handlerton *hton, TABLE_SHARE *table,
-			MEM_ROOT *mem_root)
-{
-  return new (mem_root) ha_queue(hton, table);
-}
-
-static int init(void *p)
-{
-  
-  queue_hton = (handlerton *)p;
-  
-  pthread_key_create(&share_key, NULL);
-  hash_init(&queue_open_tables, system_charset_info, 32, 0, 0,
-	    reinterpret_cast<hash_get_key>(queue_share_t::get_share_key), 0, 0);
-  
-  queue_hton->state = SHOW_OPTION_YES;
-  queue_hton->close_connection = close_connection_handler;
-  queue_hton->create = create_handler;
-  queue_hton->flags = HTON_CAN_RECREATE;
-  
-  return 0;
-}
-
-static int deinit(void *p)
-{
-  hash_free(&queue_open_tables);
-  queue_hton = NULL;
-  
-  return 0;
-}
-
 ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
   :handler(hton, table_arg),
    share(NULL),
@@ -821,6 +742,7 @@ ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
    bulk_insert_rows(NULL),
    bulk_delete_rows(NULL)
 {
+  pthread_cond_init(&cond, NULL);
 }
 
 ha_queue::~ha_queue()
@@ -833,6 +755,7 @@ ha_queue::~ha_queue()
   if (row != NULL) {
     my_free(reinterpret_cast<uchar*>(row), MYF(0));
   }
+  pthread_cond_destroy(&cond);
 }
 
 static const char *ha_queue_exts[] = {
@@ -948,22 +871,35 @@ void ha_queue::position(const uchar *record)
 int ha_queue::rnd_pos(uchar *buf, uchar *_pos)
 {
   pos = static_cast<off_t>(my_get_ptr(_pos, sizeof(pos)));
+  int err = 0;
   
+  share->lock();
   /* we should return the row even if it had the deleted flag set during the
    * execution by other threads
    */
   if (share->read(row, pos, queue_row_t::header_size(), true)
       != queue_row_t::header_size()) {
-    return HA_ERR_CRASHED_ON_USAGE;
+    err = HA_ERR_CRASHED_ON_USAGE;
+    goto EXIT;
+  }
+  if (prepare_row_buffer(row->size()) != 0) {
+    err = HA_ERR_OUT_OF_MEM;
+    goto EXIT;
   }
   if (share->read(row->bytes(), pos + queue_row_t::header_size(), row->size(),
 		  false)
       != row->size()) {
-    return HA_ERR_CRASHED_ON_USAGE;
+    err = HA_ERR_CRASHED_ON_USAGE;
+    goto EXIT;
   }
+  share->unlock();
   
   unpack_row(buf);
   return 0;
+  
+ EXIT:
+  share->unlock();
+  return err;
 }
 
 int ha_queue::info(uint flag)
@@ -1028,7 +964,7 @@ int ha_queue::end_bulk_insert()
   if (bulk_insert_rows != NULL) {
     if (bulk_insert_rows->size() != 0) {
       if ((ret = share->write_rows(&bulk_insert_rows->front(),
-				   bulk_insert_rows->size()))
+				   bulk_insert_rows->size(), &cond))
 	  == 0) {
 	for (size_t i = 0; i < bulk_insert_rows->size(); i++) {
 	  share->wake_listener();
@@ -1056,7 +992,8 @@ int ha_queue::end_bulk_delete()
   if (bulk_delete_rows->size() != 0) {
     share->lock();
     ret =
-      share->remove_rows(&bulk_delete_rows->front(), bulk_delete_rows->size());
+      share->remove_rows(&bulk_delete_rows->front(), bulk_delete_rows->size(),
+			 &cond);
     share->unlock();
   }
   delete bulk_delete_rows;
@@ -1080,7 +1017,7 @@ int ha_queue::write_row(uchar *buf)
     return 0;
   }
   
-  int err = share->write_rows(&row, 1);
+  int err = share->write_rows(&row, 1, &cond);
   if (err == 0) {
     share->wake_listener();
   }
@@ -1097,16 +1034,17 @@ int ha_queue::delete_row(const uchar *buf __attribute__((unused)))
 {
   int err = 0;
   
+  share->lock();
+  pthread_t owner = share->find_owner(pos);
+  if (owner != 0 && owner != pthread_self()) {
+    share->unlock();
+    return HA_ERR_RECORD_DELETED;
+  }
   if (bulk_delete_rows != NULL) {
+    share->unlock();
     bulk_delete_rows->push_back(pos);
   } else {
-    share->lock();
-    pthread_t owner = share->find_owner(pos);
-    if (owner != 0 && owner != pthread_self()) {
-      share->unlock();
-      return HA_ERR_RECORD_DELETED;
-    }
-    err = share->remove_rows(&pos, 1);
+    err = share->remove_rows(&pos, 1, &cond);
     share->unlock();
   }
   
@@ -1167,6 +1105,91 @@ void ha_queue::free_bulk_insert_rows()
   bulk_insert_rows = NULL;
 }
 
+static handler *create_handler(handlerton *hton, TABLE_SHARE *table,
+			MEM_ROOT *mem_root)
+{
+  return new (mem_root) ha_queue(hton, table);
+}
+
+static queue_share_t* get_share_check(const char* db_table_name)
+{
+  char buf[FN_REFLEN];
+  char path[FN_REFLEN];
+
+  // copy to buf, split to db name and table name, and build filename
+  // FIXME: creates bogus name if db_table_name is too long (but no overruns)
+  strncpy(buf, db_table_name, FN_REFLEN - 1);
+  buf[FN_REFLEN - 1] = '\0';
+  char* tbl = strchr(buf, '.');
+  if (tbl == NULL)
+    return NULL;
+  *tbl++ = '\0';
+  if (*tbl == '\0')
+    return NULL;
+  build_table_filename(path, FN_REFLEN - 1, buf, tbl, "", 0);
+  
+  return queue_share_t::get_share(path);
+}
+
+static void erase_owned()
+{
+  queue_share_t *share;
+  
+  if ((share = static_cast<queue_share_t*>(pthread_getspecific(share_key)))
+      != NULL) {
+    pthread_cond_t cond;
+    pthread_cond_init(&cond, NULL);
+    share->lock();
+    off_t off = share->get_owned_row(pthread_self(), true);
+    assert(off != 0);
+    share->remove_rows(&off, 1, &cond);
+    share->unlock();
+    share->release();
+    pthread_setspecific(share_key, NULL);
+    pthread_cond_destroy(&cond);
+  }
+}
+
+static int close_connection_handler(handlerton *hton, THD *thd)
+{
+  queue_share_t *share;
+  
+  if ((share = static_cast<queue_share_t*>(pthread_getspecific(share_key)))
+      != NULL) {
+    if (share->reset_owner(pthread_self()) != 0) {
+      share->wake_listener();
+    }
+    share->release();
+    pthread_setspecific(share_key, NULL);
+  }
+  
+  return 0;
+}
+
+static int init_plugin(void *p)
+{
+  
+  queue_hton = (handlerton *)p;
+  
+  pthread_key_create(&share_key, NULL);
+  hash_init(&queue_open_tables, system_charset_info, 32, 0, 0,
+	    reinterpret_cast<hash_get_key>(queue_share_t::get_share_key), 0, 0);
+  queue_hton->state = SHOW_OPTION_YES;
+  queue_hton->close_connection = close_connection_handler;
+  queue_hton->create = create_handler;
+  queue_hton->flags = HTON_CAN_RECREATE;
+  
+  return 0;
+}
+
+static int deinit_plugin(void *p)
+{
+  hash_free(&queue_open_tables);
+  queue_hton = NULL;
+  
+  return 0;
+}
+
 struct st_mysql_storage_engine queue_storage_engine = {
   MYSQL_HANDLERTON_INTERFACE_VERSION
 };
@@ -1179,8 +1202,8 @@ mysql_declare_plugin(queue)
   "Kazuho Oku at Cybozu Labs, Inc.",
   "Queue storage engine for MySQL",
   PLUGIN_LICENSE_GPL,
-  init,
-  deinit,
+  init_plugin,
+  deinit_plugin,
   0x0001,
   NULL,                       /* status variables                */
   NULL,                       /* system variables                */
@@ -1254,7 +1277,9 @@ long long queue_wait(UDF_INIT *initid, UDF_ARGS *args __attribute__((unused)),
       break;
     }
   } while (info->share->wait(info->return_at) == 0);
-  pthread_setspecific(share_key, info->share);
+  if (ret != 0) {
+    pthread_setspecific(share_key, info->share);
+  }
   info->share->unlock();
   
   *is_null = 0;

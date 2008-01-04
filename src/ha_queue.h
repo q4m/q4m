@@ -109,13 +109,9 @@ class queue_share_t {
     queue_row_t **rows;
     int cnt;
     int err; /* -1 if not completed, otherwise HA_ERR_XXX or 0 */
-    pthread_cond_t cond;
-    append_t(queue_row_t **r, int c)
-    : rows(r), cnt(c), err(-1) {
-      pthread_cond_init(&cond, NULL);
-    }
-    ~append_t() {
-      pthread_cond_destroy(&cond);
+    pthread_cond_t *cond;
+    append_t(queue_row_t **r, int c, pthread_cond_t *co)
+    : rows(r), cnt(c), err(-1), cond(co) {
     }
   private:
     append_t(const append_t&);
@@ -127,13 +123,9 @@ class queue_share_t {
     off_t *offsets;
     int cnt;
     int err; /* -1 if not completed, otherwise HA_ERR_XXX or 0 */
-    pthread_cond_t cond;
-    remove_t(off_t *o, int c)
-    : offsets(o), cnt(c), err(-1) {
-      pthread_cond_init(&cond, NULL);
-    }
-    ~remove_t() {
-      pthread_cond_destroy(&cond);
+    pthread_cond_t *cond;
+    remove_t(off_t *o, int c, pthread_cond_t *co)
+    : offsets(o), cnt(c), err(-1), cond(co) {
     }
   };
   typedef std::vector<remove_t*> remove_list_t;
@@ -156,7 +148,7 @@ class queue_share_t {
   
   struct {
     off_t off;
-    char buf[1024]; // should be smaller than queue_file_header_t for using off==0 for invalidation
+    char buf[4096];
   } cache;
   
   queue_rows_owned_t rows_owned;
@@ -188,12 +180,13 @@ public:
   THR_LOCK *get_store_lock() { return &store_lock; }
   const queue_file_header_t *header() const { return &_header; }
   off_t reset_owner(pthread_t owner);
-  int write_rows(queue_row_t **row, int cnt);
+  int write_rows(queue_row_t **row, int cnt, pthread_cond_t *cond);
   /* functions below requires lock */
   const void *read_cache(off_t off, ssize_t size, bool populate_cache);
   ssize_t read(void *data, off_t off, ssize_t size, bool populate_cache);
   void update_cache(const void *data, off_t off, size_t size) {
-    if (cache.off + sizeof(cache.buf) <= off || off + size <= cache.off) {
+    if (cache.off == 0
+	|| cache.off + sizeof(cache.buf) <= off || off + size <= cache.off) {
       // nothing to do
     } else if (cache.off <= off) {
       memcpy(cache.buf + off - cache.off,
@@ -207,7 +200,7 @@ public:
   }
   int next(off_t *off);
   off_t get_owned_row(pthread_t owner, bool remove = false);
-  int remove_rows(off_t *offsets, int cnt);
+  int remove_rows(off_t *offsets, int cnt, pthread_cond_t *cond);
   pthread_t find_owner(off_t off);
   off_t assign_owner(pthread_t owner);
 private:
@@ -228,6 +221,7 @@ class ha_queue: public handler
 {
   THR_LOCK_DATA lock;
   queue_share_t *share;
+  pthread_cond_t cond;
   
   off_t pos;
   queue_row_t *row;
