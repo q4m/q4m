@@ -44,9 +44,10 @@ To install the software, follow the steps below.
  > CREATE FUNCTION queue_abort RETURNS INT SONAME 'libqueue_engine.so';
 
 If you are installing Q4M against a debug build of MySQL, it might be
-necessary to set the -DSAFE_MUTEX compile option.
+necessary to set the --with-debug compile option (since size of the internal
+structures differ between a debug build and a release build).
 
- % CFLAGS=-DSAFE_MUTEX CXXFLAGS=-DSAFE_MUTEX ./configure ...
+ % ./configure --with-debug ...
 
 
 * USAGE
