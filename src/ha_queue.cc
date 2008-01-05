@@ -34,11 +34,20 @@ extern "C" {
 #undef VERSION
 #undef HAVE_DTRACE
 #undef _DTRACE_VERSION
+#include <mysql/plugin.h>
 
 #include "queue_config.h"
 
+#if SIZEOF_OFF_T != 8
+#  error "support for 64-bit file offsets is mandatory"
+#endif
+#ifdef HAVE_LSEEK64
+#  define lseek  lseek64
+#  define pread  pread64
+#  define pwrite pwrite64
+#endif
+
 #include "ha_queue.h"
-#include <mysql/plugin.h>
 #include "adler32.c"
 
 extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
@@ -107,15 +116,17 @@ static void sync_file(int fd)
   }
 }
 
-off_t queue_row_t::validate_checksum(int fd, off_t off)
+my_off_t queue_row_t::validate_checksum(int fd, my_off_t off)
 {
-  off_t len;
+  my_off_t len;
+  char _len[sizeof(len)];
   
   /* read checksum size */
   off += queue_row_t::header_size();
-  if (::pread(fd, &len, sizeof(len), off) != sizeof(len)) {
+  if (::pread(fd, _len, sizeof(len), off) != sizeof(len)) {
     return 0;
   }
+  len = uint8korr(_len);
   off += sizeof(len);
   /* calc checksum */
   uchar buf[4096];
@@ -135,7 +146,7 @@ off_t queue_row_t::validate_checksum(int fd, off_t off)
 
 queue_row_t *queue_row_t::create_checksum(const iovec* iov, int iovcnt)
 {
-  off_t sz = 0;
+  my_off_t sz = 0;
   uint32_t adler = 1;
   
   for (int i = 0; i < iovcnt; i++) {
@@ -146,16 +157,18 @@ queue_row_t *queue_row_t::create_checksum(const iovec* iov, int iovcnt)
   queue_row_t *row =
     static_cast<queue_row_t*>(my_malloc(checksum_size(), MYF(0)));
   assert(row != NULL);
-  row->_size = type_checksum | (adler & size_mask);
-  memcpy(row->_bytes, &sz, sizeof(off_t));
+  int4store(row->_size, type_checksum | (adler & size_mask));
+  int8store(row->_bytes, sz);
   
   return row;
 }
 
 queue_file_header_t::queue_file_header_t()
-  : _magic(MAGIC), _attr(0), _end(sizeof(queue_file_header_t)),
-    _begin(sizeof(queue_file_header_t))
 {
+  int4store(_magic, MAGIC);
+  int4store(_attr, 0);
+  int8store(_end, static_cast<my_off_t>(sizeof(queue_file_header_t)));
+  int8store(_begin, static_cast<my_off_t>(sizeof(queue_file_header_t)));
   memset(_padding, 0, sizeof(_padding));
 }
 
@@ -176,7 +189,7 @@ uchar* queue_share_t::get_share_key(queue_share_t *share, size_t *length,
 void queue_share_t::fixup_header()
 {
   /* update end */
-  off_t off = _header.end();
+  my_off_t off = _header.end();
   while (1) {
     queue_row_t row;
     if (read(&row, off, queue_row_t::header_size(), true)
@@ -353,9 +366,9 @@ void queue_share_t::unlock_reader()
   unlock();
 }
 
-off_t queue_share_t::reset_owner(pthread_t owner)
+my_off_t queue_share_t::reset_owner(pthread_t owner)
 {
-  off_t off = 0;
+  my_off_t off = 0;
   lock();
   
   for (queue_rows_owned_t::iterator i = rows_owned.begin();
@@ -388,7 +401,7 @@ int queue_share_t::write_rows(const void *rows, size_t rows_size,
   return a.err;
 }
 
-const void *queue_share_t::read_cache(off_t off, ssize_t size,
+const void *queue_share_t::read_cache(my_off_t off, ssize_t size,
 				      bool populate_cache)
 {
   if (size > sizeof(cache.buf)) {
@@ -409,7 +422,7 @@ const void *queue_share_t::read_cache(off_t off, ssize_t size,
   return cache.buf;
 }
 
-ssize_t queue_share_t::read(void *data, off_t off, ssize_t size,
+ssize_t queue_share_t::read(void *data, my_off_t off, ssize_t size,
 			    bool populate_cache)
 {
   const void* cp;
@@ -420,7 +433,7 @@ ssize_t queue_share_t::read(void *data, off_t off, ssize_t size,
   return pread(fd, data, size, off);
 }
 
-int queue_share_t::next(off_t *off)
+int queue_share_t::next(my_off_t *off)
 {
   if (*off == _header.end()) {
     // eof
@@ -449,7 +462,7 @@ int queue_share_t::next(off_t *off)
   return 0;
 }
 
-off_t queue_share_t::get_owned_row(pthread_t owner, bool remove)
+my_off_t queue_share_t::get_owned_row(pthread_t owner, bool remove)
 {
   for (queue_rows_owned_t::iterator i = rows_owned.begin();
        i != rows_owned.end();
@@ -464,7 +477,7 @@ off_t queue_share_t::get_owned_row(pthread_t owner, bool remove)
   return 0;
 }
 
-int queue_share_t::remove_rows(off_t *offsets, int cnt, pthread_cond_t *cond)
+int queue_share_t::remove_rows(my_off_t *offsets, int cnt, pthread_cond_t *cond)
 {
   remove_t r(offsets, cnt, cond);
   
@@ -477,7 +490,7 @@ int queue_share_t::remove_rows(off_t *offsets, int cnt, pthread_cond_t *cond)
   return r.err;
 }
 
-pthread_t queue_share_t::find_owner(off_t off)
+pthread_t queue_share_t::find_owner(my_off_t off)
 {
   for (queue_rows_owned_t::const_iterator j = rows_owned.begin();
        j != rows_owned.end();
@@ -489,9 +502,9 @@ pthread_t queue_share_t::find_owner(off_t off)
   return 0;
 }
 
-off_t queue_share_t::assign_owner(pthread_t owner)
+my_off_t queue_share_t::assign_owner(pthread_t owner)
 {
-  off_t off = _header.begin();
+  my_off_t off = _header.begin();
   while (off != _header.end()) {
     if (find_owner(off) == 0) {
       rows_owned.push_back(queue_rows_owned_t::value_type(owner, off));
@@ -519,7 +532,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
 {
   /* build iovec */
   vector<iovec> iov;
-  off_t total_len = 0;
+  my_off_t total_len = 0;
   iov.push_back(iovec());
   for (append_list_t::iterator i = l->begin(); i != l->end(); ++i) {
     iov.push_back(iovec());
@@ -533,7 +546,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
   /* expand if necessary */
   if ((_header.end() - 1) / EXPAND_BY
       != (_header.end() + total_len) / EXPAND_BY) {
-    off_t new_len =
+    my_off_t new_len =
       ((_header.end() + total_len) / EXPAND_BY + 1) * EXPAND_BY;
     if (lseek(fd, new_len - 1, SEEK_SET) == -1
 	|| write(fd, "", 1) != 1
@@ -544,7 +557,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
   }
   { /* write and sync */
     vector<iovec>::const_iterator writev_from = iov.begin();
-    off_t writev_len = writev_from->iov_len;
+    my_off_t writev_len = writev_from->iov_len;
     for (vector<iovec>::const_iterator i = iov.begin() + 1;
 	 i != iov.end();
 	 ++i) {
@@ -554,16 +567,14 @@ int queue_share_t::writer_do_append(append_list_t *l)
 	  my_free(iov[0].iov_base, MYF(0));
 	  return HA_ERR_CRASHED_ON_USAGE;
 	}
-	writev_from = i + 1;
+	writev_from = i;
 	writev_len = 0;
       }
       writev_len += i->iov_len;
     }
-    if (writev_len != 0) {
-      if (writev(fd, &*writev_from, iov.end() - writev_from) != writev_len) {
-	my_free(iov[0].iov_base, MYF(0));
-	return HA_ERR_CRASHED_ON_USAGE;
-      }
+    if (writev(fd, &*writev_from, iov.end() - writev_from) != writev_len) {
+      my_free(iov[0].iov_base, MYF(0));
+      return HA_ERR_CRASHED_ON_USAGE;
     }
     sync_file(fd);
   }
@@ -593,7 +604,7 @@ void queue_share_t::writer_do_remove(remove_list_t* l)
     pthread_mutex_lock(&mutex);
     for (int j = 0; err == 0 && j < (*i)->cnt; j++) {
       queue_row_t row;
-      off_t off = (*i)->offsets[j];
+      my_off_t off = (*i)->offsets[j];
       if (read(&row, off, queue_row_t::header_size(), false)
 	  == queue_row_t::header_size()) {
 	row.set_type(queue_row_t::type_removed);
@@ -670,7 +681,8 @@ void *queue_share_t::writer_start()
   return NULL;
 }
 
-static int copy_file_content(int src_fd, off_t begin, off_t end, int dest_fd)
+static int copy_file_content(int src_fd, my_off_t begin, my_off_t end,
+			     int dest_fd)
 {
   char buf[65536];
   
@@ -690,7 +702,7 @@ int queue_share_t::compact()
 {
   char filename[FN_REFLEN], tmp_filename[FN_REFLEN];
   int tmp_fd;
-  off_t delta = _header.begin() - sizeof(queue_file_header_t);
+  my_off_t delta = _header.begin() - sizeof(queue_file_header_t);
   
   /* open new file */
   fn_format(filename, table_name, "", Q4M,
@@ -884,7 +896,7 @@ int ha_queue::rnd_pos(uchar *buf, uchar *_pos)
 {
   assert(rows_size == 0);
   
-  pos = static_cast<off_t>(my_get_ptr(_pos, sizeof(pos)));
+  pos = static_cast<my_off_t>(my_get_ptr(_pos, sizeof(pos)));
   int err = 0;
   
   share->lock();
@@ -991,7 +1003,7 @@ int ha_queue::end_bulk_insert()
 bool ha_queue::start_bulk_delete()
 {
   assert(bulk_delete_rows == NULL);
-  bulk_delete_rows = new vector<off_t>();
+  bulk_delete_rows = new vector<my_off_t>();
   return false;
 }
 
@@ -1063,25 +1075,22 @@ int ha_queue::delete_row(const uchar *buf __attribute__((unused)))
 
 int ha_queue::prepare_rows_buffer(size_t sz)
 {
+  size_t new_reserve = (rows_size + sz + ROWS_BUFFER_EXPAND_BY)
+    / ROWS_BUFFER_EXPAND_BY * ROWS_BUFFER_EXPAND_BY;
   if (rows == NULL) {
-    if ((rows = static_cast<uchar*>(my_malloc((sz + ROWS_BUFFER_EXPAND_BY - 1)
-					      / ROWS_BUFFER_EXPAND_BY
-					      * ROWS_BUFFER_EXPAND_BY,
-					      MYF(0))))
-	== NULL) {
+    if ((rows = static_cast<uchar*>(my_malloc(new_reserve, MYF(0)))) == NULL) {
       return -1;
     }
-  } else if ((rows_size + sz) / ROWS_BUFFER_EXPAND_BY
-	     != rows_size / ROWS_BUFFER_EXPAND_BY) {
-    void *pt;
-    if ((pt = my_realloc(rows,
-			 (rows_size + sz + ROWS_BUFFER_EXPAND_BY - 1)
-			 / ROWS_BUFFER_EXPAND_BY * ROWS_BUFFER_EXPAND_BY,
-			 MYF(0)))
-	== NULL) {
-      return -1;
+  } else {
+    size_t cur_reserve = (rows_size + ROWS_BUFFER_EXPAND_BY)
+      / ROWS_BUFFER_EXPAND_BY * ROWS_BUFFER_EXPAND_BY;
+    if (new_reserve != cur_reserve) {
+      void *pt;
+      if ((pt = my_realloc(rows, new_reserve, MYF(0))) == NULL) {
+	return -1;
+      }
+      rows = static_cast<uchar*>(pt);
     }
-    rows = static_cast<uchar*>(pt);
   }
   return 0;
 }
@@ -1163,7 +1172,7 @@ static void erase_owned()
     pthread_cond_t cond;
     pthread_cond_init(&cond, NULL);
     share->lock();
-    off_t off = share->get_owned_row(pthread_self(), true);
+    my_off_t off = share->get_owned_row(pthread_self(), true);
     assert(off != 0);
     share->remove_rows(&off, 1, &cond);
     share->unlock();

@@ -25,9 +25,9 @@ class queue_share_t;
 class queue_row_t {
   /* size is stored in the lower 30 bits, while upper 2 bits are used for
    * attributes.  if type == type_checksum, lower 30 bits adler32 is stored
-   * in _size, and size of the checksum is stored in the body in type off_t.
+   * in _size, and size of the checksum is stored in the body in type my_off_t.
    */
-  unsigned _size;
+  char  _size[4];
   uchar _bytes[1];
 public:
   enum {
@@ -41,34 +41,34 @@ public:
   queue_row_t() {} // build uninitialized
   queue_row_t(unsigned size) {
     assert((size & type_mask) == 0);
-    _size = size | type_row;
+    int4store(_size, size | type_row);
   }
   unsigned size() const {
     // NOTE: does not check if the row isn't checksum
-    return _size & size_mask;
+    return uint4korr(_size) & size_mask;
   }
   unsigned checksum() const {
     return size();
   }
   unsigned type() const {
-    return _size & type_mask;
+    return uint4korr(_size) & type_mask;
   }
   void set_type(unsigned type) {
     assert((type & size_mask) == 0);
-    _size = (_size & size_mask) | type;
+    int4store(_size, (uint4korr(_size) & size_mask) | type);
   }
   uchar *bytes() { return _bytes; }
   static size_t header_size() {
-    return offsetof(queue_row_t, _bytes[0]);
+    return my_offsetof(queue_row_t, _bytes[0]);
   }
   static size_t checksum_size() {
-    return header_size() + sizeof(off_t);
+    return header_size() + sizeof(my_off_t);
   }
-  off_t next(off_t off) {
+  my_off_t next(my_off_t off) {
     return off + header_size()
-      + (type() != type_checksum ? size() : sizeof(off_t));
+      + (type() != type_checksum ? size() : sizeof(my_off_t));
   }
-  off_t validate_checksum(int fd, off_t off);
+  my_off_t validate_checksum(int fd, my_off_t off);
   // my_free should be used on deallocation
   static queue_row_t *create_checksum(const iovec* iov, int iovcnt);
 private:
@@ -83,24 +83,24 @@ public:
     attr_is_dirty = 0x1
   };
 private:
-  unsigned _magic;
-  unsigned _attr;
-  off_t    _end;
-  off_t    _begin;
-  unsigned _padding[(1024 - sizeof(unsigned) * 2 - sizeof(off_t) * 2) / sizeof(unsigned)];
+  char _magic[4];
+  char _attr[4];
+  char _end[8];
+  char _begin[8];
+  unsigned _padding[1024 - (4 + 4 + 8 + 8)];
 public:
   queue_file_header_t();
-  unsigned magic() const { return _magic; }
-  unsigned attr() const { return _attr; }
-  void set_attr(unsigned a) { _attr = a; }
-  off_t end() const { return _end; }
-  void set_end(off_t e) { _end = e; }
-  off_t begin() const { return _begin; }
-  void set_begin(off_t b) { _begin = b; }
+  unsigned magic() const { return uint4korr(_magic); }
+  unsigned attr() const { return uint4korr(_attr); }
+  void set_attr(unsigned a) { int4store(_attr, a); }
+  my_off_t end() const { return uint8korr(_end); }
+  void set_end(my_off_t e) { int8store(_end, e); }
+  my_off_t begin() const { return uint8korr(_begin); }
+  void set_begin(my_off_t b) { int8store(_begin, b); }
   void write(int fd);
 };
 
-typedef std::list<std::pair<pthread_t, off_t> > queue_rows_owned_t;
+typedef std::list<std::pair<pthread_t, my_off_t> > queue_rows_owned_t;
 
 class queue_share_t {
   
@@ -120,11 +120,11 @@ class queue_share_t {
   typedef std::vector<append_t*> append_list_t;
   
   struct remove_t {
-    off_t *offsets;
+    my_off_t *offsets;
     int cnt;
     int err; /* -1 if not completed, otherwise HA_ERR_XXX or 0 */
     pthread_cond_t *cond;
-    remove_t(off_t *o, int c, pthread_cond_t *co)
+    remove_t(my_off_t *o, int c, pthread_cond_t *co)
     : offsets(o), cnt(c), err(-1), cond(co) {
     }
   };
@@ -147,7 +147,7 @@ class queue_share_t {
   queue_file_header_t _header;
   
   struct {
-    off_t off;
+    my_off_t off;
     char buf[4096];
   } cache;
   
@@ -179,12 +179,12 @@ public:
   }
   THR_LOCK *get_store_lock() { return &store_lock; }
   const queue_file_header_t *header() const { return &_header; }
-  off_t reset_owner(pthread_t owner);
+  my_off_t reset_owner(pthread_t owner);
   int write_rows(const void *rows, size_t rows_size, pthread_cond_t *cond);
   /* functions below requires lock */
-  const void *read_cache(off_t off, ssize_t size, bool populate_cache);
-  ssize_t read(void *data, off_t off, ssize_t size, bool populate_cache);
-  void update_cache(const void *data, off_t off, size_t size) {
+  const void *read_cache(my_off_t off, ssize_t size, bool populate_cache);
+  ssize_t read(void *data, my_off_t off, ssize_t size, bool populate_cache);
+  void update_cache(const void *data, my_off_t off, size_t size) {
     if (cache.off == 0
 	|| cache.off + sizeof(cache.buf) <= off || off + size <= cache.off) {
       // nothing to do
@@ -198,11 +198,11 @@ public:
 	     min(size - (cache.off - off), sizeof(cache.buf)));
     }
   }
-  int next(off_t *off);
-  off_t get_owned_row(pthread_t owner, bool remove = false);
-  int remove_rows(off_t *offsets, int cnt, pthread_cond_t *cond);
-  pthread_t find_owner(off_t off);
-  off_t assign_owner(pthread_t owner);
+  int next(my_off_t *off);
+  my_off_t get_owned_row(pthread_t owner, bool remove = false);
+  int remove_rows(my_off_t *offsets, int cnt, pthread_cond_t *cond);
+  pthread_t find_owner(my_off_t off);
+  my_off_t assign_owner(pthread_t owner);
 private:
   int writer_do_append(append_list_t *l);
   void writer_do_remove(remove_list_t *l);
@@ -223,11 +223,11 @@ class ha_queue: public handler
   queue_share_t *share;
   pthread_cond_t cond;
   
-  off_t pos;
+  my_off_t pos;
   uchar *rows;
   size_t rows_size;
   size_t bulk_insert_rows; /* should be -1 unless bulk_insertion */
-  std::vector<off_t> *bulk_delete_rows;
+  std::vector<my_off_t> *bulk_delete_rows;
   
  public:
   ha_queue(handlerton *hton, TABLE_SHARE *table_arg);

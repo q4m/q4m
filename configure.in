@@ -71,5 +71,6 @@ esac
 
 AC_C_CONST
 AC_TYPE_SIZE_T
+AC_CHECK_FUNCS([lseek64])
 AC_CHECK_HEADERS(limits.h syslimits.h)
 AC_OUTPUT(Makefile src/Makefile)
