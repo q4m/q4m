@@ -548,7 +548,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
     for (vector<iovec>::const_iterator i = iov.begin() + 1;
 	 i != iov.end();
 	 ++i) {
-      if (i - writev_from > 5
+      if (i - writev_from > IOV_MAX
 	  || writev_len + i->iov_len > SSIZE_MAX / 2) {
 	if (writev(fd, &*writev_from, i - writev_from) != writev_len) {
 	  my_free(iov[0].iov_base, MYF(0));
