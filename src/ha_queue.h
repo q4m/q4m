@@ -106,12 +106,12 @@ class queue_share_t {
   
  public:
   struct append_t {
-    queue_row_t **rows;
-    int cnt;
+    const void *rows;
+    size_t rows_size;
     int err; /* -1 if not completed, otherwise HA_ERR_XXX or 0 */
     pthread_cond_t *cond;
-    append_t(queue_row_t **r, int c, pthread_cond_t *co)
-    : rows(r), cnt(c), err(-1), cond(co) {
+    append_t(const void *r, size_t rs, pthread_cond_t *co)
+    : rows(r), rows_size(rs), err(-1), cond(co) {
     }
   private:
     append_t(const append_t&);
@@ -180,7 +180,7 @@ public:
   THR_LOCK *get_store_lock() { return &store_lock; }
   const queue_file_header_t *header() const { return &_header; }
   off_t reset_owner(pthread_t owner);
-  int write_rows(queue_row_t **row, int cnt, pthread_cond_t *cond);
+  int write_rows(const void *rows, size_t rows_size, pthread_cond_t *cond);
   /* functions below requires lock */
   const void *read_cache(off_t off, ssize_t size, bool populate_cache);
   ssize_t read(void *data, off_t off, ssize_t size, bool populate_cache);
@@ -224,9 +224,9 @@ class ha_queue: public handler
   pthread_cond_t cond;
   
   off_t pos;
-  queue_row_t *row;
-  size_t row_max_size; /* not including header */
-  std::vector<queue_row_t*> *bulk_insert_rows;
+  uchar *rows;
+  size_t rows_size;
+  size_t bulk_insert_rows; /* should be -1 unless bulk_insertion */
   std::vector<off_t> *bulk_delete_rows;
   
  public:
@@ -273,28 +273,9 @@ class ha_queue: public handler
   int update_row(const uchar *old_data, uchar *new_data);
   int delete_row(const uchar *buf);
  private:
-  int prepare_row_buffer(size_t sz) {
-    void *pt;
-    if (row == NULL) {
-      if ((pt = my_malloc(queue_row_t::header_size() + sz, MYF(0)))
-	  == NULL) {
-	return -1;
-      }
-    } else if (row_max_size < sz) {
-      if ((pt = my_realloc(row, queue_row_t::header_size() + sz, MYF(0)))
-	  == NULL) {
-	return -1;
-      }
-    } else {
-      return 0;
-    }
-    row = static_cast<queue_row_t*>(pt);
-    row_max_size = sz;
-    return 0;
-  }
+  int prepare_rows_buffer(size_t sz);
   void unpack_row(uchar *buf);
-  int pack_row(uchar *buf);
-  void free_bulk_insert_rows();
+  size_t pack_row(uchar *buf);
 };
 
 #undef queue_end

@@ -48,7 +48,8 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 
 using namespace std;
 
-#define COMPACT_THRESHOLD 16777216
+#define ROWS_BUFFER_EXPAND_BY (4096)
+#define COMPACT_THRESHOLD (16777216)
 #define DO_COMPACT(all, free) \
     ((all) >= COMPACT_THRESHOLD && (free) * 2 >= (all))
 #define EXPAND_BY (1048576)
@@ -371,9 +372,10 @@ off_t queue_share_t::reset_owner(pthread_t owner)
   return off;
 }
 
-int queue_share_t::write_rows(queue_row_t **rows, int cnt, pthread_cond_t *cond)
+int queue_share_t::write_rows(const void *rows, size_t rows_size,
+			      pthread_cond_t *cond)
 {
-  append_t a(rows, cnt, cond);
+  append_t a(rows, rows_size, cond);
   
   pthread_mutex_lock(&mutex);
   append_list->push_back(&a);
@@ -520,20 +522,14 @@ int queue_share_t::writer_do_append(append_list_t *l)
   off_t total_len = 0;
   iov.push_back(iovec());
   for (append_list_t::iterator i = l->begin(); i != l->end(); ++i) {
-    for (int j = 0; j < (*i)->cnt; j++) {
-      iov.push_back(iovec());
-      iov.back().iov_base = (*i)->rows[j];
-      total_len += iov.back().iov_len = (*i)->rows[j]->next(0);
-    }
+    iov.push_back(iovec());
+    iov.back().iov_base = const_cast<void*>((*i)->rows);
+    total_len += iov.back().iov_len = (*i)->rows_size;
   }
   iov[0].iov_base =
     queue_row_t::create_checksum(&iov.front() + 1, iov.size() - 1);
   total_len += iov[0].iov_len =
     static_cast<queue_row_t*>(iov[0].iov_base)->next(0);
-  /* TODO: fix this limitation on 32-bit archs.  note that it should be fixed
-   * in at a much higher level since we need to commit a SQL statement in a
-   * single system call under current file format */
-  assert(total_len < INT_MAX);
   /* expand if necessary */
   if ((_header.end() - 1) / EXPAND_BY
       != (_header.end() + total_len) / EXPAND_BY) {
@@ -546,12 +542,31 @@ int queue_share_t::writer_do_append(append_list_t *l)
       return HA_ERR_RECORD_FILE_FULL;
     }
   }
-  /* write and sync */
-  if (writev(fd, &iov.front(), iov.size()) != total_len) {
-    my_free(iov[0].iov_base, MYF(0));
-    return HA_ERR_CRASHED_ON_USAGE;
+  { /* write and sync */
+    vector<iovec>::const_iterator writev_from = iov.begin();
+    off_t writev_len = writev_from->iov_len;
+    for (vector<iovec>::const_iterator i = iov.begin() + 1;
+	 i != iov.end();
+	 ++i) {
+      if (i - writev_from > 5
+	  || writev_len + i->iov_len > SSIZE_MAX / 2) {
+	if (writev(fd, &*writev_from, i - writev_from) != writev_len) {
+	  my_free(iov[0].iov_base, MYF(0));
+	  return HA_ERR_CRASHED_ON_USAGE;
+	}
+	writev_from = i + 1;
+	writev_len = 0;
+      }
+      writev_len += i->iov_len;
+    }
+    if (writev_len != 0) {
+      if (writev(fd, &*writev_from, iov.end() - writev_from) != writev_len) {
+	my_free(iov[0].iov_base, MYF(0));
+	return HA_ERR_CRASHED_ON_USAGE;
+      }
+    }
+    sync_file(fd);
   }
-  sync_file(fd);
   /* update begin, end, cache */
   pthread_mutex_lock(&mutex);
   if (_header.begin() == _header.end()) {
@@ -737,9 +752,9 @@ ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
   :handler(hton, table_arg),
    share(NULL),
    pos(),
-   row(NULL),
-   row_max_size(0),
-   bulk_insert_rows(NULL),
+   rows(NULL),
+   rows_size(0),
+   bulk_insert_rows(-1),
    bulk_delete_rows(NULL)
 {
   pthread_cond_init(&cond, NULL);
@@ -749,11 +764,8 @@ ha_queue::~ha_queue()
 {
   delete bulk_delete_rows;
   bulk_delete_rows = NULL;
-  if (bulk_insert_rows != NULL) {
-    free_bulk_insert_rows();
-  }
-  if (row != NULL) {
-    my_free(reinterpret_cast<uchar*>(row), MYF(0));
+  if (rows != NULL) {
+    my_free(rows, MYF(0));
   }
   pthread_cond_destroy(&cond);
 }
@@ -774,9 +786,6 @@ int ha_queue::open(const char *name, int mode, uint test_if_locked)
     return 1;
   }
   thr_lock_data_init(share->get_store_lock(), &lock, NULL);
-  if (prepare_row_buffer(table->s->reclength) != 0) {
-    return 1;
-  }
   
   return 0;
 }
@@ -803,6 +812,8 @@ int ha_queue::rnd_end()
 
 int ha_queue::rnd_next(uchar *buf)
 {
+  assert(rows_size == 0);
+  
   int err = HA_ERR_END_OF_FILE;
   share->lock();
 
@@ -836,21 +847,22 @@ int ha_queue::rnd_next(uchar *buf)
     }
   }
   
-  /* read data to row buffer */
-  if (share->read(row, pos, queue_row_t::header_size(), true)
-      != queue_row_t::header_size()) {
-    err = HA_ERR_CRASHED_ON_USAGE;
-    goto EXIT;
-  }
-  if (prepare_row_buffer(row->size()) != 0) {
-    err = HA_ERR_OUT_OF_MEM;
-    goto EXIT;
-  }
-  if (share->read(row->bytes(), pos + queue_row_t::header_size(), row->size(),
-		  false)
-      != row->size()) {
-    err = HA_ERR_CRASHED_ON_USAGE;
-    goto EXIT;
+  { /* read data to row buffer */
+    queue_row_t hdr;
+    if (share->read(&hdr, pos, queue_row_t::header_size(), true)
+	!= queue_row_t::header_size()) {
+      err = HA_ERR_CRASHED_ON_USAGE;
+      goto EXIT;
+    }
+    if (prepare_rows_buffer(queue_row_t::header_size() + hdr.size()) != 0) {
+      err = HA_ERR_OUT_OF_MEM;
+      goto EXIT;
+    }
+    if (share->read(rows, pos, queue_row_t::header_size() + hdr.size(), false)
+	!= queue_row_t::header_size() + hdr.size()) {
+      err = HA_ERR_CRASHED_ON_USAGE;
+      goto EXIT;
+    }
   }
   
   /* unlock and convert to internal representation */
@@ -870,6 +882,8 @@ void ha_queue::position(const uchar *record)
 
 int ha_queue::rnd_pos(uchar *buf, uchar *_pos)
 {
+  assert(rows_size == 0);
+  
   pos = static_cast<off_t>(my_get_ptr(_pos, sizeof(pos)));
   int err = 0;
   
@@ -877,18 +891,17 @@ int ha_queue::rnd_pos(uchar *buf, uchar *_pos)
   /* we should return the row even if it had the deleted flag set during the
    * execution by other threads
    */
-  if (share->read(row, pos, queue_row_t::header_size(), true)
+  queue_row_t hdr;
+  if (share->read(&hdr, pos, queue_row_t::header_size(), true)
       != queue_row_t::header_size()) {
     err = HA_ERR_CRASHED_ON_USAGE;
     goto EXIT;
   }
-  if (prepare_row_buffer(row->size()) != 0) {
+  if (prepare_rows_buffer(queue_row_t::header_size() + hdr.size()) != 0) {
     err = HA_ERR_OUT_OF_MEM;
     goto EXIT;
   }
-  if (share->read(row->bytes(), pos + queue_row_t::header_size(), row->size(),
-		  false)
-      != row->size()) {
+  if (share->read(rows, pos, hdr.size(), false) != hdr.size()) {
     err = HA_ERR_CRASHED_ON_USAGE;
     goto EXIT;
   }
@@ -953,26 +966,24 @@ int ha_queue::create(const char *name, TABLE *table_arg,
 
 void ha_queue::start_bulk_insert(ha_rows rows __attribute__((unused)))
 {
-  assert(bulk_insert_rows == NULL);
-  bulk_insert_rows = new vector<queue_row_t*>();
+  assert(rows_size == 0);
+  assert(bulk_insert_rows == -1);
+  bulk_insert_rows = 0;
 }
 
 int ha_queue::end_bulk_insert()
 {
   int ret = 0;
   
-  if (bulk_insert_rows != NULL) {
-    if (bulk_insert_rows->size() != 0) {
-      if ((ret = share->write_rows(&bulk_insert_rows->front(),
-				   bulk_insert_rows->size(), &cond))
-	  == 0) {
-	for (size_t i = 0; i < bulk_insert_rows->size(); i++) {
-	  share->wake_listener();
-	}
+  if (rows_size != 0) {
+    if ((ret = share->write_rows(rows, rows_size, &cond)) == 0) {
+      for (size_t i = 0; i < bulk_insert_rows; i++) {
+	share->wake_listener();
       }
-      free_bulk_insert_rows();
     }
+    rows_size = 0;
   }
+  bulk_insert_rows = -1;
   
   return ret;
 }
@@ -1004,23 +1015,22 @@ int ha_queue::end_bulk_delete()
 
 int ha_queue::write_row(uchar *buf)
 {
-  if (pack_row(buf) != 0) {
+  size_t sz;
+  
+  if ((sz = pack_row(buf)) == 0) {
     return HA_ERR_OUT_OF_MEM;
   }
-  
-  if (bulk_insert_rows != NULL) {
-    bulk_insert_rows->push_back(row);
-    row = NULL;
-    if (prepare_row_buffer(table->s->reclength) != 0) {
-      return HA_ERR_OUT_OF_MEM;
+  if (bulk_insert_rows == -1) {
+    int err;
+    if ((err = share->write_rows(rows, sz, &cond)) != 0) {
+      return err;
     }
-    return 0;
+    share->wake_listener();
+  } else {
+    rows_size += sz;
+    bulk_insert_rows++;
   }
   
-  int err = share->write_rows(&row, 1, &cond);
-  if (err == 0) {
-    share->wake_listener();
-  }
   return 0;
 }
 
@@ -1051,11 +1061,36 @@ int ha_queue::delete_row(const uchar *buf __attribute__((unused)))
   return err;
 }
 
+int ha_queue::prepare_rows_buffer(size_t sz)
+{
+  if (rows == NULL) {
+    if ((rows = static_cast<uchar*>(my_malloc((sz + ROWS_BUFFER_EXPAND_BY - 1)
+					      / ROWS_BUFFER_EXPAND_BY
+					      * ROWS_BUFFER_EXPAND_BY,
+					      MYF(0))))
+	== NULL) {
+      return -1;
+    }
+  } else if ((rows_size + sz) / ROWS_BUFFER_EXPAND_BY
+	     != rows_size / ROWS_BUFFER_EXPAND_BY) {
+    void *pt;
+    if ((pt = my_realloc(rows,
+			 (rows_size + sz + ROWS_BUFFER_EXPAND_BY - 1)
+			 / ROWS_BUFFER_EXPAND_BY * ROWS_BUFFER_EXPAND_BY,
+			 MYF(0)))
+	== NULL) {
+      return -1;
+    }
+    rows = static_cast<uchar*>(pt);
+  }
+  return 0;
+}
+
 void ha_queue::unpack_row(uchar *buf)
 {
-  const uchar *src = row->bytes();
+  const uchar *src = rows + queue_row_t::header_size();
 			  
-  memcpy(buf, row->bytes(), table->s->null_bytes);
+  memcpy(buf, src, table->s->null_bytes);
   src += table->s->null_bytes;
   for (Field **field = table->field; *field != NULL; field++) {
     if (! (*field)->is_null()) {
@@ -1064,20 +1099,21 @@ void ha_queue::unpack_row(uchar *buf)
   }
 }
 
-int ha_queue::pack_row(uchar *buf)
+size_t ha_queue::pack_row(uchar *buf)
 {
-  size_t maxsize = table->s->reclength + table->s->fields * 2;
+  /* allocate memory (w. some extra) */
+  size_t sz = queue_row_t::header_size() + table->s->reclength
+    + table->s->fields * 2;
   for (uint *ptr = table->s->blob_field, *end = ptr + table->s->blob_fields;
        ptr != end;
        ++ptr) {
-    maxsize += 2 + ((Field_blob*)table->field[*ptr])->get_length();
+    sz += 2 + ((Field_blob*)table->field[*ptr])->get_length();
   }
-  
-  if (prepare_row_buffer(maxsize) != 0) {
+  if (sz > queue_row_t::max_size || prepare_rows_buffer(sz) != 0) {
     return -1;
   }
-  uchar *dst = row->bytes();
-  
+  /* write data */
+  uchar *dst = rows + rows_size + queue_row_t::header_size();
   memcpy(dst, buf, table->s->null_bytes);
   dst += table->s->null_bytes;
   for (Field **field = table->field; *field != NULL; field++) {
@@ -1085,24 +1121,11 @@ int ha_queue::pack_row(uchar *buf)
       dst = (*field)->pack(dst, buf + (*field)->offset(buf));
     }
   }
-  size_t size = dst - row->bytes();
-  if (size > queue_row_t::max_size) {
-    return -1;
-  }
-  new (row) queue_row_t(dst - row->bytes());
-  
-  return 0;
-}
-
-void ha_queue::free_bulk_insert_rows()
-{
-  for (vector<queue_row_t*>::iterator i = bulk_insert_rows->begin();
-       i != bulk_insert_rows->end();
-       ++i) {
-    my_free(*i, MYF(0));
-  }
-  delete bulk_insert_rows;
-  bulk_insert_rows = NULL;
+  /* write header */
+  sz = dst - (rows + rows_size);
+  new (reinterpret_cast<queue_row_t*>(rows + rows_size))
+    queue_row_t(sz - queue_row_t::header_size());
+  return sz;
 }
 
 static handler *create_handler(handlerton *hton, TABLE_SHARE *table,
