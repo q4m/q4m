@@ -9,7 +9,7 @@ use DBI;
 use List::MoreUtils qw/uniq/;
 
 my $NUM_CHILDREN = 32;
-my $NUM_MESSAGES = $NUM_CHILDREN * 100;
+my $NUM_MESSAGES = $NUM_CHILDREN * 200;
 my $BLOCK_SIZE = 100;
 
 sub dbi_connect {

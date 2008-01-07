@@ -468,10 +468,11 @@ my_off_t queue_share_t::get_owned_row(pthread_t owner, bool remove)
        i != rows_owned.end();
        ++i) {
     if (i->first == owner) {
+      my_off_t off = i->second;
       if (remove) {
 	rows_owned.erase(i);
       }
-      return i->second;
+      return off;
     }
   }
   return 0;
@@ -635,8 +636,6 @@ void *queue_share_t::writer_start()
   pthread_mutex_lock(&mutex);
   
   while (1) {
-    remove_list_t *rl = NULL;
-    append_list_t *al = NULL;
     /* wait for signal if we do not have any pending writes */
     while (remove_list->size() == 0 && append_list->size() == 0) {
       if (writer_exit) {
@@ -650,6 +649,8 @@ void *queue_share_t::writer_start()
       }
     }
     /* detach operation lists */
+    remove_list_t *rl = NULL;
+    append_list_t *al = NULL;
     if (remove_list->size() != 0) {
       rl = remove_list;
       remove_list = new remove_list_t();
@@ -995,6 +996,7 @@ int ha_queue::end_bulk_insert()
     }
     rows_size = 0;
   }
+  free_rows_buffer();
   bulk_insert_rows = -1;
   
   return ret;
@@ -1033,8 +1035,9 @@ int ha_queue::write_row(uchar *buf)
     return HA_ERR_OUT_OF_MEM;
   }
   if (bulk_insert_rows == -1) {
-    int err;
-    if ((err = share->write_rows(rows, sz, &cond)) != 0) {
+    int err = share->write_rows(rows, sz, &cond);
+    free_rows_buffer();
+    if (err != 0) {
       return err;
     }
     share->wake_listener();
@@ -1076,6 +1079,7 @@ int ha_queue::delete_row(const uchar *buf __attribute__((unused)))
 int ha_queue::prepare_rows_buffer(size_t sz)
 {
   if (rows == NULL) {
+    assert(rows_size == 0);
     rows_reserved = MIN_ROWS_BUFFER_SIZE;
     while (rows_reserved < sz) {
       rows_reserved *= 2;
@@ -1184,9 +1188,10 @@ static void erase_owned()
     pthread_cond_t cond;
     pthread_cond_init(&cond, NULL);
     share->lock();
-    my_off_t off = share->get_owned_row(pthread_self(), true);
+    my_off_t off = share->get_owned_row(pthread_self());
     assert(off != 0);
     share->remove_rows(&off, 1, &cond);
+    share->get_owned_row(pthread_self(), true);
     share->unlock();
     share->release();
     pthread_setspecific(share_key, NULL);
