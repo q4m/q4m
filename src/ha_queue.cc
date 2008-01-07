@@ -57,7 +57,7 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 
 using namespace std;
 
-#define ROWS_BUFFER_EXPAND_BY (4096)
+#define MIN_ROWS_BUFFER_SIZE (4096)
 #define COMPACT_THRESHOLD (16777216)
 #define DO_COMPACT(all, free) \
     ((all) >= COMPACT_THRESHOLD && (free) * 2 >= (all))
@@ -766,6 +766,7 @@ ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
    pos(),
    rows(NULL),
    rows_size(0),
+   rows_reserved(0),
    bulk_insert_rows(-1),
    bulk_delete_rows(NULL)
 {
@@ -776,9 +777,7 @@ ha_queue::~ha_queue()
 {
   delete bulk_delete_rows;
   bulk_delete_rows = NULL;
-  if (rows != NULL) {
-    my_free(rows, MYF(0));
-  }
+  free_rows_buffer();
   pthread_cond_destroy(&cond);
 }
 
@@ -819,6 +818,7 @@ int ha_queue::rnd_init(bool scan)
 int ha_queue::rnd_end()
 {
   share->unlock_reader();
+  free_rows_buffer();
   return 0;
 }
 
@@ -1075,24 +1075,36 @@ int ha_queue::delete_row(const uchar *buf __attribute__((unused)))
 
 int ha_queue::prepare_rows_buffer(size_t sz)
 {
-  size_t new_reserve = (rows_size + sz + ROWS_BUFFER_EXPAND_BY)
-    / ROWS_BUFFER_EXPAND_BY * ROWS_BUFFER_EXPAND_BY;
   if (rows == NULL) {
-    if ((rows = static_cast<uchar*>(my_malloc(new_reserve, MYF(0)))) == NULL) {
+    rows_reserved = MIN_ROWS_BUFFER_SIZE;
+    while (rows_reserved < sz) {
+      rows_reserved *= 2;
+    }
+    if ((rows = static_cast<uchar*>(my_malloc(rows_reserved, MYF(0))))
+	== NULL) {
       return -1;
     }
-  } else {
-    size_t cur_reserve = (rows_size + ROWS_BUFFER_EXPAND_BY)
-      / ROWS_BUFFER_EXPAND_BY * ROWS_BUFFER_EXPAND_BY;
-    if (new_reserve != cur_reserve) {
-      void *pt;
-      if ((pt = my_realloc(rows, new_reserve, MYF(0))) == NULL) {
-	return -1;
-      }
-      rows = static_cast<uchar*>(pt);
+  } else if (rows_reserved < rows_size + sz) {
+    size_t new_reserve = rows_reserved;
+    do {
+      new_reserve *= 2;
+    } while (new_reserve < rows_size + sz);
+    void *pt;
+    if ((pt = my_realloc(rows, new_reserve, MYF(0))) == NULL) {
+      return -1;
     }
+    rows = static_cast<uchar*>(pt);
+    rows_reserved = new_reserve;
   }
   return 0;
+}
+
+void ha_queue::free_rows_buffer()
+{
+  if (rows != NULL) {
+    my_free(rows, MYF(0));
+    rows = NULL;
+  }
 }
 
 void ha_queue::unpack_row(uchar *buf)

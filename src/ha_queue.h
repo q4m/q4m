@@ -225,7 +225,7 @@ class ha_queue: public handler
   
   my_off_t pos;
   uchar *rows;
-  size_t rows_size;
+  size_t rows_size, rows_reserved;
   size_t bulk_insert_rows; /* should be -1 unless bulk_insertion */
   std::vector<my_off_t> *bulk_delete_rows;
   
@@ -274,6 +274,7 @@ class ha_queue: public handler
   int delete_row(const uchar *buf);
  private:
   int prepare_rows_buffer(size_t sz);
+  void free_rows_buffer();
   void unpack_row(uchar *buf);
   size_t pack_row(uchar *buf);
 };
