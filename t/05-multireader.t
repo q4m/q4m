@@ -3,7 +3,8 @@
 use strict;
 use warnings;
 
-use Test::More tests => 3;
+use Time::HiRes qw/time/;
+use Test::More tests => 4;
 
 use DBI;
 use List::MoreUtils qw/uniq/;
@@ -48,6 +49,8 @@ for (my $i = 0; $i < $NUM_CHILDREN; $i++) {
     }
 }
 
+my $start = time;
+
 # start adding messages
 $dbh = dbi_connect();
 for (my $i = 0; $i < $NUM_MESSAGES; $i += $BLOCK_SIZE) {
@@ -62,6 +65,8 @@ for (my $i = 0; $i < $NUM_CHILDREN; $i++) {
     until (waitpid(-1, 0) > 0) {
     }
 }
+
+my $elapsed = time - $start;
 
 # check all logs
 my @recvs;
@@ -79,3 +84,11 @@ foreach my $pid (@children) {
 is(scalar @recvs, $NUM_MESSAGES);
 is($recvs[0], 1);
 is($recvs[-1], $NUM_MESSAGES);
+is($dbh->selectrow_array('select count(*) from q4m_t'), 0);
+
+print STDERR "\n\nMultireader benchmark result:\n";
+printf STDERR "    # of messages: %d\n", $NUM_MESSAGES;
+printf STDERR "    Elapsed:       %.3f seconds\n", $elapsed;
+printf STDERR "    Concurrency:   %d\n", $NUM_CHILDREN;
+printf STDERR "    Throughput:    %.3f mess./sec.\n", $NUM_MESSAGES / $elapsed;
+print STDERR "\n";
