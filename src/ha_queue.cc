@@ -941,7 +941,15 @@ THR_LOCK_DATA **ha_queue::store_lock(THD *thd,
 				     enum thr_lock_type lock_type)
 {
   if (lock_type != TL_IGNORE && lock.type == TL_UNLOCK) {
-    lock.type=lock_type;
+    // just follow ha_archive::store_lock
+    if ((TL_WRITE_CONCURRENT_INSERT <= lock_type && lock_type <= TL_WRITE)
+	&& ! thd_in_lock_tables(thd) && ! thd_tablespace_op(thd)) {
+      lock.type = TL_WRITE_ALLOW_WRITE;
+    } else if (lock_type == TL_READ_NO_INSERT && ! thd_in_lock_tables(thd)) {
+      lock.type = TL_READ;
+    } else {
+      lock.type = lock_type;
+    }
   }
   
   *to++= &lock;
