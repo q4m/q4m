@@ -9,7 +9,7 @@ use Test::More tests => 4;
 use DBI;
 use List::MoreUtils qw/uniq/;
 
-my $NUM_CHILDREN = 32;
+my $NUM_CHILDREN = $ENV{CONCURRENCY} || 32;
 my $NUM_MESSAGES = $NUM_CHILDREN * 200;
 my $BLOCK_SIZE = 100;
 
@@ -87,8 +87,9 @@ is($recvs[-1], $NUM_MESSAGES);
 is($dbh->selectrow_array('select count(*) from q4m_t'), 0);
 
 print STDERR "\n\nMultireader benchmark result:\n";
-printf STDERR "    # of messages: %d\n", $NUM_MESSAGES;
-printf STDERR "    Elapsed:       %.3f seconds\n", $elapsed;
-printf STDERR "    Concurrency:   %d\n", $NUM_CHILDREN;
-printf STDERR "    Throughput:    %.3f mess./sec.\n", $NUM_MESSAGES / $elapsed;
+printf STDERR "    Number of messages: %d\n", $NUM_MESSAGES;
+printf STDERR "    Number of readers:  %d\n", $NUM_CHILDREN;
+printf STDERR "    Elapsed:            %.3f seconds\n", $elapsed;
+printf STDERR "    Throughput:         %.3f mess./sec.\n",
+    $NUM_MESSAGES / $elapsed;
 print STDERR "\n";
