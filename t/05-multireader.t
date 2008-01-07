@@ -71,6 +71,8 @@ foreach my $pid (@children) {
         chomp $l;
         push @recvs, $l;
     }
+    close $logfh;
+    unlink "$pid.log";
 }
 @recvs = sort { $a <=> $b } uniq @recvs;
 
