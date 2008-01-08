@@ -1197,9 +1197,10 @@ static void erase_owned()
     pthread_cond_init(&cond, NULL);
     share->lock();
     my_off_t off = share->get_owned_row(pthread_self());
-    assert(off != 0);
-    share->remove_rows(&off, 1, &cond);
-    share->get_owned_row(pthread_self(), true);
+    if (off != 0) {
+      share->remove_rows(&off, 1, &cond);
+      share->get_owned_row(pthread_self(), true);
+    }
     share->unlock();
     share->release();
     pthread_setspecific(share_key, NULL);
@@ -1334,9 +1335,8 @@ long long queue_wait(UDF_INIT *initid, UDF_ARGS *args __attribute__((unused)),
       break;
     }
   } while (info->share->wait(info->return_at) == 0);
-  if (ret != 0) {
-    pthread_setspecific(share_key, info->share);
-  }
+  /* always enter owner-mode, regardless whether or not we own a row */
+  pthread_setspecific(share_key, info->share);
   info->share->unlock();
   
   *is_null = 0;
