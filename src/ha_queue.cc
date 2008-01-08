@@ -47,6 +47,8 @@ extern "C" {
 #  define pwrite pwrite64
 #endif
 
+#define LOCK_BEFORE_SIGNAL 1
+
 #include "ha_queue.h"
 #include "adler32.c"
 
@@ -307,7 +309,13 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   
  ERR_AFTER_WRITER_START:
   share->writer_exit = true;
+#ifdef LOCK_BEFORE_SIGNAL
+  pthread_mutex_lock(&share->mutex);
+#endif
   pthread_cond_signal(&share->writer_cond);
+#ifdef LOCK_BEFORE_SIGNAL
+  pthread_mutex_unlock(&share->mutex);
+#endif
   pthread_join(share->writer_thread, NULL);
  ERR_AFTER_FILEOPEN:
   close(share->fd);
@@ -332,7 +340,13 @@ void queue_share_t::release()
   if (--use_count == 0) {
     hash_delete(&queue_open_tables, reinterpret_cast<uchar*>(this));
     writer_exit = true;
+#ifdef LOCK_BEFORE_SIGNAL
+    pthread_mutex_lock(&mutex);
+#endif
     pthread_cond_signal(&writer_cond);
+#ifdef LOCK_BEFORE_SIGNAL
+    pthread_mutex_unlock(&mutex);
+#endif
     if (pthread_join(writer_thread, NULL) != 0) {
       kill_proc("failed to join writer thread\n");
     }
@@ -625,9 +639,15 @@ void queue_share_t::writer_do_remove(remove_list_t* l)
 	err = HA_ERR_CRASHED_ON_USAGE;
       }
     }
+#ifdef LOCK_BEFORE_SIGNAL
+    (*i)->err = err;
+    pthread_cond_signal((*i)->cond);
+    pthread_mutex_unlock(&mutex);
+#else
     pthread_mutex_unlock(&mutex);
     (*i)->err = err;
     pthread_cond_signal((*i)->cond);
+#endif
   }
 }
 
@@ -670,7 +690,13 @@ void *queue_share_t::writer_start()
       if ((err = writer_do_append(al)) != 0) {
 	sync_file(fd);
       }
+#ifdef LOCK_BEFORE_SIGNAL
+      pthread_mutex_lock(&mutex);
+#endif
       close_append_list(al, err);
+#ifdef LOCK_BEFORE_SIGNAL
+      pthread_mutex_unlock(&mutex);
+#endif
     } else {
       sync_file(fd);
     }
