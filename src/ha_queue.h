@@ -20,8 +20,6 @@
 
 class queue_share_t;
 
-// forget about endianness, for now :-)
-
 class queue_row_t {
   /* size is stored in the lower 30 bits, while upper 2 bits are used for
    * attributes.  if type == type_checksum, lower 30 bits adler32 is stored
@@ -241,7 +239,9 @@ class ha_queue: public handler
   }
   const char **bas_ext() const;
   ulonglong table_flags() const {
-    return 0;
+    return HA_NO_TRANSACTIONS | HA_CAN_GEOMETRY | HA_CAN_BIT_FIELD
+      | HA_BINLOG_ROW_CAPABLE | HA_BINLOG_STMT_CAPABLE | HA_FILE_BASED
+      | HA_NO_AUTO_INCREMENT;
   }
 
   ulong index_flags(uint, uint, bool) const {
