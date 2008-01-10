@@ -1,0 +1,21 @@
+----------------------------------------------------------------------
+Thank you for installing Q4M.  If this is the first time to install
+Q4M, please run support-files/install.sql and activate it.
+
+    % mysql -u root mysql < support-files/install.sql
+
+Once you have activated Q4M, you can try running the tests bundled to
+this ditribution, by typing
+
+    % make test
+
+The tests are written in perl, so you can specify database locations
+using perl-style DBI strings, for example:
+
+    % DBI='dbi:mysql:database=test2;host=testhost' \
+      DBI_USER='testuser' \
+      DBI_PASSWORD='testpass' \
+      make test
+
+Have fun!
+----------------------------------------------------------------------
