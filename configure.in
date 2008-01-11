@@ -13,8 +13,6 @@ LIBTOOL="$LIBTOOL --preserve-dup-deps"
 AC_SUBST(LIBTOOL)
 
 sinclude(config/ac_mysql.m4)
-sinclude(config/ac_system.m4)
-sinclude(config/dtrace.m4)
 
 MYSQL_SRC_TEST
 AC_SUBST(MYSQL_INC)
