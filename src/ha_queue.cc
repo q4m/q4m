@@ -1169,7 +1169,7 @@ size_t ha_queue::pack_row(uchar *buf)
     sz += 2 + ((Field_blob*)table->field[*ptr])->get_length();
   }
   if (sz > queue_row_t::max_size || prepare_rows_buffer(sz) != 0) {
-    return -1;
+    return 0;
   }
   /* write data */
   uchar *dst = rows + rows_size + queue_row_t::header_size();
