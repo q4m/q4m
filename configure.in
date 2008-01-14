@@ -73,6 +73,12 @@ no)
     ;;
 esac
 
+if test -z "$DOC_ROOT"
+then
+    DOC_ROOT='http://q4m.31tools.com/'
+fi
+AC_SUBST(DOC_ROOT)
+
 AC_CHECK_SIZEOF(int*)
 if test "$SIZEOF_INT_P" = "8"
 then
