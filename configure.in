@@ -27,6 +27,13 @@ else
   DTRACEFLAGS="-64"
 fi
 
+OSNAME=`uname -s | tr "[[:upper:]]" "[[:lower:]]"`
+PROCNAME=`uname -p | tr "[[:upper:]]" "[[:lower:]]"`
+if test "$PROCNAME" = "i686"
+then
+    PROCNAME="i386"
+fi
+
 AC_ARG_WITH(debug,
     [   --with-debug            enable debugging, should match the configuration
                            used to compile mysql ],
@@ -48,8 +55,7 @@ AC_ARG_WITH(sync,
     [ with_sync=yes ])
 if test "$with_sync" = "yes"
 then
-    UNAME=`uname -s`
-    if test "$UNAME" = "Darwin" ; then
+    if test "$OSNAME" = "darwin" ; then
         with_sync="fcntl"
     else
         with_sync="fdatasync"
@@ -66,6 +72,20 @@ no)
     AC_DEFINE([FDATASYNC_SKIP],1,[do not sync at checkpoints])
     ;;
 esac
+
+AC_CHECK_SIZEOF(int*)
+if test "$SIZEOF_INT_P" = "8"
+then
+    if test "$PROCNAME" = "x86_64"
+    then
+	BINARY_ARCH="$OSNAME-x86_64"
+    else
+	BINARY_ARCH="$OSNAME-$PROCNAME-64bit"
+    fi
+else
+    BINARY_ARCH="$OSNAME-$PROCNAME"
+fi
+AC_SUBST(BINARY_ARCH)
 
 AC_C_CONST
 AC_TYPE_SIZE_T
