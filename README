@@ -1,14 +1,13 @@
 Q4M - a Message Queue for MySQL
 
-Dec. 27 2007
-Kazuho Oku
-Cybozu Labs, Inc.
+Jan 14 2008
+Kazuho Oku at Cybozu Labs, Inc.
 
 
 Q4M is a message queue that works as a pluggable storage engine of MySQL
 5.1.
 
-Since its development is still in very early alpha-stage, NEVER USE THE
+Since its development is still in early stage, BE CAREFUL USING THE
 SOFTWARE IN PRODUCTION ENVIRONMENT.
 
 
@@ -20,58 +19,4 @@ Copyright of the source code of the queue engine belongs to Cybozu Labs,
 Inc., and is licensed under GPLv2.
 
 
-* LIMITATIONS
-
-- does not support REPLACE,UPDATE (only supports SELECT,DELETE,INSERT)
-  - since Q4M is a queue :-)
-- no transactions
-- no indexes
-  - simplicity for speed
-  - is it neressary, when we can create any number of tables=queues?
-
-
-* INSTALLATION
-
-To install the software, follow the steps below.
-
- % ./configure --with-mysql=<mysql-source-dir> --libdir=<mysql-lib-dir>
- % make
- % make install
- % mysql -u root
- > INSTALL PLUGIN queue SONAME 'libqueue_engine.so';
- > CREATE FUNCTION queue_wait RETURNS INT SONAME 'libqueue_engine.so';
- > CREATE FUNCTION queue_end RETURNS INT SONAME 'libqueue_engine.so';
- > CREATE FUNCTION queue_abort RETURNS INT SONAME 'libqueue_engine.so';
-
-If you are installing Q4M against a debug build of MySQL, it might be
-necessary to set the --with-debug compile option (since size of the internal
-structures differ between a debug build and a release build).
-
- % ./configure --with-debug ...
-
-
-* USAGE
-
-creating queues:
- > CREATE TABLE my_queue (id INT UNSIGNED NOT NULL) ENGINE=queue;
-
-sending messages to queue:
- > INSERT INTO my_queue (id) values (2),(3),(4);
-
-receiving messages from queue (shown in perl code):
-  
-  while (1) {
-    # wait until any data becomes available
-    $dbh->do('select queue_wait("dbname.tblname")');
-    # receive data (only one row becomes ready at once)
-    if (my @ary = $dbh->selectrow_array('select * from tblname')) {
-      # process data
-      unless (process_row(@ary)) {
-        # abort if failed, return data to queue
-        $dbh->do('select queue_abort()');
-        last;
-      }
-    }
-  }
-  # tidy up
-  $dbh->do('select queue_end()');
+For more information see doc/index.html.

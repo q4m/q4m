@@ -16,7 +16,7 @@ install-exec-hook:
 dist-doc:
 	rm -rf $(distdir)/doc doc.tmp
 	mkdir -p $(distdir)/doc doc.tmp
-	(cd doc.tmp && wget -r $(DOC_ROOT))
+	(cd doc.tmp && wget -q -r $(DOC_ROOT))
 	find doc.tmp -type f -exec mv {} $(distdir)/doc \;
 	for i in $(distdir)/doc/*.php ; do \
 	    mv $$i `echo $$i | perl -pe 's/\.php$$/.html/'` ; \
@@ -24,7 +24,7 @@ dist-doc:
 	perl -i.bak -pe 's/href="([a-z0-9_]*)\.php"/href="$$1.html"/g' $(distdir)/doc/*.html
 	perl -i.bak -pe 's|href="\./"|href="index.html"|g' $(distdir)/doc/*.html
 	rm -f $(distdir)/doc/*.bak
-	(cd $(distdir)/doc && wget $(DOC_ROOT)/top.jpg)
+	(cd $(distdir)/doc && wget -q $(DOC_ROOT)/top.jpg)
 	rm -rf doc.tmp
 
 dist-hook: dist-doc
