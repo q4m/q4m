@@ -5,4 +5,4 @@ install-exec-hook:
 	@cat support-files/install-exec-hook.txt
 
 test:
-	perl -MTest::Harness -e 'runtests(@ARGV)' t/*.t
+	./run_tests.pl
