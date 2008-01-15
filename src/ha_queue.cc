@@ -797,6 +797,7 @@ ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
    bulk_insert_rows(-1),
    bulk_delete_rows(NULL)
 {
+  assert(ref_length == sizeof(my_off_t));
   pthread_cond_init(&cond, NULL);
 }
 
@@ -916,14 +917,14 @@ int ha_queue::rnd_next(uchar *buf)
 
 void ha_queue::position(const uchar *record)
 {
-  my_store_ptr(ref, sizeof(pos), pos);
+  my_store_ptr(ref, ref_length, pos);
 }
 
 int ha_queue::rnd_pos(uchar *buf, uchar *_pos)
 {
   assert(rows_size == 0);
   
-  pos = static_cast<my_off_t>(my_get_ptr(_pos, sizeof(pos)));
+  pos = my_get_ptr(_pos, ref_length);
   int err = 0;
   
   share->lock();
