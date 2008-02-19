@@ -107,9 +107,8 @@ class queue_share_t {
     const void *rows;
     size_t rows_size;
     int err; /* -1 if not completed, otherwise HA_ERR_XXX or 0 */
-    pthread_cond_t *cond;
-    append_t(const void *r, size_t rs, pthread_cond_t *co)
-    : rows(r), rows_size(rs), err(-1), cond(co) {
+    append_t(const void *r, size_t rs)
+    : rows(r), rows_size(rs), err(-1) {
     }
   private:
     append_t(const append_t&);
@@ -121,9 +120,8 @@ class queue_share_t {
     my_off_t *offsets;
     int cnt;
     int err; /* -1 if not completed, otherwise HA_ERR_XXX or 0 */
-    pthread_cond_t *cond;
-    remove_t(my_off_t *o, int c, pthread_cond_t *co)
-    : offsets(o), cnt(c), err(-1), cond(co) {
+    remove_t(my_off_t *o, int c)
+    : offsets(o), cnt(c), err(-1) {
     }
   };
   typedef std::vector<remove_t*> remove_list_t;
@@ -155,7 +153,9 @@ class queue_share_t {
   int num_readers;
   
   pthread_t writer_thread;
-  pthread_cond_t writer_cond;
+  pthread_cond_t to_writer_cond;
+  pthread_cond_t *from_writer_cond;
+  pthread_cond_t _from_writer_conds[2];
   bool writer_exit;
   append_list_t *append_list;
   remove_list_t *remove_list;
@@ -178,7 +178,7 @@ public:
   THR_LOCK *get_store_lock() { return &store_lock; }
   const queue_file_header_t *header() const { return &_header; }
   my_off_t reset_owner(pthread_t owner);
-  int write_rows(const void *rows, size_t rows_size, pthread_cond_t *cond);
+  int write_rows(const void *rows, size_t rows_size);
   /* functions below requires lock */
   const void *read_cache(my_off_t off, ssize_t size, bool populate_cache);
   ssize_t read(void *data, my_off_t off, ssize_t size, bool populate_cache);
@@ -198,7 +198,7 @@ public:
   }
   int next(my_off_t *off);
   my_off_t get_owned_row(pthread_t owner, bool remove = false);
-  int remove_rows(my_off_t *offsets, int cnt, pthread_cond_t *cond);
+  int remove_rows(my_off_t *offsets, int cnt);
   pthread_t find_owner(my_off_t off);
   my_off_t assign_owner(pthread_t owner);
 private:
@@ -219,7 +219,6 @@ class ha_queue: public handler
 {
   THR_LOCK_DATA lock;
   queue_share_t *share;
-  pthread_cond_t cond;
   
   my_off_t pos;
   uchar *rows;

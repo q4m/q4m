@@ -47,8 +47,6 @@ extern "C" {
 #  define pwrite pwrite64
 #endif
 
-#define LOCK_BEFORE_SIGNAL 1
-
 #include "ha_queue.h"
 #include "adler32.c"
 
@@ -263,7 +261,10 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   new (&share->rows_owned) queue_rows_owned_t();
   pthread_cond_init(&share->queue_cond, NULL);
   share->num_readers = 0;
-  pthread_cond_init(&share->writer_cond, NULL);
+  pthread_cond_init(&share->to_writer_cond, NULL);
+  pthread_cond_init(&share->_from_writer_conds[0], NULL);
+  pthread_cond_init(&share->_from_writer_conds[1], NULL);
+  share->from_writer_cond = &share->_from_writer_conds[0];
   share->writer_exit = false;
   share->append_list = new append_list_t();
   share->remove_list = new remove_list_t();
@@ -309,20 +310,16 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   
  ERR_AFTER_WRITER_START:
   share->writer_exit = true;
-#ifdef LOCK_BEFORE_SIGNAL
-  pthread_mutex_lock(&share->mutex);
-#endif
-  pthread_cond_signal(&share->writer_cond);
-#ifdef LOCK_BEFORE_SIGNAL
-  pthread_mutex_unlock(&share->mutex);
-#endif
+  pthread_cond_signal(&share->to_writer_cond);
   pthread_join(share->writer_thread, NULL);
  ERR_AFTER_FILEOPEN:
   close(share->fd);
  ERR_ON_FILEOPEN:
   delete share->remove_list;
   delete share->append_list;
-  pthread_cond_destroy(&share->writer_cond);
+  pthread_cond_destroy(&share->_from_writer_conds[0]);
+  pthread_cond_destroy(&share->_from_writer_conds[1]);
+  pthread_cond_destroy(&share->to_writer_cond);
   pthread_cond_destroy(&share->queue_cond);
   share->rows_owned.~list();
   thr_lock_delete(&share->store_lock);
@@ -340,13 +337,7 @@ void queue_share_t::release()
   if (--use_count == 0) {
     hash_delete(&queue_open_tables, reinterpret_cast<uchar*>(this));
     writer_exit = true;
-#ifdef LOCK_BEFORE_SIGNAL
-    pthread_mutex_lock(&mutex);
-#endif
-    pthread_cond_signal(&writer_cond);
-#ifdef LOCK_BEFORE_SIGNAL
-    pthread_mutex_unlock(&mutex);
-#endif
+    pthread_cond_signal(&to_writer_cond);
     if (pthread_join(writer_thread, NULL) != 0) {
       kill_proc("failed to join writer thread\n");
     }
@@ -358,7 +349,9 @@ void queue_share_t::release()
     close(fd);
     delete remove_list;
     delete append_list;
-    pthread_cond_destroy(&writer_cond);
+    pthread_cond_destroy(&_from_writer_conds[0]);
+    pthread_cond_destroy(&_from_writer_conds[1]);
+    pthread_cond_destroy(&to_writer_cond);
     pthread_cond_destroy(&queue_cond);
     rows_owned.~list();
     thr_lock_delete(&store_lock);
@@ -375,7 +368,7 @@ void queue_share_t::unlock_reader()
   if (--num_readers == 0
       && DO_COMPACT(_header.end() - sizeof(_header),
 		    _header.begin() - sizeof(_header))) {
-    pthread_cond_signal(&writer_cond);
+    pthread_cond_signal(&to_writer_cond);
   }
   unlock();
 }
@@ -399,16 +392,16 @@ my_off_t queue_share_t::reset_owner(pthread_t owner)
   return off;
 }
 
-int queue_share_t::write_rows(const void *rows, size_t rows_size,
-			      pthread_cond_t *cond)
+int queue_share_t::write_rows(const void *rows, size_t rows_size)
 {
-  append_t a(rows, rows_size, cond);
+  append_t a(rows, rows_size);
   
   pthread_mutex_lock(&mutex);
   append_list->push_back(&a);
-  pthread_cond_signal(&writer_cond);
+  pthread_cond_t *c = from_writer_cond;
+  pthread_cond_signal(&to_writer_cond);
   do {
-    pthread_cond_wait(cond, &mutex);
+    pthread_cond_wait(c, &mutex);
   } while (a.err == -1);
   pthread_mutex_unlock(&mutex);
   
@@ -492,14 +485,15 @@ my_off_t queue_share_t::get_owned_row(pthread_t owner, bool remove)
   return 0;
 }
 
-int queue_share_t::remove_rows(my_off_t *offsets, int cnt, pthread_cond_t *cond)
+int queue_share_t::remove_rows(my_off_t *offsets, int cnt)
 {
-  remove_t r(offsets, cnt, cond);
+  remove_t r(offsets, cnt);
   
   remove_list->push_back(&r);
-  pthread_cond_signal(&writer_cond);
+  pthread_cond_t *c = from_writer_cond;
+  pthread_cond_signal(&to_writer_cond);
   do {
-    pthread_cond_wait(cond, &mutex);
+    pthread_cond_wait(c, &mutex);
   } while (r.err == -1);
   
   return r.err;
@@ -538,7 +532,6 @@ static void close_append_list(queue_share_t::append_list_t *l, int err)
        i != l->end();
        ++i) {
     (*i)->err = err;
-    pthread_cond_signal((*i)->cond);
   }
   delete l;
 }
@@ -639,15 +632,8 @@ void queue_share_t::writer_do_remove(remove_list_t* l)
 	err = HA_ERR_CRASHED_ON_USAGE;
       }
     }
-#ifdef LOCK_BEFORE_SIGNAL
     (*i)->err = err;
-    pthread_cond_signal((*i)->cond);
     pthread_mutex_unlock(&mutex);
-#else
-    pthread_mutex_unlock(&mutex);
-    (*i)->err = err;
-    pthread_cond_signal((*i)->cond);
-#endif
   }
 }
 
@@ -665,7 +651,7 @@ void *queue_share_t::writer_start()
 			       _header.begin() - sizeof(_header))) {
 	compact();
       } else {
-	pthread_cond_wait(&writer_cond, &mutex);
+	pthread_cond_wait(&to_writer_cond, &mutex);
       }
     }
     /* detach operation lists */
@@ -679,6 +665,8 @@ void *queue_share_t::writer_start()
       al = append_list;
       append_list = new append_list_t();
     }
+    pthread_cond_t *notify_cond = from_writer_cond;
+    from_writer_cond = _from_writer_conds + (_from_writer_conds == notify_cond);
     /* do the task and send back the results */
     pthread_mutex_unlock(&mutex);
     if (rl != NULL) {
@@ -690,15 +678,11 @@ void *queue_share_t::writer_start()
       if ((err = writer_do_append(al)) != 0) {
 	sync_file(fd);
       }
-#ifdef LOCK_BEFORE_SIGNAL
-      pthread_mutex_lock(&mutex);
-#endif
       close_append_list(al, err);
-#ifdef LOCK_BEFORE_SIGNAL
-      pthread_mutex_unlock(&mutex);
-#endif
+      pthread_cond_broadcast(notify_cond);
     } else {
       sync_file(fd);
+      pthread_cond_broadcast(notify_cond);
     }
     pthread_mutex_lock(&mutex);
   }
@@ -798,7 +782,6 @@ ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
    bulk_delete_rows(NULL)
 {
   assert(ref_length == sizeof(my_off_t));
-  pthread_cond_init(&cond, NULL);
 }
 
 ha_queue::~ha_queue()
@@ -806,7 +789,6 @@ ha_queue::~ha_queue()
   delete bulk_delete_rows;
   bulk_delete_rows = NULL;
   free_rows_buffer();
-  pthread_cond_destroy(&cond);
 }
 
 static const char *ha_queue_exts[] = {
@@ -1024,7 +1006,7 @@ int ha_queue::end_bulk_insert()
   int ret = 0;
   
   if (rows_size != 0) {
-    if ((ret = share->write_rows(rows, rows_size, &cond)) == 0) {
+    if ((ret = share->write_rows(rows, rows_size)) == 0) {
       for (size_t i = 0; i < bulk_insert_rows; i++) {
 	share->wake_listener();
       }
@@ -1052,8 +1034,7 @@ int ha_queue::end_bulk_delete()
   if (bulk_delete_rows->size() != 0) {
     share->lock();
     ret =
-      share->remove_rows(&bulk_delete_rows->front(), bulk_delete_rows->size(),
-			 &cond);
+      share->remove_rows(&bulk_delete_rows->front(), bulk_delete_rows->size());
     share->unlock();
   }
   delete bulk_delete_rows;
@@ -1070,7 +1051,7 @@ int ha_queue::write_row(uchar *buf)
     return HA_ERR_OUT_OF_MEM;
   }
   if (bulk_insert_rows == -1) {
-    int err = share->write_rows(rows, sz, &cond);
+    int err = share->write_rows(rows, sz);
     free_rows_buffer();
     if (err != 0) {
       return err;
@@ -1104,7 +1085,7 @@ int ha_queue::delete_row(const uchar *buf __attribute__((unused)))
     share->unlock();
     bulk_delete_rows->push_back(pos);
   } else {
-    err = share->remove_rows(&pos, 1, &cond);
+    err = share->remove_rows(&pos, 1);
     share->unlock();
   }
   
@@ -1220,18 +1201,15 @@ static void erase_owned()
   
   if ((share = static_cast<queue_share_t*>(pthread_getspecific(share_key)))
       != NULL) {
-    pthread_cond_t cond;
-    pthread_cond_init(&cond, NULL);
     share->lock();
     my_off_t off = share->get_owned_row(pthread_self());
     if (off != 0) {
-      share->remove_rows(&off, 1, &cond);
+      share->remove_rows(&off, 1);
       share->get_owned_row(pthread_self(), true);
     }
     share->unlock();
     share->release();
     pthread_setspecific(share_key, NULL);
-    pthread_cond_destroy(&cond);
   }
 }
 
