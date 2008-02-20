@@ -1226,8 +1226,6 @@ static queue_share_t* get_share_check(const char* db_table_name)
   }
   build_table_filename(path, FN_REFLEN - 1, db, tbl, "", 0);
   
-  fprintf(stderr, "%s\n", path);
-  
   return queue_share_t::get_share(path);
 }
 
