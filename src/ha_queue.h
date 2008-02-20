@@ -126,6 +126,15 @@ class queue_share_t {
   };
   typedef std::vector<remove_t*> remove_list_t;
   
+  struct listener_t {
+    pthread_cond_t *cond;
+    bool signalled;
+    listener_t(pthread_cond_t *c)
+    : cond(c), signalled(false) {
+    }
+  };
+  typedef std::list<listener_t*> listener_list_t;
+  
  private:
   uint use_count;
   char *table_name;
@@ -149,7 +158,8 @@ class queue_share_t {
   
   queue_rows_owned_t rows_owned;
   
-  pthread_cond_t queue_cond;
+  listener_list_t listener_list;
+  
   int num_readers;
   
   pthread_t writer_thread;
@@ -170,11 +180,10 @@ public:
   void unlock() { pthread_mutex_unlock(&mutex); }
   void lock_reader() { lock(); ++num_readers; unlock(); }
   void unlock_reader();
-  void wake_listener() { pthread_cond_signal(&queue_cond); }
-  int wait(time_t t) {
-    timespec ts = { t, 0 };
-    return pthread_cond_timedwait(&queue_cond, &mutex, &ts);
-  }
+  void register_listener(listener_t *l) { listener_list.push_back(l); }
+  void unregister_listener(pthread_cond_t *c);
+  void wake_listener(bool locked = false);
+  static int wait_multi(const std::list<queue_share_t*> &shares, pthread_cond_t *c, time_t t);
   THR_LOCK *get_store_lock() { return &store_lock; }
   const queue_file_header_t *header() const { return &_header; }
   my_off_t reset_owner(pthread_t owner);

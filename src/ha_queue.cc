@@ -65,6 +65,8 @@ using namespace std;
 #define Q4M ".Q4M"
 #define Q4T ".Q4T"
 
+#define EMPTY_OWNER_MODE ((queue_share_t*)1)
+
 static HASH queue_open_tables;
 #ifdef SAFE_MUTEX
 static pthread_mutex_t g_mutex = {
@@ -259,7 +261,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   thr_lock_init(&share->store_lock);
   share->cache.off = 0;
   new (&share->rows_owned) queue_rows_owned_t();
-  pthread_cond_init(&share->queue_cond, NULL);
+  new (&share->listener_list) listener_list_t();
   share->num_readers = 0;
   pthread_cond_init(&share->to_writer_cond, NULL);
   pthread_cond_init(&share->_from_writer_conds[0], NULL);
@@ -320,7 +322,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   pthread_cond_destroy(&share->_from_writer_conds[0]);
   pthread_cond_destroy(&share->_from_writer_conds[1]);
   pthread_cond_destroy(&share->to_writer_cond);
-  pthread_cond_destroy(&share->queue_cond);
+  share->listener_list.~list();
   share->rows_owned.~list();
   thr_lock_delete(&share->store_lock);
   pthread_mutex_destroy(&share->mutex);
@@ -352,7 +354,7 @@ void queue_share_t::release()
     pthread_cond_destroy(&_from_writer_conds[0]);
     pthread_cond_destroy(&_from_writer_conds[1]);
     pthread_cond_destroy(&to_writer_cond);
-    pthread_cond_destroy(&queue_cond);
+    listener_list.~list();
     rows_owned.~list();
     thr_lock_delete(&store_lock);
     pthread_mutex_destroy(&mutex);
@@ -371,6 +373,36 @@ void queue_share_t::unlock_reader()
     pthread_cond_signal(&to_writer_cond);
   }
   unlock();
+}
+
+void queue_share_t::unregister_listener(pthread_cond_t *c)
+{
+  for (listener_list_t::iterator i = listener_list.begin();
+       i != listener_list.end();
+       ++i) {
+    if ((*i)->cond == c) {
+      listener_list.erase(i);
+      break;
+    }
+  }
+}
+
+void queue_share_t::wake_listener(bool locked)
+{
+  if (! locked) {
+    pthread_mutex_lock(&g_mutex);
+  }
+  
+  if (! listener_list.empty()) {
+    listener_t* l = listener_list.front();
+    l->signalled = true;
+    pthread_cond_signal(l->cond);
+    listener_list.pop_front();
+  }
+  
+  if (! locked) {
+    pthread_mutex_unlock(&g_mutex);
+  }
 }
 
 my_off_t queue_share_t::reset_owner(pthread_t owner)
@@ -1201,14 +1233,16 @@ static void erase_owned()
   
   if ((share = static_cast<queue_share_t*>(pthread_getspecific(share_key)))
       != NULL) {
-    share->lock();
-    my_off_t off = share->get_owned_row(pthread_self());
-    if (off != 0) {
-      share->remove_rows(&off, 1);
-      share->get_owned_row(pthread_self(), true);
+    if (share != EMPTY_OWNER_MODE) {
+      share->lock();
+      my_off_t off = share->get_owned_row(pthread_self());
+      if (off != 0) {
+	share->remove_rows(&off, 1);
+	share->get_owned_row(pthread_self(), true);
+      }
+      share->unlock();
+      share->release();
     }
-    share->unlock();
-    share->release();
     pthread_setspecific(share_key, NULL);
   }
 }
@@ -1219,10 +1253,12 @@ static int close_connection_handler(handlerton *hton, THD *thd)
   
   if ((share = static_cast<queue_share_t*>(pthread_getspecific(share_key)))
       != NULL) {
-    if (share->reset_owner(pthread_self()) != 0) {
-      share->wake_listener();
+    if (share != EMPTY_OWNER_MODE) {
+      if (share->reset_owner(pthread_self()) != 0) {
+	share->wake_listener();
+      }
+      share->release();
     }
-    share->release();
     pthread_setspecific(share_key, NULL);
   }
   
@@ -1274,23 +1310,115 @@ mysql_declare_plugin(queue)
 }
 mysql_declare_plugin_end;
 
+static int _queue_wait_core(char **share_names, int num_shares, int timeout,
+			    char *error)
+{
+  struct share_listener_t {
+    queue_share_t* share;
+    queue_share_t::listener_t listener;
+  };
+  share_listener_t *shares;
+  pthread_cond_t cond;
+  time_t return_at = time(NULL) + timeout;
+  int share_owned = -1;
+  
+  erase_owned();
+  
+  /* setup */
+  if ((shares =
+       reinterpret_cast<share_listener_t*>(my_malloc(num_shares
+						     * sizeof(share_listener_t),
+						     MY_ZEROFILL)))
+      == NULL) {
+    *error = 1;
+    return 0;
+  }
+  pthread_cond_init(&cond, NULL);
+  
+  /* set ha_data so that close_conn gets called,
+   * should correspond to the implementation of handle::ha_data
+   */
+  current_thd->ha_data[queue_hton->slot] = reinterpret_cast<void*>(1);
+  
+  /* setup, or immediately break if data found */
+  for (int i = 0; i < num_shares && share_owned == -1; i++) {
+    if ((shares[i].share = get_share_check(share_names[i])) == NULL) {
+      *error = 1;
+      goto EXIT;
+    }
+    new (&shares[i].listener) queue_share_t::listener_t(&cond);
+    shares[i].share->lock();
+    if (shares[i].share->assign_owner(pthread_self()) != 0) {
+      share_owned = i;
+    }
+    shares[i].share->unlock();
+  }
+  /* wait for signal */
+  if (share_owned == -1) {
+    pthread_mutex_lock(&g_mutex);
+    for (int i = 0; i < num_shares; i++) {
+      shares[i].share->register_listener(&shares[i].listener);
+    }
+    while (1) {
+      for (int i = 0; i < num_shares && share_owned == -1; i++) {
+	shares[i].share->lock();
+	if (shares[i].share->assign_owner(pthread_self()) != 0) {
+	  share_owned = i;
+	}
+	shares[i].share->unlock();
+      }
+      if (share_owned != -1) {
+	break;
+      }
+      timespec ts = { return_at, 0 };
+      int err = pthread_cond_timedwait(&cond, &g_mutex, &ts);
+      if (err != 0) {
+	break;
+      }
+    }
+    for (int i = 0; i < num_shares; i++) {
+      if (i != share_owned) {
+	if (shares[i].listener.signalled) {
+	  shares[i].share->unregister_listener(&cond);
+	} else {
+	  shares[i].share->wake_listener(true);
+	}
+      } else {
+	if (! shares[i].listener.signalled) {
+	  shares[i].share->unregister_listener(&cond);
+	}
+      }
+    }
+    pthread_mutex_unlock(&g_mutex);
+  }
+  /* always enter owner-mode, regardless whether or not we own a row */
+  pthread_setspecific(share_key,
+		      share_owned != -1
+		      ? shares[share_owned].share : EMPTY_OWNER_MODE);
+  
+ EXIT:
+  for (int i = 0; i < num_shares && shares[i].share != NULL; i++) {
+    if (i != share_owned) {
+      shares[i].share->release();
+    }
+  }
+  pthread_cond_destroy(&cond);
+  my_free(shares, MYF(0));
+  return share_owned;
+}
+
 my_bool queue_wait_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 {
-  queue_share_t *share;
-  time_t return_at;
-  
-  switch (args->arg_count) {
-  case 2:
-    args->arg_type[1] = INT_RESULT;
-    args->maybe_null[1] = 0;
-    // fallthrough
-  case 1:
-    args->arg_type[0] = STRING_RESULT;
-    args->maybe_null[0] = 0;
-    break;
-  default:
+  if (args->arg_count == 0) {
     strcpy(message, "queue_wait(table_name[,timeout]): argument error");
     return 1;
+  } else if (args->arg_count >= 2) {
+    args->arg_type[args->arg_count - 1] = INT_RESULT;
+    args->maybe_null[args->arg_count - 1] = 0;
+  }
+  for (int i = max(args->arg_count - 2, 0); i >= 0; i--) {
+    args->arg_type[i] = STRING_RESULT;
+    args->maybe_null[i] = 0;
   }
   initid->maybe_null = 0;
   
@@ -1301,44 +1429,16 @@ void queue_wait_deinit(UDF_INIT *initid __attribute__((unused)))
 {
 }
 
-long long queue_wait(UDF_INIT *initid, UDF_ARGS *args __attribute__((unused)),
+long long queue_wait(UDF_INIT *initid __attribute__((unused)), UDF_ARGS *args,
 		     char *is_null, char *error)
 {
-  queue_share_t *share;
-  time_t return_at;
-  int ret = 0;
-  
-  /* parse args */
-  if (args->arg_count >=2) {
-    return_at = time(NULL) + *reinterpret_cast<long long*>(args->args[1]);
-  } else {
-    return_at = time(NULL) + 60;
-  }
-  if ((share = get_share_check(args->args[0])) == NULL) {
-    *error = 1;
-    return 0;
-  }
-  
-  /* set ha_data so that close_conn gets called,
-   * should correspond to the implementation of handle::ha_data
-   */
-  current_thd->ha_data[queue_hton->slot] = reinterpret_cast<void*>(1);
-  
-  erase_owned();
-  
-  share->lock();
-  do {
-    if (share->assign_owner(pthread_self()) != 0) {
-      ret = 1;
-      break;
-    }
-  } while (share->wait(return_at) == 0);
-  /* always enter owner-mode, regardless whether or not we own a row */
-  pthread_setspecific(share_key, share);
-  share->unlock();
+  int timeout = args->arg_count >= 2
+    ? *reinterpret_cast<long long*>(args->args[args->arg_count - 1]) : 60;
   
   *is_null = 0;
-  return ret;
+  return
+    _queue_wait_core(args->args, max(args->arg_count - 1, 1), timeout, error)
+    + 1;
 }
 
 my_bool queue_end_init(UDF_INIT *initid,
