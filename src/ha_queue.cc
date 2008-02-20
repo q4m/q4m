@@ -1211,18 +1211,22 @@ static queue_share_t* get_share_check(const char* db_table_name)
 {
   char buf[FN_REFLEN];
   char path[FN_REFLEN];
-
-  // copy to buf, split to db name and table name, and build filename
+  const char *db, *tbl;
+  
   // FIXME: creates bogus name if db_table_name is too long (but no overruns)
-  strncpy(buf, db_table_name, FN_REFLEN - 1);
-  buf[FN_REFLEN - 1] = '\0';
-  char* tbl = strchr(buf, '.');
-  if (tbl == NULL)
-    return NULL;
-  *tbl++ = '\0';
-  if (*tbl == '\0')
-    return NULL;
-  build_table_filename(path, FN_REFLEN - 1, buf, tbl, "", 0);
+  if ((tbl = strchr(db_table_name, '.')) != NULL) {
+    size_t db_len = min(tbl - db_table_name, sizeof(buf) - 1);
+    memcpy(buf, db_table_name, db_len);
+    buf[db_len] = '\0';
+    db = buf;
+    tbl = tbl + 1;
+  } else {
+    db = current_thd->db;
+    tbl = db_table_name;
+  }
+  build_table_filename(path, FN_REFLEN - 1, db, tbl, "", 0);
+  
+  fprintf(stderr, "%s\n", path);
   
   return queue_share_t::get_share(path);
 }
