@@ -1274,55 +1274,51 @@ mysql_declare_plugin(queue)
 }
 mysql_declare_plugin_end;
 
-struct queue_wait_t {
-  queue_share_t *share;
-  time_t return_at;
-  queue_wait_t(queue_share_t *s, time_t r)
-    : share(s), return_at(r)
-  {}
-};
-
 my_bool queue_wait_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 {
   queue_share_t *share;
   time_t return_at;
   
-  if (args->arg_count < 1) {
-    strcpy(message, "queue_wait(): missing table name");
+  switch (args->arg_count) {
+  case 2:
+    args->arg_type[1] = INT_RESULT;
+    args->maybe_null[1] = 0;
+    // fallthrough
+  case 1:
+    args->arg_type[0] = STRING_RESULT;
+    args->maybe_null[0] = 0;
+    break;
+  default:
+    strcpy(message, "queue_wait(table_name[,timeout]): argument error");
     return 1;
   }
-  if (args->arg_type[0] != STRING_RESULT
-      || (share = get_share_check(args->args[0])) == NULL) {
-    strcpy(message, "queue_wait(): table not found");
-    return 1;
-  }
-  if (args->arg_count >= 2) {
-    if (args->arg_type[1] != INT_RESULT) {
-      share->release();
-      strcpy(message, "queue_wait(): timeout not an integer");
-      return 1;
-    }
-    return_at = time(NULL) + *reinterpret_cast<long long*>(args->args[1]);
-  } else {
-    return_at = time(NULL) + 60;
-  }
-  
   initid->maybe_null = 0;
-  initid->ptr = reinterpret_cast<char*>(new queue_wait_t(share, return_at));
   
   return 0;
 }
 
 void queue_wait_deinit(UDF_INIT *initid __attribute__((unused)))
 {
-  queue_wait_t *info = reinterpret_cast<queue_wait_t*>(initid->ptr);
-  
-  delete info;
 }
 
 long long queue_wait(UDF_INIT *initid, UDF_ARGS *args __attribute__((unused)),
 		     char *is_null, char *error)
 {
+  queue_share_t *share;
+  time_t return_at;
+  int ret = 0;
+  
+  /* parse args */
+  if (args->arg_count >=2) {
+    return_at = time(NULL) + *reinterpret_cast<long long*>(args->args[1]);
+  } else {
+    return_at = time(NULL) + 60;
+  }
+  if ((share = get_share_check(args->args[0])) == NULL) {
+    *error = 1;
+    return 0;
+  }
+  
   /* set ha_data so that close_conn gets called,
    * should correspond to the implementation of handle::ha_data
    */
@@ -1330,19 +1326,16 @@ long long queue_wait(UDF_INIT *initid, UDF_ARGS *args __attribute__((unused)),
   
   erase_owned();
   
-  queue_wait_t *info = reinterpret_cast<queue_wait_t*>(initid->ptr);
-  int ret = 0;
-  
-  info->share->lock();
+  share->lock();
   do {
-    if (info->share->assign_owner(pthread_self()) != 0) {
+    if (share->assign_owner(pthread_self()) != 0) {
       ret = 1;
       break;
     }
-  } while (info->share->wait(info->return_at) == 0);
+  } while (share->wait(return_at) == 0);
   /* always enter owner-mode, regardless whether or not we own a row */
-  pthread_setspecific(share_key, info->share);
-  info->share->unlock();
+  pthread_setspecific(share_key, share);
+  share->unlock();
   
   *is_null = 0;
   return ret;
