@@ -1385,18 +1385,15 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
       for (int i = 0; i < num_shares; i++) {
 	shares[i].share->unlock();
 	if (i == share_owned) {
-	  break;
+	  goto END_WAIT;
 	}
       }
-      if (share_owned != -1) {
-	break;
-      }
       timespec ts = { return_at, 0 };
-      int err = pthread_cond_timedwait(&cond, &g_mutex, &ts);
-      if (err != 0) {
+      if (pthread_cond_timedwait(&cond, &g_mutex, &ts) != 0) {
 	break;
       }
     }
+  END_WAIT:
     for (int i = 0; i < num_shares; i++) {
       if (i != share_owned) {
 	if (shares[i].listener.signalled) {
