@@ -224,6 +224,19 @@ private:
   queue_share_t& operator=(const queue_share_t&);
 };
 
+struct queue_connection_t {
+  bool owner_mode;
+  queue_share_t *share_owned;
+  void erase_owned();
+  static size_t cnt;
+  static queue_connection_t *current(bool create_if_empty = false);
+  static int close(handlerton *hton, THD *thd);
+private:
+  queue_connection_t()
+  : owner_mode(false), share_owned(NULL) {}
+  ~queue_connection_t() {}
+};
+
 class ha_queue: public handler
 {
   THR_LOCK_DATA lock;
