@@ -112,27 +112,48 @@ static void sync_file(int fd)
 
 my_off_t queue_row_t::validate_checksum(int fd, my_off_t off)
 {
-  my_off_t len;
-  char _len[sizeof(len)];
+  my_off_t off_end;
+  char _len[sizeof(my_off_t)];
   
   /* read checksum size */
   off += queue_row_t::header_size();
-  if (::pread(fd, _len, sizeof(len), off) != sizeof(len)) {
+  if (::pread(fd, _len, sizeof(_len), off) != sizeof(_len)) {
     return 0;
   }
-  len = uint8korr(_len);
-  off += sizeof(len);
+  off += sizeof(_len);
+  off_end = off + uint8korr(_len);
   /* calc checksum */
-  uchar buf[4096];
   uint32_t adler = 1;
-  while (len != 0) {
-    size_t bs = min(len, sizeof(buf));
-    if (::pread(fd, buf, bs, off) != bs) {
+  while (off != off_end) {
+    /* read header */
+    queue_row_t r;
+    if (off_end - off < header_size()
+	||::pread(fd, &r, header_size(), off) != header_size()) {
       return 0;
     }
-    adler = adler32(adler, buf, bs);
-    off += bs;
-    len -= bs;
+    switch (r.type()) {
+    case type_removed:
+      r.set_type(type_row);
+      break;
+    case type_checksum:
+      return 0;
+    }
+    adler = adler32(adler, &r, header_size());
+    off += header_size();
+    /* read data */
+    my_off_t row_end = off + r.size();
+    if (row_end > off_end) {
+      return 0;
+    }
+    while (off != row_end) {
+      char buf[4096];
+      size_t bs = min(row_end - off, sizeof(buf));
+      if (::pread(fd, buf, bs, off) != bs) {
+	return 0;
+      }
+      adler = adler32(adler, buf, bs);
+      off += bs;
+    }
   }
   /* compare checksum */
   return size() == (adler & size_mask) ? off : 0;
@@ -751,13 +772,7 @@ int queue_share_t::compact()
   }
   { /* write data (and seek to end) */
     queue_file_header_t hdr;
-    switch (mode) {
-    case e_volatile:
-      break; // end points to top
-    default:
-      hdr.set_end(_header.end() - delta);
-      break;
-    }
+    hdr.set_end(_header.end() - delta);
     if (write(tmp_fd, &hdr, sizeof(hdr)) != sizeof(hdr)
 	|| copy_file_content(fd, _header.begin(), _header.end(), tmp_fd) != 0) {
       goto ERR_OPEN;

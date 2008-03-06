@@ -143,11 +143,6 @@ class queue_share_t {
   pthread_mutex_t mutex, append_mutex;
   THR_LOCK store_lock;
   
-  enum {
-    e_sync,
-    e_volatile,
-  } mode;
-  
   int fd;
   queue_file_header_t _header;
   
