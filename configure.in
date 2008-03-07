@@ -20,7 +20,8 @@ AC_SUBST(MYSQL_INC)
 # We only support GCC and Sun's forte at the moment
 if test "$GCC" = "yes"
 then
-  CXXFLAGS="$CXXFLAGS -fno-exceptions -fno-rtti"
+  CFLAGS="$CFLAGS -Wall"
+  CXXFLAGS="$CXXFLAGS -Wall -fno-exceptions -fno-rtti"
 else
   CFLAGS="-Xa -xstrconst -mt -D_FORTEC_ -fast -m64"
   CXXFLAGS="$CXXFLAGS -noex -mt -D_FORTEC_ -fast -m64"

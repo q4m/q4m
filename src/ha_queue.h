@@ -18,6 +18,11 @@
 #ifndef HA_QUEUE_H
 #define HA_QUEUE_H
 
+// error numbers should be less than HA_ERR_FIRST
+#define QUEUE_ERR_RECORD_EXISTS (1)
+
+#define QUEUE_MAX_SOURCES (64)
+
 class queue_share_t;
 
 class queue_row_t {
@@ -29,17 +34,18 @@ class queue_row_t {
   uchar _bytes[1];
 public:
   enum {
-    type_mask     = 0xc0000000,
-    type_row      = 0x00000000,
-    type_removed  = 0x80000000,
-    type_checksum = 0x40000000,
-    size_mask     = ~type_mask,
-    max_size      = ~type_mask
+    type_mask         = 0xe0000000,
+    type_row          = 0x00000000,
+    type_row_received = 0x20000000,
+    type_checksum     = 0x40000000,
+    type_flag_removed = 0x80000000,
+    size_mask         = ~type_mask,
+    max_size          = ~type_mask
   };
   queue_row_t() {} // build uninitialized
-  queue_row_t(unsigned size) {
+  queue_row_t(unsigned size, unsigned type) {
     assert((size & type_mask) == 0);
-    int4store(_size, size | type_row);
+    int4store(_size, size | type);
   }
   unsigned size() const {
     // NOTE: does not check if the row isn't checksum
@@ -85,7 +91,9 @@ private:
   char _attr[4];
   char _end[8];
   char _begin[8];
-  unsigned _padding[1024 - (4 + 4 + 8 + 8)];
+  char _compaction_offset[8];
+  char _last_received_offsets[QUEUE_MAX_SOURCES][8];
+  unsigned _padding[1024 - (4 + 4 + 8 + 8 + 8 + QUEUE_MAX_SOURCES * 8)];
 public:
   queue_file_header_t();
   unsigned magic() const { return uint4korr(_magic); }
@@ -95,7 +103,28 @@ public:
   void set_end(my_off_t e) { int8store(_end, e); }
   my_off_t begin() const { return uint8korr(_begin); }
   void set_begin(my_off_t b) { int8store(_begin, b); }
+  my_off_t compaction_offset() const { return uint8korr(_compaction_offset); }
+  void set_compaction_offset(my_off_t co) { int8store(_compaction_offset, co); }
+  my_off_t last_received_offset(unsigned i) {
+    return uint8korr(_last_received_offsets[i]);
+  }
+  void set_last_received_offset(unsigned i, my_off_t o) {
+    int8store(_last_received_offsets[i], o);
+  }
   void write(int fd);
+};
+
+struct queue_source_t {
+  char _offset[8];
+  unsigned char _sender;
+  unsigned sender() const { return _sender; }
+  void set_sender(unsigned s) { _sender = s; }
+  my_off_t offset() const { return uint8korr(_offset); }
+  void set_offset(my_off_t o) { int8store(_offset, o); }
+  queue_source_t(unsigned s, my_off_t o) {
+    set_sender(s);
+    set_offset(o);
+  }
 };
 
 typedef std::list<std::pair<pthread_t, my_off_t> > queue_rows_owned_t;
@@ -106,9 +135,10 @@ class queue_share_t {
   struct append_t {
     const void *rows;
     size_t rows_size;
+    const queue_source_t *source;
     int err; /* -1 if not completed, otherwise HA_ERR_XXX or 0 */
-    append_t(const void *r, size_t rs)
-    : rows(r), rows_size(rs), err(-1) {
+    append_t(const void *r, size_t rs, const queue_source_t *s)
+    : rows(r), rows_size(rs), source(s), err(-1) {
     }
   private:
     append_t(const append_t&);
@@ -153,7 +183,7 @@ class queue_share_t {
   
   queue_rows_owned_t rows_owned;
   
-  listener_list_t listener_list;
+  listener_list_t listener_list; /* access serialized using g_mutex */
   
   int num_readers;
   
@@ -179,10 +209,12 @@ public:
   void unregister_listener(pthread_cond_t *c);
   void wake_listener(bool locked = false);
   static int wait_multi(const std::list<queue_share_t*> &shares, pthread_cond_t *c, time_t t);
+  
+  const char *get_table_name() const { return table_name; }
   THR_LOCK *get_store_lock() { return &store_lock; }
   const queue_file_header_t *header() const { return &_header; }
   my_off_t reset_owner(pthread_t owner);
-  int write_rows(const void *rows, size_t rows_size);
+  int write_rows(const void *rows, size_t rows_size, queue_source_t *source);
   /* functions below requires lock */
   const void *read_cache(my_off_t off, ssize_t size, bool populate_cache);
   ssize_t read(void *data, my_off_t off, ssize_t size, bool populate_cache);
@@ -210,7 +242,7 @@ private:
   void writer_do_remove(remove_list_t *l);
   void *writer_start();
   static void *_writer_start(void* self) {
-    static_cast<queue_share_t*>(self)->writer_start();
+    return static_cast<queue_share_t*>(self)->writer_start();
   }
   int compact();
   queue_share_t();
@@ -302,6 +334,10 @@ extern "C" {
   void queue_wait_deinit(UDF_INIT *initid);
   long long queue_wait(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
 		       char *error);
+  my_bool queue_dread_init(UDF_INIT *initid, UDF_ARGS *args, char *message);
+  void queue_dread_deinit(UDF_INIT *initid);
+  char *queue_dread(UDF_INIT *initid, UDF_ARGS *args, char *result,
+		    unsigned long *length, char *is_null, char *error);
   my_bool queue_end_init(UDF_INIT *initid, UDF_ARGS *args, char *message);
   void queue_end_deinit(UDF_INIT *initid);
   long long queue_end(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
@@ -310,6 +346,10 @@ extern "C" {
   void queue_abort_deinit(UDF_INIT *initid);
   long long queue_abort(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
 			char *error);
+  my_bool queue_dwrite_init(UDF_INIT *initid, UDF_ARGS *args, char *message);
+  void queue_dwrite_deinit(UDF_INIT *initid);
+  long long queue_dwrite(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
+			 char *error);
 };
 
 #endif
