@@ -1757,7 +1757,8 @@ long long queue_dwrite(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
       share->wake_listener();
       break;
     case QUEUE_ERR_RECORD_EXISTS:
-      log("queue_dwrite: entry already exists: %llu\n", source->offset());
+      log("queue_dwrite: entry already exists: %s,%llu\n",
+	  share->get_table_name(), source->offset());
       break;
     default:
       *error = 1;
