@@ -1482,7 +1482,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
   END_WAIT:
     for (int i = 0; i < num_shares; i++) {
       if (i != share_owned) {
-	if (shares[i].listener.signalled) {
+	if (! shares[i].listener.signalled) {
 	  shares[i].share->unregister_listener(&cond);
 	} else {
 	  shares[i].share->wake_listener(true);
@@ -1559,7 +1559,7 @@ my_bool queue_dread_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
     strcpy(message, "queue_dread(table_name[,timeout]): argument error");
     return 1;
   }
-  initid->maybe_null = 1;
+  initid->maybe_null = 0;
   initid->ptr = NULL;
   return 0;
 }
@@ -1580,8 +1580,8 @@ char *queue_dread(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long 
   // capture one row
   if (_queue_wait_core(args->args, 1, timeout, error) == -1) {
     *length = 0;
-    *is_null = 1;
-    return NULL;
+    result[0] = '\0'; // just in case
+    return result;
   }
   
   // load pointer to queue_share_t

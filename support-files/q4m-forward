@@ -1,0 +1,61 @@
+#! /usr/bin/perl
+
+use strict;
+use warnings;
+
+use DBI;
+use Getopt::Long;
+
+sub usage {
+    my $exit_code = shift || 0;
+    print STDERR << "EOT";
+
+Usage: $0 [options] src_addr dest_addr
+
+Example:
+  % $0 \\
+   "dbi:mysql:database=db1;table=tbl1;user=foo;password=XXX" \\
+   "dbi:mysql:database=db2;table=tbl2;host=bar;user=foo"
+
+EOT
+    exit $exit_code;
+}
+
+sub connect_to_db {
+    my $addr = shift;
+    $addr =~ s/;table=([^;]+)//
+        or die "table name missing in operand: $addr\n";
+    my $table = $1;
+    my $dbh = DBI->connect($addr)
+        or die "failed to connect to database: $addr\n";
+    ($dbh, $table);
+}
+
+usage() unless @ARGV == 2;
+
+my ($src, $dst, $sender_index) = @ARGV;
+$sender_index ||= 0;
+
+my ($src_conn, $src_table) = connect_to_db($src);
+my ($dst_conn, $dst_table) = connect_to_db($dst);
+
+my $src_st = $src_conn->prepare('select binary queue_dread(?)')
+    or die $src_conn->errstr;
+my $dst_st = $dst_conn->prepare('select queue_dwrite(?,?,binary ?)')
+    or die $dst_conn->errstr;
+
+while (1) {
+    $src_st->execute($src_table)
+        or die $src_conn->errstr;
+    my $rows = $src_st->fetchall_arrayref
+        or die $src_conn->errstr;
+    die "received an error from source (table not found?)\n"
+        unless defined $rows->[0][0];
+    if (length $rows->[0][0] != 0) {
+        $dst_st->execute($dst_table, $sender_index, $rows->[0][0])
+            or die $dst_conn->errstr;
+        my $result = $dst_st->fetchall_arrayref;
+        die "received an error from destination (table not found?)\n"
+            unless @$result && defined $result->[0][0];
+    }
+}
