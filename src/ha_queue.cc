@@ -1751,10 +1751,12 @@ long long queue_dwrite(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
   memcpy(row->bytes(), args->args[2] + sizeof(my_off_t),
 	 args->lengths[2] - sizeof(my_off_t));
   /* write row */
+  int ret = 0;
   if ((share = get_share_check(args->args[0])) != NULL) {
     switch (share->write_rows(row, row_size, source)) {
     case 0:
       share->wake_listener();
+      ret = 1;
       break;
     case QUEUE_ERR_RECORD_EXISTS:
       log("queue_dwrite: entry already exists: %s,%llu\n",
@@ -1773,5 +1775,5 @@ long long queue_dwrite(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
   my_free(row, MYF(0));
   
   *is_null = 0;
-  return 0;
+  return ret;
 }

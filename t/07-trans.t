@@ -33,7 +33,7 @@ is(ref $r->[0], 'ARRAY');
 is(substr($r->[0]->[0], 8), "\xff\1\0\0\0");
 is_deeply(
     $dbh->selectall_arrayref('select queue_dwrite("q4m_t2", 0, binary ' . $dbh->quote($r->[0]->[0]) . ')'),
-    [ [ 0 ] ],
+    [ [ 1 ] ],
 );
 is_deeply(
     $dbh2->selectall_arrayref('select queue_wait("q4m_t2", 1)'),
@@ -65,7 +65,7 @@ is(ref $r->[0], 'ARRAY');
 is(substr($r->[0]->[0], 8), "\xff\2\0\0\0");
 is_deeply(
     $dbh->selectall_arrayref('select queue_dwrite("q4m_t2", 0, binary ' . $dbh->quote($r->[0]->[0]) . ')'),
-    [ [ 0 ] ],
+    [ [ 1 ] ],
 );
 is_deeply(
     $dbh2->selectall_arrayref('select queue_wait("q4m_t2", 1)'),
@@ -79,7 +79,7 @@ is_deeply(
 # check if we can re-insert the same value using a different source_id
 is_deeply(
     $dbh->selectall_arrayref('select queue_dwrite("q4m_t2", 1, binary ' . $dbh->quote($r->[0]->[0]) . ')'),
-    [ [ 0 ] ],
+    [ [ 1 ] ],
 );
 is_deeply(
     $dbh2->selectall_arrayref('select queue_wait("q4m_t2", 1)'),
