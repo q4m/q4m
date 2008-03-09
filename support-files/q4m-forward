@@ -39,23 +39,44 @@ $sender_index ||= 0;
 my ($src_conn, $src_table) = connect_to_db($src);
 my ($dst_conn, $dst_table) = connect_to_db($dst);
 
-my $src_st = $src_conn->prepare('select binary queue_dread(?)')
-    or die $src_conn->errstr;
-my $dst_st = $dst_conn->prepare('select queue_dwrite(?,?,binary ?)')
-    or die $dst_conn->errstr;
-
 while (1) {
-    $src_st->execute($src_table)
-        or die $src_conn->errstr;
-    my $rows = $src_st->fetchall_arrayref
-        or die $src_conn->errstr;
+    # wait until a row gets ready
+    my $wait = $src_conn->selectall_arrayref(
+        'select queue_wait(?)',
+        {},
+        $src_table,
+    ) or die $src_conn->errstr;
     die "received an error from source (table not found?)\n"
-        unless defined $rows->[0][0];
-    if (length $rows->[0][0] != 0) {
-        $dst_st->execute($dst_table, $sender_index, $rows->[0][0])
-            or die $dst_conn->errstr;
-        my $result = $dst_st->fetchall_arrayref;
-        die "received an error from destination (table not found?)\n"
-            unless @$result && defined $result->[0][0];
-    }
+        unless defined $wait->[0][0];
+    next unless $wait->[0][0];
+    # receive row
+    my $rowid = $src_conn->selectall_arrayref('select queue_rowid()')
+        or die $src_conn->errstr;
+    die "unexpected response from source\n"
+        unless $rowid->[0][0];
+    my $row = $src_conn->selectall_arrayref(
+        "select * from $src_table",
+        { Slice => {} },
+    ) or die $src_conn->errstr;
+    # write row
+    my $res = $dst_conn->selectall_arrayref(
+        'select queue_set_srcid(?,?)',
+        {},
+        $sender_index,
+        $rowid->[0][0],
+    ) or die $dst_conn->errstr;
+    die "failed to set source id (sender index out of range?)\n"
+        unless $res->[0][0];
+    $dst_conn->do(
+        "insert into $dst_table ("
+            . join(',', sort keys %{$row->[0]})
+                . ') values ('
+                    . join(
+                        ',',
+                        map {
+                            $dst_conn->quote($row->[0]{$_})
+                        } sort keys %{$row->[0]},
+                    )
+                        . ')',
+    ) or die $dst_conn->errstr;
 }

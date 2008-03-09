@@ -5,7 +5,7 @@ use warnings;
 
 use DBI;
 
-use Test::More tests => 25;
+use Test::More tests => 26;
 
 sub dbi_connect {
     DBI->connect(
@@ -26,76 +26,80 @@ my $dbh2 = dbi_connect();
 # prepare test data
 ok($dbh->do('insert into q4m_t values (1),(2),(3),(4),(5)'));
 
-# transmit
-my $r = $dbh->selectall_arrayref('select binary queue_dread("q4m_t")');
+# calling queue_rowid while NOT in owner mode should return an error
+$dbh->{PrintError} = undef;
+my $r = $dbh->selectall_arrayref('select queue_rowid()');
+$dbh->{PrintError} = 1;
+isnt(ref $r, 'ARRAY');
+
+# transmit first row
+is_deeply(
+    $dbh->selectall_arrayref('select queue_wait("q4m_t")'),
+    [ [ 1 ] ],
+);
+$r = $dbh->selectall_arrayref('select queue_rowid()');
 is(ref $r, 'ARRAY');
 is(ref $r->[0], 'ARRAY');
-is(substr($r->[0]->[0], 8), "\xff\1\0\0\0");
+my $row_id = $r->[0][0];
+$r = $dbh->selectall_arrayref('select * from q4m_t');
 is_deeply(
-    $dbh->selectall_arrayref('select queue_dwrite("q4m_t2", 0, binary ' . $dbh->quote($r->[0]->[0]) . ')'),
+    $dbh->selectall_arrayref("select queue_set_srcid(0,$row_id)"),
     [ [ 1 ] ],
 );
+ok($dbh->do("insert into q4m_t2 values ($r->[0][0])"));
 is_deeply(
-    $dbh2->selectall_arrayref('select queue_wait("q4m_t2", 1)'),
-    [ [ 1 ] ],
-);
-is_deeply(
-    $dbh2->selectall_arrayref('select * from q4m_t2'),
+    $dbh2->selectall_arrayref("select * from q4m_t2"),
     [ [ 1 ] ],
 );
 
-# dup check
+# test if duplicates are ignored
 is_deeply(
-    $dbh->selectall_arrayref('select queue_dwrite("q4m_t2", 0, binary ' . $dbh->quote($r->[0]->[0]) . ')'),
-    [ [ 0 ] ],
+    $dbh->selectall_arrayref("select queue_set_srcid(0,$row_id)"),
+    [ [ 1 ] ],
 );
+ok($dbh->do("insert into q4m_t2 values ($r->[0][0])"));
 is_deeply(
-    $dbh2->selectall_arrayref('select queue_wait("q4m_t2", 1)'),
-    [ [ 0 ] ],
-);
-is_deeply(
-    $dbh2->selectall_arrayref('select * from q4m_t2'),
-    [],
+    $dbh2->selectall_arrayref("select * from q4m_t2"),
+    [ [ 1 ] ],
 );
 
-# transmit once more
-$r = $dbh->selectall_arrayref('select binary queue_dread("q4m_t")');
+# transmit next row
+is_deeply(
+    $dbh->selectall_arrayref('select queue_wait("q4m_t")'),
+    [ [ 1 ] ],
+);
+$r = $dbh->selectall_arrayref('select queue_rowid()');
 is(ref $r, 'ARRAY');
 is(ref $r->[0], 'ARRAY');
-is(substr($r->[0]->[0], 8), "\xff\2\0\0\0");
+$row_id = $r->[0][0];
+$r = $dbh->selectall_arrayref('select * from q4m_t');
 is_deeply(
-    $dbh->selectall_arrayref('select queue_dwrite("q4m_t2", 0, binary ' . $dbh->quote($r->[0]->[0]) . ')'),
+    $dbh->selectall_arrayref("select queue_set_srcid(0,$row_id)"),
     [ [ 1 ] ],
 );
+ok($dbh->do("insert into q4m_t2 values ($r->[0][0])"));
 is_deeply(
-    $dbh2->selectall_arrayref('select queue_wait("q4m_t2", 1)'),
-    [ [ 1 ] ],
-);
-is_deeply(
-    $dbh2->selectall_arrayref('select * from q4m_t2'),
-    [ [ 2 ] ],
+    $dbh2->selectall_arrayref("select * from q4m_t2"),
+    [ [ 1 ], [ 2 ] ],
 );
 
 # check if we can re-insert the same value using a different source_id
 is_deeply(
-    $dbh->selectall_arrayref('select queue_dwrite("q4m_t2", 1, binary ' . $dbh->quote($r->[0]->[0]) . ')'),
+    $dbh->selectall_arrayref("select queue_set_srcid(1,$row_id)"),
     [ [ 1 ] ],
 );
+ok($dbh->do("insert into q4m_t2 values ($r->[0][0])"));
 is_deeply(
-    $dbh2->selectall_arrayref('select queue_wait("q4m_t2", 1)'),
-    [ [ 1 ] ],
-);
-is_deeply(
-    $dbh2->selectall_arrayref('select * from q4m_t2'),
-    [ [ 2 ] ],
+    $dbh2->selectall_arrayref("select * from q4m_t2"),
+    [ [ 1 ], [ 2 ], [ 2 ] ],
 );
 
 # sanity check of source_id
 is_deeply(
-    $dbh->selectall_arrayref('select queue_dwrite("q4m_t2", 64, binary ' . $dbh->quote($r->[0]->[0]) . ')'),
+    $dbh->selectall_arrayref("select queue_set_srcid(-1,$row_id)"),
     [ [ undef ] ],
 );
 is_deeply(
-    $dbh->selectall_arrayref('select queue_dwrite("q4m_t2", -1, binary ' . $dbh->quote($r->[0]->[0]) . ')'),
+    $dbh->selectall_arrayref("select queue_set_srcid(64,$row_id)"),
     [ [ undef ] ],
 );

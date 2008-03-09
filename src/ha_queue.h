@@ -105,7 +105,7 @@ public:
   void set_begin(my_off_t b) { int8store(_begin, b); }
   my_off_t compaction_offset() const { return uint8korr(_compaction_offset); }
   void set_compaction_offset(my_off_t co) { int8store(_compaction_offset, co); }
-  my_off_t last_received_offset(unsigned i) {
+  my_off_t last_received_offset(unsigned i) const {
     return uint8korr(_last_received_offsets[i]);
   }
   void set_last_received_offset(unsigned i, my_off_t o) {
@@ -214,7 +214,7 @@ public:
   THR_LOCK *get_store_lock() { return &store_lock; }
   const queue_file_header_t *header() const { return &_header; }
   my_off_t reset_owner(pthread_t owner);
-  int write_rows(const void *rows, size_t rows_size, queue_source_t *source);
+  int write_rows(const void *rows, size_t rows_size);
   /* functions below requires lock */
   const void *read_cache(my_off_t off, ssize_t size, bool populate_cache);
   ssize_t read(void *data, my_off_t off, ssize_t size, bool populate_cache);
@@ -254,13 +254,14 @@ private:
 struct queue_connection_t {
   bool owner_mode;
   queue_share_t *share_owned;
+  queue_source_t source;
   void erase_owned();
   static size_t cnt;
   static queue_connection_t *current(bool create_if_empty = false);
   static int close(handlerton *hton, THD *thd);
 private:
   queue_connection_t()
-  : owner_mode(false), share_owned(NULL) {}
+  : owner_mode(false), share_owned(NULL), source(0, 0) {}
   ~queue_connection_t() {}
 };
 
@@ -324,7 +325,7 @@ class ha_queue: public handler
   int prepare_rows_buffer(size_t sz);
   void free_rows_buffer();
   void unpack_row(uchar *buf);
-  size_t pack_row(uchar *buf);
+  size_t pack_row(uchar *buf, queue_source_t *source);
 };
 
 #undef queue_end
@@ -334,10 +335,6 @@ extern "C" {
   void queue_wait_deinit(UDF_INIT *initid);
   long long queue_wait(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
 		       char *error);
-  my_bool queue_dread_init(UDF_INIT *initid, UDF_ARGS *args, char *message);
-  void queue_dread_deinit(UDF_INIT *initid);
-  char *queue_dread(UDF_INIT *initid, UDF_ARGS *args, char *result,
-		    unsigned long *length, char *is_null, char *error);
   my_bool queue_end_init(UDF_INIT *initid, UDF_ARGS *args, char *message);
   void queue_end_deinit(UDF_INIT *initid);
   long long queue_end(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
@@ -346,10 +343,14 @@ extern "C" {
   void queue_abort_deinit(UDF_INIT *initid);
   long long queue_abort(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
 			char *error);
-  my_bool queue_dwrite_init(UDF_INIT *initid, UDF_ARGS *args, char *message);
-  void queue_dwrite_deinit(UDF_INIT *initid);
-  long long queue_dwrite(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
-			 char *error);
+  my_bool queue_rowid_init(UDF_INIT *initid, UDF_ARGS *args, char *message);
+  void queue_rowid_deinit(UDF_INIT *initid);
+  long long queue_rowid(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
+			char *error);
+  my_bool queue_set_srcid_init(UDF_INIT *initid, UDF_ARGS *args, char *message);
+  void queue_set_srcid_deinit(UDF_INIT *initid);
+  long long queue_set_srcid(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
+			    char *error);
 };
 
 #endif

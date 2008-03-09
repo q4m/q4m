@@ -489,15 +489,21 @@ my_off_t queue_share_t::reset_owner(pthread_t owner)
   return off;
 }
 
-int queue_share_t::write_rows(const void *rows, size_t rows_size,
-			      queue_source_t *source)
+int queue_share_t::write_rows(const void *rows, size_t rows_size)
 {
+  queue_connection_t *conn = queue_connection_t::current();
+  queue_source_t *source =
+    conn != NULL && conn->source.offset() != 0 ? &conn->source : NULL;
+  
   append_t a(rows, rows_size, source);
   
   pthread_mutex_lock(&mutex);
   if (source != NULL
       && source->offset() <= _header.last_received_offset(source->sender())) {
     pthread_mutex_unlock(&mutex);
+    log("skipping forwarded duplicates: %s,max %llu,got %llu\n", table_name,
+	_header.last_received_offset(source->sender()), source->offset());
+    *source = queue_source_t(0, 0);
     return QUEUE_ERR_RECORD_EXISTS;
   }
   append_list->push_back(&a);
@@ -508,6 +514,9 @@ int queue_share_t::write_rows(const void *rows, size_t rows_size,
   } while (a.err == -1);
   pthread_mutex_unlock(&mutex);
   
+  if (source != NULL) {
+    *source = queue_source_t(0, 0);
+  }
   return a.err;
 }
 
@@ -1162,10 +1171,16 @@ int ha_queue::end_bulk_insert()
   int ret = 0;
   
   if (rows_size != 0) {
-    if ((ret = share->write_rows(rows, rows_size, NULL)) == 0) {
+    ret = share->write_rows(rows, rows_size);
+    switch (ret) {
+    case 0:
       for (size_t i = 0; i < bulk_insert_rows; i++) {
 	share->wake_listener();
       }
+      break;
+    case QUEUE_ERR_RECORD_EXISTS:
+      ret = 0;
+      break;
     }
     rows_size = 0;
   }
@@ -1201,18 +1216,30 @@ int ha_queue::end_bulk_delete()
 
 int ha_queue::write_row(uchar *buf)
 {
+  queue_connection_t *conn = queue_connection_t::current();
   size_t sz;
   
-  if ((sz = pack_row(buf)) == 0) {
+  if (conn != NULL && conn->source.offset() != 0) {
+    sz = pack_row(buf, &conn->source);
+  } else {
+    sz = pack_row(buf, NULL);
+  }
+  if (sz == 0) {
     return HA_ERR_OUT_OF_MEM;
   }
   if (bulk_insert_rows == static_cast<size_t>(-1)) {
-    int err = share->write_rows(rows, sz, NULL);
+    int err = share->write_rows(rows, sz);
     free_rows_buffer();
-    if (err != 0) {
+    switch (err) {
+    case 0:
+      share->wake_listener();
+      break;
+    case QUEUE_ERR_RECORD_EXISTS:
+      err = 0;
+      break;
+    default:
       return err;
     }
-    share->wake_listener();
   } else {
     rows_size += sz;
     bulk_insert_rows++;
@@ -1296,11 +1323,14 @@ void ha_queue::unpack_row(uchar *buf)
   }
 }
 
-size_t ha_queue::pack_row(uchar *buf)
+size_t ha_queue::pack_row(uchar *buf, queue_source_t *source)
 {
   /* allocate memory (w. some extra) */
   size_t sz = queue_row_t::header_size() + table->s->reclength
     + table->s->fields * 2;
+  if (source != NULL) {
+    sz += sizeof(*source);
+  }
   for (uint *ptr = table->s->blob_field, *end = ptr + table->s->blob_fields;
        ptr != end;
        ++ptr) {
@@ -1317,6 +1347,11 @@ size_t ha_queue::pack_row(uchar *buf)
     if (! (*field)->is_null()) {
       dst = (*field)->pack(dst, buf + (*field)->offset(buf));
     }
+  }
+  /* write source */
+  if (source != NULL) {
+    memcpy(dst, source, sizeof(*source));
+    dst += sizeof(*source);
   }
   /* write header */
   sz = dst - (rows + rows_size);
@@ -1544,94 +1579,6 @@ long long queue_wait(UDF_INIT *initid __attribute__((unused)), UDF_ARGS *args,
     + 1;
 }
 
-my_bool queue_dread_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
-{
-  switch (args->arg_count) {
-  case 2:
-    args->arg_type[1] = INT_RESULT;
-    args->maybe_null[1] = 0;
-    // fallthrough
-  case 1:
-    args->arg_type[0] = STRING_RESULT;
-    args->maybe_null[0] = 0;
-    break;
-  default:
-    strcpy(message, "queue_dread(table_name[,timeout]): argument error");
-    return 1;
-  }
-  initid->maybe_null = 0;
-  initid->ptr = NULL;
-  return 0;
-}
-
-void queue_dread_deinit(UDF_INIT *initid)
-{
-  if (initid->ptr != NULL) {
-    my_free(initid->ptr, MYF(0));
-    initid->ptr = NULL;
-  }
-}
-
-char *queue_dread(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long *length, char *is_null, char *error)
-{
-  int timeout = args->arg_count >= 2
-    ? *reinterpret_cast<long long*>(args->args[args->arg_count - 1]) : 60;
-  
-  // capture one row
-  if (_queue_wait_core(args->args, 1, timeout, error) == -1) {
-    *length = 0;
-    result[0] = '\0'; // just in case
-    return result;
-  }
-  
-  // load pointer to queue_share_t
-  queue_connection_t *conn = queue_connection_t::current(false);
-  assert(conn != NULL);
-  assert(conn->owner_mode);
-  queue_share_t *share = conn->share_owned;
-  assert(share != NULL);
-  // copy data
-  share->lock();
-  my_off_t pos = share->get_owned_row(pthread_self());
-  assert(pos != 0);
-  queue_row_t hdr;
-  if (share->read(&hdr, pos, queue_row_t::header_size(), true)
-      != static_cast<ssize_t>(queue_row_t::header_size())) {
-    // corrupt file
-    goto ERR_AFTER_LOCK;
-  }
-  if (sizeof(my_off_t) + hdr.size() > 255) {
-    if (initid->ptr != NULL) {
-      my_free(initid->ptr, MYF(0));
-    }
-    if ((initid->ptr = static_cast<char*>(my_malloc(sizeof(my_off_t)
-						    + hdr.size(),
-						    MYF(0))))
-	== NULL) {
-      log("out of memory\n");
-      goto ERR_AFTER_LOCK;
-    }
-    result = initid->ptr;
-  }
-  int8store(result,  pos + share->header()->compaction_offset());
-  if (share->read(result + sizeof(my_off_t), pos + queue_row_t::header_size(),
-		  hdr.size(), false)
-      != hdr.size()) {
-    log("corrupt table: %s\n", share->get_table_name());
-    goto ERR_AFTER_LOCK;
-  }
-  *length = sizeof(my_off_t) + hdr.size();
-  share->unlock();
-  
-  return result;
-  
- ERR_AFTER_LOCK:
-  share->unlock();
-  *error = 1;
-  *length = 0;
-  return NULL;
-}
-
 my_bool queue_end_init(UDF_INIT *initid,
 		       UDF_ARGS *args __attribute__((unused)),
 		       char *message __attribute__((unused)))
@@ -1695,85 +1642,74 @@ long long queue_abort(UDF_INIT *initid, UDF_ARGS *args __attribute__((unused)),
   return 1;
 }
 
-my_bool queue_dwrite_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+my_bool queue_rowid_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 {
-  if (args->arg_count != 3) {
-    strcpy(message, "queue_dwrite(table_name,source_id,data): argument error");
+  if (args->arg_count != 0) {
+    strcpy(message, "queue_rowid(): argument error");
     return 1;
   }
-  args->arg_type[0] = STRING_RESULT;
+  queue_connection_t *conn;
+  if ((conn = queue_connection_t::current()) == NULL || ! conn->owner_mode) {
+    strcpy(message, "queue_rowid(): not in owner mode");
+    return 1;
+  }
+  initid->maybe_null = 1;
+  return 0;
+}
+
+void queue_rowid_deinit(UDF_INIT *initid __attribute__((unused)))
+{
+}
+
+long long queue_rowid(UDF_INIT *initid __attribute__((unused)), UDF_ARGS *args,
+		      char *is_null, char *error)
+{
+  queue_connection_t *conn;
+  if ((conn = queue_connection_t::current()) == NULL) {
+    log("internal error, unexpectedly conn==NULL\n");
+    *error = 1;
+    return 0;
+  }
+  queue_share_t *share;
+  if (! conn->owner_mode || (share = conn->share_owned) == NULL) {
+    *is_null = 1;
+    return 0;
+  }
+  share->lock();
+  my_off_t off = share->get_owned_row(pthread_self());
+  share->unlock();
+  return static_cast<long long>(off);
+}
+
+my_bool queue_set_srcid_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+  if (args->arg_count != 2) {
+    strcpy(message, "queue_set_srcid(source,rowid): argument_error");
+    return 1;
+  }
+  args->arg_type[0] = INT_RESULT;
   args->maybe_null[0] = 0;
   args->arg_type[1] = INT_RESULT;
   args->maybe_null[1] = 0;
-  args->arg_type[2] = STRING_RESULT;
-  args->maybe_null[2] = 0;
   initid->maybe_null = 0;
   return 0;
 }
 
-void queue_dwrite_deinit(UDF_INIT *initid __attribute__((unused)))
+void queue_set_srcid_deinit(UDF_INIT *initid __attribute__((unused)))
 {
 }
 
-long long queue_dwrite(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
-		       char *error)
+long long queue_set_srcid(UDF_INIT *initid __attribute__((unused)),
+			  UDF_ARGS *args, char *is_null __attribute__((unused)),
+			  char *error)
 {
-  queue_share_t *share;
-  queue_row_t *row;
-  size_t row_size;
-  unsigned sender;
-  
-  /* sanity check */
-  if (args->lengths[2] < sizeof(my_off_t)) {
-    log("data too short\n");
+  long long sender = *(long long*)args->args[0];
+  if (sender < 0 || QUEUE_MAX_SOURCES <= sender) {
+    log("queue_set_srcid: source number exceeds limit: %lld\n", sender);
     *error = 1;
     return 0;
   }
-  if ((sender = *(long long*)args->args[1]) >= QUEUE_MAX_SOURCES) {
-    log("source_id above maximum: %u\n", sender);
-    *error = 1;
-    return 0;
-  }
-  row_size = queue_row_t::header_size() + args->lengths[2] - sizeof(my_off_t)
-    + sizeof(queue_source_t);
-  /* build row data */
-  if ((row = static_cast<queue_row_t*>(my_malloc(row_size, MYF(0)))) == NULL) {
-    log("out of memory\n");
-    *error = 1;
-    return 0;
-  }
-  new (row) queue_row_t(row_size - queue_row_t::header_size(),
-			queue_row_t::type_row_received);
-  queue_source_t *source =
-    reinterpret_cast<queue_source_t*>(row->bytes() + args->lengths[2]
-				      - sizeof(my_off_t));
-  new (source) queue_source_t(sender, uint8korr(args->args[2]));
-  memcpy(row->bytes(), args->args[2] + sizeof(my_off_t),
-	 args->lengths[2] - sizeof(my_off_t));
-  /* write row */
-  int ret = 0;
-  if ((share = get_share_check(args->args[0])) != NULL) {
-    switch (share->write_rows(row, row_size, source)) {
-    case 0:
-      share->wake_listener();
-      ret = 1;
-      break;
-    case QUEUE_ERR_RECORD_EXISTS:
-      log("queue_dwrite: entry already exists: %s,%llu\n",
-	  share->get_table_name(), source->offset());
-      break;
-    default:
-      *error = 1;
-      break;
-    }
-    share->release();
-  } else {
-    log("table not found: %s\n", args->args[0]);
-    *error = 1;
-  }
-  /* free row data */
-  my_free(row, MYF(0));
-  
-  *is_null = 0;
-  return ret;
+  queue_connection_t *conn = queue_connection_t::current(true);
+  conn->source = queue_source_t(sender, *(long long*)args->args[1]);
+  return 1;
 }
