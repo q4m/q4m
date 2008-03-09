@@ -9,14 +9,14 @@ use Getopt::Long;
 sub usage {
     my $exit_code = shift || 0;
     print STDERR << "EOT";
-
-Usage: $0 [options] src_addr dest_addr
-
-Example:
+usage: $0 [options] src_addr dest_addr
+example:
   % $0 \\
    "dbi:mysql:database=db1;table=tbl1;user=foo;password=XXX" \\
    "dbi:mysql:database=db2;table=tbl2;host=bar;user=foo"
-
+options:
+  --sender=sender_index
+  --help
 EOT
     exit $exit_code;
 }
@@ -31,10 +31,17 @@ sub connect_to_db {
     ($dbh, $table);
 }
 
-usage() unless @ARGV == 2;
+my $sender_index = 0;
+my $help;
 
-my ($src, $dst, $sender_index) = @ARGV;
-$sender_index ||= 0;
+GetOptions(
+    'sender=i' => \$sender_index,
+    help       => \$help,
+) or usage(1);
+usage(1) if $help;
+usage(1) unless @ARGV == 2;
+
+my ($src, $dst) = @ARGV;
 
 my ($src_conn, $src_table) = connect_to_db($src);
 my ($dst_conn, $dst_table) = connect_to_db($dst);
