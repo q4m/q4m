@@ -59,9 +59,10 @@ using namespace std;
 
 #define MIN_ROWS_BUFFER_SIZE (4096)
 #define COMPACT_THRESHOLD (16777216)
+#define EXPAND_BY (1048576)
+
 #define DO_COMPACT(all, free) \
     ((all) >= COMPACT_THRESHOLD && (free) * 2 >= (all))
-#define EXPAND_BY (1048576)
 #define Q4M ".Q4M"
 #define Q4T ".Q4T"
 
@@ -829,6 +830,8 @@ static int copy_file_content(int src_fd, my_off_t begin, my_off_t end,
 
 int queue_share_t::compact()
 {
+  log("starting table compaction: %s\n", table_name);
+  
   char filename[FN_REFLEN], tmp_filename[FN_REFLEN];
   int tmp_fd;
   my_off_t delta = _header.begin() - sizeof(queue_file_header_t);
@@ -840,6 +843,7 @@ int queue_share_t::compact()
 	    MY_REPLACE_EXT | MY_UNPACK_FILENAME);
   if ((tmp_fd = open(tmp_filename, O_CREAT | O_TRUNC | O_RDWR, 0660))
       == -1) {
+    log("failed to create temporary file: %s\n", tmp_filename);
     goto ERR_RETURN;
   }
   { /* write data (and seek to end) */
@@ -857,6 +861,7 @@ int queue_share_t::compact()
   }
   /* rename */
   if (rename(tmp_filename, filename) != 0) {
+    log("failed to rename (2): %s => %s\n", tmp_filename, filename);
     goto ERR_OPEN;
   }
   // is the directory entry synced with fsync?
@@ -878,6 +883,7 @@ int queue_share_t::compact()
     cache.off = 0; /* invalidate, since it may go below sizeof(_header) */
   }
   
+  log("finished table compaction: %s\n", table_name);
   return 0;
     
  ERR_OPEN:
@@ -1676,7 +1682,8 @@ long long queue_rowid(UDF_INIT *initid __attribute__((unused)), UDF_ARGS *args,
     return 0;
   }
   share->lock();
-  my_off_t off = share->get_owned_row(pthread_self());
+  my_off_t off = share->get_owned_row(pthread_self())
+    + share->header()->compaction_offset();
   share->unlock();
   return static_cast<long long>(off);
 }
