@@ -1094,7 +1094,8 @@ int ha_queue::rnd_pos(uchar *buf, uchar *_pos)
     err = HA_ERR_OUT_OF_MEM;
     goto EXIT;
   }
-  if (share->read(rows, pos, hdr.size(), false) != hdr.size()) {
+  if (share->read(rows, pos, hdr.size(), false)
+      != static_cast<ssize_t>(hdr.size())) {
     err = HA_ERR_CRASHED_ON_USAGE;
     goto EXIT;
   }
