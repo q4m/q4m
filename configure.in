@@ -1,8 +1,10 @@
 dnl For Queue for MySQL - a mysql pluggable storage engine
+
 AC_INIT(src/ha_queue.cc)
 AC_CONFIG_AUX_DIR(config)
 AM_CONFIG_HEADER(src/queue_config.h)
 AM_INIT_AUTOMAKE("q4m", 0.3)
+AC_PREFIX_PROGRAM(mysql)
 
 AC_PROG_CC
 AC_PROG_CXX
@@ -16,6 +18,20 @@ sinclude(config/ac_mysql.m4)
 
 MYSQL_SRC_TEST
 AC_SUBST(MYSQL_INC)
+
+# check if prefix points to mysql 5.1
+if test ! -e "${prefix}/include/mysql/plugin.h"
+then
+  echo "${prefix}/include/mysql/plugin.h not found." 2>&1
+  echo "Please specify mysql 5.1 directory with --prefix option." 2>&1
+  exit 1
+fi
+
+# change libdir to prefix/lib/mysql unless otherwise specified
+if test "$libdir" = '${exec_prefix}/lib'
+then
+  libdir="${libdir}/mysql"
+fi
 
 # We only support GCC and Sun's forte at the moment
 if test "$GCC" = "yes"
