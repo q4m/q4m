@@ -27,17 +27,19 @@ my $dbh2 = dbi_connect();
 ok($dbh->do('insert into q4m_t values (1),(2),(3),(4),(5)'));
 
 # calling queue_rowid while NOT in owner mode should return an error
-$dbh->{PrintError} = undef;
-my $r = $dbh->selectall_arrayref('select queue_rowid()');
-$dbh->{PrintError} = 1;
-isnt(ref $r, 'ARRAY');
+{
+    local $dbh->{PrintError} = undef;
+    local $dbh->{PrintWarn} = undef;
+    my $r = $dbh->selectall_arrayref('select queue_rowid()');
+    isnt(ref $r, 'ARRAY');
+}
 
 # transmit first row
 is_deeply(
     $dbh->selectall_arrayref('select queue_wait("q4m_t")'),
     [ [ 1 ] ],
 );
-$r = $dbh->selectall_arrayref('select queue_rowid()');
+my $r = $dbh->selectall_arrayref('select queue_rowid()');
 is(ref $r, 'ARRAY');
 is(ref $r->[0], 'ARRAY');
 my $row_id = $r->[0][0];
