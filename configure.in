@@ -22,15 +22,18 @@ AC_SUBST(MYSQL_INC)
 # check if prefix points to mysql 5.1
 if test ! -e "${prefix}/include/mysql/plugin.h"
 then
-  echo "${prefix}/include/mysql/plugin.h not found." 2>&1
-  echo "Please specify mysql 5.1 directory with --prefix option." 2>&1
+  echo "${prefix}/include/mysql/plugin.h not found." >&2
+  echo "Please specify mysql 5.1 directory with --prefix option." >&2
   exit 1
 fi
 
 # change libdir to prefix/lib/mysql unless otherwise specified
 if test "$libdir" = '${exec_prefix}/lib'
 then
-  libdir="${libdir}/mysql"
+  if test -d "${prefix}/lib/mysql"
+  then
+    libdir="${libdir}/mysql"
+  fi
 fi
 
 # We only support GCC and Sun's forte at the moment
