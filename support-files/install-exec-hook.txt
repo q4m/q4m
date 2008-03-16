@@ -2,7 +2,7 @@
 Thank you for installing Q4M.  If this is the first time to install
 Q4M, please run support-files/install.sql and activate it.
 
-    % mysql -u root mysql < support-files/install.sql
+    % mysql -u root -f mysql < support-files/install.sql
 
 Once you have activated Q4M, you can try running the tests bundled to
 this ditribution, by typing
