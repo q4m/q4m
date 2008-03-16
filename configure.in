@@ -20,9 +20,9 @@ MYSQL_SRC_TEST
 AC_SUBST(MYSQL_INC)
 
 # check if prefix points to mysql 5.1
-if test ! -e "${prefix}/include/mysql/plugin.h"
+if test ! -e "${prefix}/include/mysql/plugin.h" -a ! -e "${prefix}/include/mysql.h"
 then
-  echo "${prefix}/include/mysql/plugin.h not found." >&2
+  echo "failed to lacate mysql 5.1 installation" >&2
   echo "Please specify mysql 5.1 directory with --prefix option." >&2
   exit 1
 fi
