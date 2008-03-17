@@ -5,7 +5,7 @@ use warnings;
 
 use DBI;
 
-use Test::More tests => 26;
+use Test::More tests => 32;
 
 sub dbi_connect {
     DBI->connect(
@@ -45,7 +45,7 @@ is(ref $r->[0], 'ARRAY');
 my $row_id = $r->[0][0];
 $r = $dbh->selectall_arrayref('select * from q4m_t');
 is_deeply(
-    $dbh->selectall_arrayref("select queue_set_srcid(0,$row_id)"),
+    $dbh->selectall_arrayref("select queue_set_srcid(0,'a',$row_id)"),
     [ [ 1 ] ],
 );
 ok($dbh->do("insert into q4m_t2 values ($r->[0][0])"));
@@ -56,7 +56,7 @@ is_deeply(
 
 # test if duplicates are ignored
 is_deeply(
-    $dbh->selectall_arrayref("select queue_set_srcid(0,$row_id)"),
+    $dbh->selectall_arrayref("select queue_set_srcid(0,'a',$row_id)"),
     [ [ 1 ] ],
 );
 ok($dbh->do("insert into q4m_t2 values ($r->[0][0])"));
@@ -76,7 +76,7 @@ is(ref $r->[0], 'ARRAY');
 $row_id = $r->[0][0];
 $r = $dbh->selectall_arrayref('select * from q4m_t');
 is_deeply(
-    $dbh->selectall_arrayref("select queue_set_srcid(0,$row_id)"),
+    $dbh->selectall_arrayref("select queue_set_srcid(0,'a',$row_id)"),
     [ [ 1 ] ],
 );
 ok($dbh->do("insert into q4m_t2 values ($r->[0][0])"));
@@ -87,7 +87,7 @@ is_deeply(
 
 # check if we can re-insert the same value using a different source_id
 is_deeply(
-    $dbh->selectall_arrayref("select queue_set_srcid(1,$row_id)"),
+    $dbh->selectall_arrayref("select queue_set_srcid(1,'a',$row_id)"),
     [ [ 1 ] ],
 );
 ok($dbh->do("insert into q4m_t2 values ($r->[0][0])"));
@@ -96,12 +96,32 @@ is_deeply(
     [ [ 1 ], [ 2 ], [ 2 ] ],
 );
 
+# check if we can re-insert the same value by using "w" mode
+is_deeply(
+    $dbh->selectall_arrayref("select queue_set_srcid(1,'w',$row_id)"),
+    [ [ 1 ] ],
+);
+ok($dbh->do("insert into q4m_t2 values ($r->[0][0])"));
+is_deeply(
+    $dbh2->selectall_arrayref("select * from q4m_t2"),
+    [ [ 1 ], [ 2 ], [ 2 ], [ 2 ] ],
+);
+is_deeply(
+    $dbh->selectall_arrayref("select queue_set_srcid(1,'a',$row_id)"),
+    [ [ 1 ] ],
+);
+ok($dbh->do("insert into q4m_t2 values ($r->[0][0])"));
+is_deeply(
+    $dbh2->selectall_arrayref("select * from q4m_t2"),
+    [ [ 1 ], [ 2 ], [ 2 ], [ 2 ] ],
+);
+
 # sanity check of source_id
 is_deeply(
-    $dbh->selectall_arrayref("select queue_set_srcid(-1,$row_id)"),
+    $dbh->selectall_arrayref("select queue_set_srcid(-1,'a',$row_id)"),
     [ [ undef ] ],
 );
 is_deeply(
-    $dbh->selectall_arrayref("select queue_set_srcid(64,$row_id)"),
+    $dbh->selectall_arrayref("select queue_set_srcid(64,'a',$row_id)"),
     [ [ undef ] ],
 );

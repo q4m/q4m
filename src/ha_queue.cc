@@ -264,9 +264,7 @@ void queue_share_t::fixup_header()
       if (source.sender() > QUEUE_MAX_SOURCES) {
 	kill_proc("corrupt table: %s\n", table_name);
       }
-      if (source.offset() > _header.last_received_offset(source.sender())) {
-	_header.set_last_received_offset(source.sender(), source.offset());
-      }
+      _header.set_last_received_offset(source.sender(), source.offset());
     }
     off = row.next(off);
   }
@@ -499,7 +497,7 @@ int queue_share_t::write_rows(const void *rows, size_t rows_size)
   append_t a(rows, rows_size, source);
   
   pthread_mutex_lock(&mutex);
-  if (source != NULL
+  if (source != NULL && ! conn->reset_source
       && source->offset() <= _header.last_received_offset(source->sender())) {
     pthread_mutex_unlock(&mutex);
     log("skipping forwarded duplicates: %s,max %llu,got %llu\n", table_name,
@@ -709,8 +707,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
   }
   for (append_list_t::iterator i = l->begin(); i != l->end(); ++i) {
     const queue_source_t *s = (*i)->source;
-    if (s != NULL
-	&& s->offset() > _header.last_received_offset(s->sender())) {
+    if (s != NULL) {
       _header.set_last_received_offset(s->sender(), s->offset());
     }
   }
@@ -1691,14 +1688,16 @@ long long queue_rowid(UDF_INIT *initid __attribute__((unused)), UDF_ARGS *args,
 
 my_bool queue_set_srcid_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 {
-  if (args->arg_count != 2) {
-    strcpy(message, "queue_set_srcid(source,rowid): argument_error");
+  if (args->arg_count != 3) {
+    strcpy(message, "queue_set_srcid(source,mode,rowid): argument error");
     return 1;
   }
   args->arg_type[0] = INT_RESULT;
   args->maybe_null[0] = 0;
-  args->arg_type[1] = INT_RESULT;
+  args->arg_type[1] = STRING_RESULT;
   args->maybe_null[1] = 0;
+  args->arg_type[2] = INT_RESULT;
+  args->maybe_null[2] = 0;
   initid->maybe_null = 0;
   return 0;
 }
@@ -1718,6 +1717,15 @@ long long queue_set_srcid(UDF_INIT *initid __attribute__((unused)),
     return 0;
   }
   queue_connection_t *conn = queue_connection_t::current(true);
-  conn->source = queue_source_t(sender, *(long long*)args->args[1]);
+  if (strcmp(args->args[1], "a") == 0) {
+    conn->reset_source = false;
+  } else if (strcmp(args->args[1], "w") == 0) {
+    conn->reset_source = true;
+  } else {
+    log("queue_set_srcid: invalid mode: %s\n", args->args[1]);
+    *error = 1;
+    return 0;
+  }
+  conn->source = queue_source_t(sender, *(long long*)args->args[2]);
   return 1;
 }

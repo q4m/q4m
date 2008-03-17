@@ -255,13 +255,14 @@ struct queue_connection_t {
   bool owner_mode;
   queue_share_t *share_owned;
   queue_source_t source;
+  bool reset_source;
   void erase_owned();
   static size_t cnt;
   static queue_connection_t *current(bool create_if_empty = false);
   static int close(handlerton *hton, THD *thd);
 private:
   queue_connection_t()
-  : owner_mode(false), share_owned(NULL), source(0, 0) {}
+  : owner_mode(false), share_owned(NULL), source(0, 0), reset_source(false) {}
   ~queue_connection_t() {}
 };
 

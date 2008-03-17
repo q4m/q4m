@@ -15,7 +15,8 @@ example:
    "dbi:mysql:database=db1;table=tbl1;user=foo;password=XXX" \\
    "dbi:mysql:database=db2;table=tbl2;host=bar;user=foo"
 options:
-  --sender=sender_index
+  --reset                reset duplicate check info.
+  --sender=sender_index  slot no. used for checking duplicates (0..63)
   --help
 EOT
     exit $exit_code;
@@ -32,10 +33,12 @@ sub connect_to_db {
 }
 
 my $sender_index = 0;
+my $do_reset = 0;
 my $help;
 
 GetOptions(
     'sender=i' => \$sender_index,
+    'reset'    => \$do_reset,
     help       => \$help,
 ) or usage(1);
 usage(1) if $help;
@@ -45,6 +48,8 @@ my ($src, $dst) = @ARGV;
 
 my ($src_conn, $src_table) = connect_to_db($src);
 my ($dst_conn, $dst_table) = connect_to_db($dst);
+
+my $mode = $do_reset ? 'w' : 'a';
 
 while (1) {
     # wait until a row gets ready
@@ -67,13 +72,15 @@ while (1) {
     ) or die $src_conn->errstr;
     # write row
     my $res = $dst_conn->selectall_arrayref(
-        'select queue_set_srcid(?,?)',
+        "select queue_set_srcid(?,?,?)",
         {},
         $sender_index,
+	$mode,
         $rowid->[0][0],
     ) or die $dst_conn->errstr;
     die "failed to set source id (sender index out of range?)\n"
         unless $res->[0][0];
+    $mode = 'a';
     $dst_conn->do(
         "insert into $dst_table ("
             . join(',', sort keys %{$row->[0]})
