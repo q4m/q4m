@@ -15,8 +15,8 @@ example:
    "dbi:mysql:database=db1;table=tbl1;user=foo;password=XXX" \\
    "dbi:mysql:database=db2;table=tbl2;host=bar;user=foo"
 options:
-  --reset                reset duplicate check info.
-  --sender=sender_index  slot no. used for checking duplicates (0..63)
+  --reset       reset duplicate check info.
+  --sender=idx  slot no. used for checking duplicates (0..63, default: 0)
   --help
 EOT
     exit $exit_code;
