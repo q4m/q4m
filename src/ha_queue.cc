@@ -1503,15 +1503,17 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
       for (int i = 0; i < num_shares; i++) {
 	shares[i].share->lock();
 	if (shares[i].share->assign_owner(pthread_self()) != 0) {
+          shares[i].share->unlock();
 	  share_owned = i;
-	  break;
-	}
-      }
-      for (int i = 0; i < num_shares; i++) {
-	shares[i].share->unlock();
-	if (i == share_owned) {
 	  goto END_WAIT;
 	}
+        shares[i].share->unlock();
+        /* re-register listener if we received the signal but failed to acquire
+           the row (taken by another thread) */
+        if (shares[i].listener.signalled) {
+          shares[i].listener.signalled = false;
+          shares[i].share->register_listener(&shares[i].listener);
+        }
       }
       timespec ts = { return_at, 0 };
       if (pthread_cond_timedwait(&cond, &g_mutex, &ts) != 0) {
