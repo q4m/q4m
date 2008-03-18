@@ -157,10 +157,15 @@ class queue_share_t {
   typedef std::vector<remove_t*> remove_list_t;
   
   struct listener_t {
-    pthread_cond_t *cond;
-    bool signalled;
-    listener_t(pthread_cond_t *c)
-    : cond(c), signalled(false) {
+    pthread_cond_t cond;
+    queue_share_t *signalled_by;
+    pthread_t listener;
+    listener_t(const pthread_t& t)
+    : signalled_by(NULL), listener(t) {
+      pthread_cond_init(&cond, NULL);
+    }
+    ~listener_t() {
+      pthread_cond_destroy(&cond);
     }
   };
   typedef std::list<listener_t*> listener_list_t;
@@ -206,8 +211,8 @@ public:
   void lock_reader() { lock(); ++num_readers; unlock(); }
   void unlock_reader();
   void register_listener(listener_t *l) { listener_list.push_back(l); }
-  void unregister_listener(pthread_cond_t *c);
-  void wake_listener(bool locked = false);
+  void unregister_listener(listener_t *l);
+  void wake_listeners();
   static int wait_multi(const std::list<queue_share_t*> &shares, pthread_cond_t *c, time_t t);
   
   const char *get_table_name() const { return table_name; }
@@ -236,7 +241,7 @@ public:
   my_off_t get_owned_row(pthread_t owner, bool remove = false);
   int remove_rows(my_off_t *offsets, int cnt);
   pthread_t find_owner(my_off_t off);
-  my_off_t assign_owner(pthread_t owner);
+  my_off_t assign_owner(pthread_t owner, my_off_t last = 0);
 private:
   int writer_do_append(append_list_t *l);
   void writer_do_remove(remove_list_t *l);
