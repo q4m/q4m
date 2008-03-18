@@ -38,9 +38,12 @@ for (my $i = 0; $i < $NUM_CHILDREN; $i++) {
         open my $logfh, '>', "$$.log" or die $!;
         $dbh = dbi_connect();
         for (my $j = 0; $j < $NUM_MESSAGES / $NUM_CHILDREN; $j++) {
-            my @w = $dbh->selectrow_array("select queue_wait('test.q4m_t')")
-                or die $dbh->errstr;
-	    next unless $w[0];
+            while (1) {
+		my @w = $dbh->selectrow_array("select queue_wait('test.q4m_t')")
+		    or die $dbh->errstr;
+		last if $w[0];
+		print STDERR "queue_wait timeout\n";
+	    }
             my $a = $dbh->selectall_arrayref("select * from q4m_t")
                 or die $dbh->errstr;
             print $logfh "$a->[0]->[0]\n";
@@ -78,7 +81,8 @@ foreach my $pid (@children) {
         push @recvs, $l;
     }
     close $logfh;
-    unlink "$pid.log";
+    unlink "$pid.log"
+	unless $ENV{Q4M_TEST_PRESERVE_LOG};
 }
 @recvs = sort { $a <=> $b } uniq @recvs;
 
