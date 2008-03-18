@@ -42,7 +42,8 @@ for (my $i = 0; $i < $NUM_CHILDREN; $i++) {
                 or die $dbh->errstr;
             my $a = $dbh->selectall_arrayref("select * from q4m_t")
                 or die $dbh->errstr;
-            print $logfh "$a->[0]->[0]\n";
+            print $logfh "$a->[0]->[0]\n"
+		if $a->[0];
         }
         $dbh->do("select queue_end()");
         exit 0;
