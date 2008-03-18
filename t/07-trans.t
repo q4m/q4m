@@ -5,7 +5,7 @@ use warnings;
 
 use DBI;
 
-use Test::More tests => 32;
+use Test::More tests => 33;
 
 sub dbi_connect {
     DBI->connect(
@@ -44,6 +44,10 @@ is(ref $r, 'ARRAY');
 is(ref $r->[0], 'ARRAY');
 my $row_id = $r->[0][0];
 $r = $dbh->selectall_arrayref('select * from q4m_t');
+is_deeply(
+    $r,
+    [ [ 1 ] ],
+);
 is_deeply(
     $dbh->selectall_arrayref("select queue_set_srcid(0,'a',$row_id)"),
     [ [ 1 ] ],
