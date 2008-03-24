@@ -203,7 +203,7 @@ queue_row_t *queue_row_t::create_checksum(const iovec* iov, int iovcnt)
 
 queue_file_header_t::queue_file_header_t()
 {
-  int4store(_magic, MAGIC);
+  int4store(_magic, MAGIC_V2);
   int4store(_attr, 0);
   int8store(_end, static_cast<my_off_t>(sizeof(queue_file_header_t)));
   int8store(_begin, static_cast<my_off_t>(sizeof(queue_file_header_t)));
@@ -289,7 +289,114 @@ void queue_share_t::fixup_header()
   sync_file(fd);
 }
 
-queue_share_t *queue_share_t::get_share(const char *table_name)
+static bool load_table(TABLE *table, const char *db_table_name)
+{
+  // precondition: LOCK_open should be acquired
+  
+  TABLE_SHARE *share;
+  TABLE_LIST table_list;
+  char key[MAX_DBKEY_LENGTH];
+  uint key_length;
+  int err;
+  char *db_table_buf;
+  
+  bzero((char*)&table_list, sizeof(TABLE_LIST));
+  bzero((char*)table, sizeof(TABLE));
+  
+  /* copy table name to buffer and split to db name and table name */
+  if ((db_table_buf = strdup(db_table_name)) == NULL) {
+    log("out of memory\n");
+    return false;
+  }
+  for (table_list.db = db_table_buf;
+       *table_list.db == '/' || *table_list.db == '.';
+       table_list.db++)
+    ;
+  if (*table_list.db == '\0') {
+    log("invalid table name: %s\n", db_table_name);
+    goto Error;
+  }
+  for (table_list.table_name = table_list.db + 1;
+       *table_list.table_name != '/';
+       table_list.table_name++) {
+    if (*table_list.table_name == '\0') {
+      log("invalid table name: %s\n", db_table_name);
+      goto Error;
+    }
+  }
+  *table_list.table_name++ = '\0';
+  
+  /* load table data */
+  key_length = create_table_def_key(current_thd, key, &table_list, 0);
+  if ((share = get_table_share(current_thd, &table_list, key, key_length, 0,
+			       &err))
+      == NULL) {
+    return true;
+  }
+  if (open_table_from_share(current_thd, share, table_list.table_name, NULL,
+			    READ_ALL, 0, table, TRUE)
+      != 0) {
+    goto Error;
+  }
+  
+  /* free and return */
+  free(db_table_buf);
+  return true;
+  
+ Error:
+  free(db_table_buf);
+  return false;
+}
+
+static queue_fixed_field_t **create_fixed_fields(TABLE *table)
+{
+  queue_fixed_field_t** map = new queue_fixed_field_t* [table->s->fields];
+  Field **field;
+  int field_index;
+  size_t off = table->s->null_bytes;
+  
+  for (field = table->field, field_index = 0;
+       *field != NULL;
+       field++, field_index++) {
+    switch ((*field)->type()) {
+#define TYPEMAP(type, cls) \
+      case MYSQL_TYPE_##type: \
+	map[field_index] = new cls; \
+        off += map[field_index]->size(); \
+	break
+      TYPEMAP(TINY, queue_int_field_t<1>(table, *field));
+      TYPEMAP(SHORT, queue_int_field_t<2>(table, *field));
+      TYPEMAP(INT24, queue_int_field_t<3>(table, *field));
+      TYPEMAP(LONG, queue_int_field_t<4>(table, *field));
+      TYPEMAP(LONGLONG, queue_int_field_t<8>(table, *field));
+      TYPEMAP(FLOAT, queue_fixed_field_t(table, *field, sizeof(float)));
+      TYPEMAP(DOUBLE, queue_fixed_field_t(table, *field, sizeof(double)));
+      TYPEMAP(TIMESTAMP, queue_int_field_t<4>(table, *field));
+      TYPEMAP(DATE, queue_int_field_t<4>(table, *field));
+      TYPEMAP(NEWDATE, queue_int_field_t<3>(table, *field));
+      TYPEMAP(TIME, queue_int_field_t<3>(table, *field));
+      TYPEMAP(DATETIME, queue_int_field_t<8>(table, *field));
+#undef TYPEMAP:
+    default:
+      map[field_index] = NULL;
+      break;
+    }
+  }
+  
+  return map;
+}
+
+static void destroy_fixed_fields(queue_fixed_field_t **fields, size_t n)
+{
+  if (fields != NULL) {
+    for (size_t i = 0; i < n; i++) {
+      delete fields[i];
+    }
+    delete [] fields;
+  }
+}
+
+queue_share_t *queue_share_t::get_share(TABLE *table, const char *table_name)
 {
   queue_share_t *share;
   uint table_name_length;
@@ -344,8 +451,32 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
       != sizeof(share->_header)) {
     goto ERR_AFTER_FILEOPEN;
   }
-  if (share->_header.magic() != queue_file_header_t::MAGIC) {
+  switch (share->_header.magic()) {
+  case queue_file_header_t::MAGIC_V1:
+  case queue_file_header_t::MAGIC_V2:
+    break;
+  default:
     goto ERR_AFTER_FILEOPEN;
+  }
+  /* load fixed-field info */
+  if (share->_header.magic() == queue_file_header_t::MAGIC_V2) {
+    if (table == NULL) {
+      TABLE table_buf;
+      pthread_mutex_lock(&LOCK_open);
+      if (! load_table(&table_buf, table_name)) {
+	pthread_mutex_unlock(&LOCK_open);
+	goto ERR_AFTER_FILEOPEN;
+      }
+      share->fixed_fields = create_fixed_fields(&table_buf);
+      share->null_bytes = table_buf.s->null_bytes;
+      share->field = table_buf.s->fields;
+      closefrm(&table_buf, true);
+      pthread_mutex_unlock(&LOCK_open);
+    } else {
+      share->fixed_fields = create_fixed_fields(table);
+      share->null_bytes = table->s->null_bytes;
+      share->fields = table->s->fields;
+    }
   }
   /* sanity check */
   if ((share->_header.attr() & queue_file_header_t::attr_is_dirty) != 0) {
@@ -378,6 +509,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   pthread_cond_signal(&share->to_writer_cond);
   pthread_join(share->writer_thread, NULL);
  ERR_AFTER_FILEOPEN:
+  destroy_fixed_fields(share->fixed_fields, share->fields);
   close(share->fd);
  ERR_ON_FILEOPEN:
   delete share->remove_list;
@@ -411,6 +543,7 @@ void queue_share_t::release()
     _header.set_attr(_header.attr() & ~queue_file_header_t::attr_is_dirty);
     _header.write(fd);
     sync_file(fd);
+    destroy_fixed_fields(fixed_fields, fields);
     close(fd);
     delete remove_list;
     delete append_list;
@@ -986,7 +1119,7 @@ const char **ha_queue::bas_ext() const
 
 int ha_queue::open(const char *name, int mode, uint test_if_locked)
 {
-  if ((share = queue_share_t::get_share(name)) == NULL) {
+  if ((share = queue_share_t::get_share(table, name)) == NULL) {
     return 1;
   }
   thr_lock_data_init(share->get_store_lock(), &lock, NULL);
@@ -1325,11 +1458,22 @@ void ha_queue::free_rows_buffer()
 void ha_queue::unpack_row(uchar *buf)
 {
   const uchar *src = rows + queue_row_t::header_size();
-			  
+  Field **field;
+  queue_fixed_field_t * const * fixed;
+  
   memcpy(buf, src, table->s->null_bytes);
   src += table->s->null_bytes;
-  for (Field **field = table->field; *field != NULL; field++) {
-    if (! (*field)->is_null()) {
+  for (field = table->field, fixed = share->get_fixed_fields();
+       *field != NULL;
+       field++, fixed++) {
+    if (fixed != NULL && ! (*field)->is_null()) {
+      src = (*field)->unpack(buf + (*field)->offset(table->record[0]), src);
+    }
+  }
+  for (field = table->field, fixed = share->get_fixed_fields();
+       *field != NULL;
+       field++, fixed++) {
+    if (fixed == NULL && ! (*field)->is_null()) {
       src = (*field)->unpack(buf + (*field)->offset(table->record[0]), src);
     }
   }
@@ -1355,8 +1499,19 @@ size_t ha_queue::pack_row(uchar *buf, queue_source_t *source)
   uchar *dst = rows + rows_size + queue_row_t::header_size();
   memcpy(dst, buf, table->s->null_bytes);
   dst += table->s->null_bytes;
-  for (Field **field = table->field; *field != NULL; field++) {
-    if (! (*field)->is_null()) {
+  Field **field;
+  queue_fixed_field_t * const *fixed;
+  for (field = table->field, fixed = share->get_fixed_fields();
+       *field != NULL;
+       field++, fixed++) {
+    if (fixed != NULL && ! (*field)->is_null()) {
+      dst = (*field)->pack(dst, buf + (*field)->offset(buf));
+    }
+  }
+  for (field = table->field, fixed = share->get_fixed_fields();
+       *field != NULL;
+       field++, fixed++) {
+    if (fixed == NULL && ! (*field)->is_null()) {
       dst = (*field)->pack(dst, buf + (*field)->offset(buf));
     }
   }
@@ -1396,9 +1551,12 @@ static queue_share_t* get_share_check(const char* db_table_name)
     db = current_thd->db;
     tbl = db_table_name;
   }
-  build_table_filename(path, FN_REFLEN - 1, db, tbl, "", 0);
+  if (db == NULL) {
+    return NULL;
+  }
   
-  return queue_share_t::get_share(path);
+  build_table_filename(path, FN_REFLEN - 1, db, tbl, "", 0);
+  return queue_share_t::get_share(NULL, path);
 }
 
 static int init_plugin(void *p)

@@ -83,7 +83,8 @@ private:
 class queue_file_header_t {
 public:
   enum {
-    MAGIC         = 0x304d3451, // 'Q4M0' in little endian
+    MAGIC_V1      = 0x304d3451, // 'Q4M0' in little endian
+    MAGIC_V2      = 0x314d3451, // 'Q4M1' in little endian, w. conditional wait
     attr_is_dirty = 0x1
   };
 private:
@@ -124,6 +125,58 @@ struct queue_source_t {
   queue_source_t(unsigned s, my_off_t o) {
     set_sender(s);
     set_offset(o);
+  }
+};
+
+class queue_fixed_field_t {
+protected:
+  char *nam;
+  size_t sz;
+  size_t null_off;
+  uchar null_bit;
+public:
+  queue_fixed_field_t(const TABLE *t, const Field *f, size_t s)
+  : nam(new char [strlen(f->field_name) + 1]), sz(s),
+    null_off(f->null_ptr != NULL ? f->null_ptr - t->record[0] : 0),
+    null_bit(f->null_ptr != NULL ? f->null_bit : 0) {
+    strcpy(nam, f->field_name);
+  }
+  virtual ~queue_fixed_field_t() { delete [] nam; }
+  virtual bool is_int() const { return false; }
+  bool is_null(const uchar *buf) const {
+    return (buf[null_off] & null_bit) != 0;
+  }
+  const char *name() const { return nam; }
+  size_t size() const { return sz; }
+};
+
+template<size_t N> class queue_int_field_t : public queue_fixed_field_t {
+protected:
+  bool is_unsigned;
+public:
+  queue_int_field_t(const TABLE *t, const Field *f)
+  : queue_fixed_field_t(t, f, N),
+    is_unsigned(f->key_type() == HA_KEYTYPE_BINARY) {}
+  virtual ~queue_int_field_t() {}
+  virtual bool is_int() const { return true; }
+  long long get_value(const uchar *buf, size_t offset) const {
+    long long v;
+    switch (N) {
+#define TYPEREAD(sz, rd)			\
+    case sz:					\
+      v = rd;						   \
+      if (! is_unsigned && (v & (1 << (sz * 8) - 1)) != 0) \
+	v |= 0x8000000000000000LL >> (64 - sz * 8);	   \
+      break
+      TYPEREAD(1, buf[offset]);
+      TYPEREAD(2, uint2korr(buf + offset));
+      TYPEREAD(3, uint3korr(buf + offset));
+      TYPEREAD(4, uint4korr(buf + offset));
+      TYPEREAD(8, uint8korr(buf + offset));
+    default:
+      assert(0);
+    }
+    return v;
   }
 };
 
@@ -199,12 +252,16 @@ class queue_share_t {
   bool writer_exit;
   append_list_t *append_list;
   remove_list_t *remove_list;
+  /* following fields are for V2 type table only */
+  queue_fixed_field_t **fixed_fields;
+  size_t null_bytes;
+  size_t fields;
   
 public:
   void fixup_header();
   static uchar *get_share_key(queue_share_t *share, size_t *length,
 			      my_bool not_used);
-  static queue_share_t *get_share(const char* table_name);
+  static queue_share_t *get_share(TABLE *table, const char* table_name);
   void release();
   void lock() { pthread_mutex_lock(&mutex); }
   void unlock() { pthread_mutex_unlock(&mutex); }
@@ -218,6 +275,7 @@ public:
   const char *get_table_name() const { return table_name; }
   THR_LOCK *get_store_lock() { return &store_lock; }
   const queue_file_header_t *header() const { return &_header; }
+  queue_fixed_field_t * const *get_fixed_fields() const { return fixed_fields; }
   my_off_t reset_owner(pthread_t owner);
   int write_rows(const void *rows, size_t rows_size);
   /* functions below requires lock */
