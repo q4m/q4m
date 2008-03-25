@@ -333,8 +333,8 @@ static bool load_table(TABLE *table, const char *db_table_name)
       == NULL) {
     return true;
   }
-  if (open_table_from_share(current_thd, share, table_list.table_name, NULL,
-			    READ_ALL, 0, table, TRUE)
+  if (open_table_from_share(current_thd, share, table_list.table_name, 0,
+			    READ_ALL, 0, table, FALSE)
       != 0) {
     goto Error;
   }
@@ -376,7 +376,7 @@ static queue_fixed_field_t **create_fixed_fields(TABLE *table)
       TYPEMAP(NEWDATE, queue_int_field_t<3>(table, *field));
       TYPEMAP(TIME, queue_int_field_t<3>(table, *field));
       TYPEMAP(DATETIME, queue_int_field_t<8>(table, *field));
-#undef TYPEMAP:
+#undef TYPEMAP
     default:
       map[field_index] = NULL;
       break;
@@ -611,6 +611,7 @@ void queue_share_t::unregister_listener(listener_t *l)
 void queue_share_t::wake_listeners()
 {
   bool use_cond_expr = false;
+  my_off_t off;
   
   // note: lock order should always be: g_mutex -> queue_share_t::mutex
   pthread_mutex_lock(&g_mutex);
@@ -633,7 +634,7 @@ void queue_share_t::wake_listeners()
   
   // per-row test
   lock();
-  my_off_t off = _header.begin();
+  off = _header.begin();
   while (off != _header.end()) {
     while (find_owner(off) != 0) {
       if (next(&off) != 0) {
@@ -854,7 +855,7 @@ pthread_t queue_share_t::find_owner(my_off_t off)
 my_off_t queue_share_t::assign_owner(pthread_t owner,
 				     cond_expr_t *cond_expr)
 {
-  my_off_t off = cond_expr != NULL ? cond_expr->pos() : NULL;
+  my_off_t off = cond_expr != NULL ? cond_expr->pos() : 0;
   if (off == 0) {
     off = _header.begin();
   } else if (next(&off) != 0) {
@@ -1210,6 +1211,20 @@ int queue_share_t::compact()
       i->second -= delta;
     }
     cache.off = 0; /* invalidate, since it may go below sizeof(_header) */
+    for (cond_expr_data_list_t::iterator i = active_cond_expr_list.begin();
+	 i != active_cond_expr_list.end();
+	 ++i) {
+      if ((i->pos -= delta) < sizeof(queue_file_header_t)) {
+	i->pos = 0;
+      }
+    }
+    for (cond_expr_data_list_t::iterator i = inactive_cond_expr_list.begin();
+	 i != inactive_cond_expr_list.end();
+	 ++i) {
+      if ((i->pos -= delta) < sizeof(queue_file_header_t)) {
+	i->pos = 0;
+      }
+    }
   }
   
   log("finished table compaction: %s\n", table_name);
