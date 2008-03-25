@@ -40,7 +40,7 @@ fi
 if test "$GCC" = "yes"
 then
   CFLAGS="$CFLAGS -Wall"
-  CXXFLAGS="$CXXFLAGS -Wall -fno-exceptions -fno-rtti"
+  CXXFLAGS="$CXXFLAGS -Wall"
 else
   CFLAGS="-Xa -xstrconst -mt -D_FORTEC_ -fast -m64"
   CXXFLAGS="$CXXFLAGS -noex -mt -D_FORTEC_ -fast -m64"

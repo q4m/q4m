@@ -18,6 +18,8 @@
 #ifndef HA_QUEUE_H
 #define HA_QUEUE_H
 
+#include "queue_cond.h"
+
 // error numbers should be less than HA_ERR_FIRST
 #define QUEUE_ERR_RECORD_EXISTS (1)
 
@@ -142,7 +144,10 @@ public:
     strcpy(nam, f->field_name);
   }
   virtual ~queue_fixed_field_t() { delete [] nam; }
-  virtual bool is_int() const { return false; }
+  virtual bool is_convertible() const { return false; }
+  virtual queue_cond_t::value_t get_value(const uchar *buf, size_t off) const {
+    return queue_cond_t::value_t::null_value();
+  }
   bool is_null(const uchar *buf) const {
     return (buf[null_off] & null_bit) != 0;
   }
@@ -158,25 +163,25 @@ public:
   : queue_fixed_field_t(t, f, N),
     is_unsigned(f->key_type() == HA_KEYTYPE_BINARY) {}
   virtual ~queue_int_field_t() {}
-  virtual bool is_int() const { return true; }
-  long long get_value(const uchar *buf, size_t offset) const {
+  virtual bool is_convertible() const { return true; }
+  virtual queue_cond_t::value_t get_value(const uchar *buf, size_t off) const {
     long long v;
     switch (N) {
-#define TYPEREAD(sz, rd)			\
-    case sz:					\
-      v = rd;						   \
-      if (! is_unsigned && (v & (1 << (sz * 8) - 1)) != 0) \
-	v |= 0x8000000000000000LL >> (64 - sz * 8);	   \
+#define TYPEREAD(sz, rd) \
+    case sz: \
+      v = rd; \
+      if (! is_unsigned && (v & (LLONG_MIN >> (64 - sz * 8))) != 0) \
+	v |= LLONG_MIN >> (64 - sz * 8); \
       break
-      TYPEREAD(1, buf[offset]);
-      TYPEREAD(2, uint2korr(buf + offset));
-      TYPEREAD(3, uint3korr(buf + offset));
-      TYPEREAD(4, uint4korr(buf + offset));
-      TYPEREAD(8, uint8korr(buf + offset));
+      TYPEREAD(1, buf[off]);
+      TYPEREAD(2, uint2korr(buf + off));
+      TYPEREAD(3, uint3korr(buf + off));
+      TYPEREAD(4, uint4korr(buf + off));
+      TYPEREAD(8, uint8korr(buf + off));
     default:
       assert(0);
     }
-    return v;
+    return queue_cond_t::value_t::int_value(v);
   }
 };
 
@@ -213,15 +218,15 @@ class queue_share_t {
     pthread_cond_t cond;
     queue_share_t *signalled_by;
     pthread_t listener;
-    listener_t(const pthread_t& t)
-    : signalled_by(NULL), listener(t) {
+    listener_t(const pthread_t& t) : signalled_by(NULL), listener(t) {
       pthread_cond_init(&cond, NULL);
     }
     ~listener_t() {
       pthread_cond_destroy(&cond);
     }
   };
-  typedef std::list<listener_t*> listener_list_t;
+  typedef std::list<std::pair<listener_t*, const queue_cond_t::node_t*> >
+  listener_list_t;
   
  private:
   uint use_count;
@@ -252,10 +257,13 @@ class queue_share_t {
   bool writer_exit;
   append_list_t *append_list;
   remove_list_t *remove_list;
+  queue_cond_t cond_eval;
   /* following fields are for V2 type table only */
   queue_fixed_field_t **fixed_fields;
   size_t null_bytes;
   size_t fields;
+  uchar *fixed_buf;
+  size_t fixed_buf_size;
   
 public:
   void fixup_header();
@@ -267,14 +275,18 @@ public:
   void unlock() { pthread_mutex_unlock(&mutex); }
   void lock_reader() { lock(); ++num_readers; unlock(); }
   void unlock_reader();
-  void register_listener(listener_t *l) { listener_list.push_back(l); }
+  void register_listener(listener_t *l, const queue_cond_t::node_t *c) {
+    listener_list.push_back(std::make_pair(l, c));
+  }
   void unregister_listener(listener_t *l);
   void wake_listeners();
-  static int wait_multi(const std::list<queue_share_t*> &shares, pthread_cond_t *c, time_t t);
+  static int wait_multi(const std::list<queue_share_t*> &shares,
+			pthread_cond_t *c, time_t t);
   
   const char *get_table_name() const { return table_name; }
   THR_LOCK *get_store_lock() { return &store_lock; }
   const queue_file_header_t *header() const { return &_header; }
+  queue_cond_t *get_cond_eval() { return &cond_eval; }
   queue_fixed_field_t * const *get_fixed_fields() const { return fixed_fields; }
   my_off_t reset_owner(pthread_t owner);
   int write_rows(const void *rows, size_t rows_size);
@@ -299,7 +311,8 @@ public:
   my_off_t get_owned_row(pthread_t owner, bool remove = false);
   int remove_rows(my_off_t *offsets, int cnt);
   pthread_t find_owner(my_off_t off);
-  my_off_t assign_owner(pthread_t owner, my_off_t last = 0);
+  int setup_cond_eval(my_off_t pos);
+  my_off_t assign_owner(pthread_t owner, const queue_cond_t::node_t *cond_expr);
 private:
   int writer_do_append(append_list_t *l);
   void writer_do_remove(remove_list_t *l);
