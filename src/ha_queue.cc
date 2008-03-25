@@ -441,6 +441,8 @@ queue_share_t *queue_share_t::get_share(TABLE *table, const char *table_name)
   share->append_list = new append_list_t();
   share->remove_list = new remove_list_t();
   new (&share->cond_eval) queue_cond_t();
+  new (&share->active_cond_expr_list) cond_expr_data_list_t();
+  new (&share->inactive_cond_expr_list) cond_expr_data_list_t();
   /* open file */
   fn_format(filename, share->table_name, "", Q4M,
 	    MY_REPLACE_EXT | MY_UNPACK_FILENAME);
@@ -523,6 +525,8 @@ queue_share_t *queue_share_t::get_share(TABLE *table, const char *table_name)
   destroy_fixed_fields(share->fixed_fields, share->fields);
   close(share->fd);
  ERR_ON_FILEOPEN:
+  share->inactive_cond_expr_list.~cond_expr_data_list_t();
+  share->active_cond_expr_list.~cond_expr_data_list_t();
   share->cond_eval.~queue_cond_t();
   delete share->remove_list;
   delete share->append_list;
@@ -558,6 +562,13 @@ void queue_share_t::release()
     delete [] fixed_buf;
     destroy_fixed_fields(fixed_fields, fields);
     close(fd);
+    for (cond_expr_data_list_t::iterator i = inactive_cond_expr_list.begin();
+	 i != inactive_cond_expr_list.end();
+	 ++i) {
+      i->release();
+    }
+    inactive_cond_expr_list.~cond_expr_data_list_t();
+    active_cond_expr_list.~cond_expr_data_list_t();
     cond_eval.~queue_cond_t();
     delete remove_list;
     delete append_list;
@@ -635,7 +646,16 @@ void queue_share_t::wake_listeners()
       goto UNLOCK_ALL_RETURN;
     }
     for (l = listener_list.begin(); l != listener_list.end(); ++l) {
-      if (l->second == NULL || cond_eval.evaluate(l->second)) {
+      bool found = false;
+      if (l->second == NULL) {
+	found = true;
+      } else if (l->second->pos() < off) {
+	l->second->set_pos(off);
+	if (cond_eval.evaluate(l->second->node())) {
+	  found = true;
+	}
+      }
+      if (found) {
 	rows_owned.push_back(make_pair(l->first->listener, off));
 	l->first->signalled_by = this;
 	pthread_cond_signal(&l->first->cond);
@@ -663,6 +683,7 @@ my_off_t queue_share_t::reset_owner(pthread_t owner)
   my_off_t off = 0;
   lock();
   
+  // find the row to be released, and remove it from owner list
   for (queue_rows_owned_t::iterator i = rows_owned.begin();
        i != rows_owned.end();
        ++i) {
@@ -670,6 +691,26 @@ my_off_t queue_share_t::reset_owner(pthread_t owner)
       off = i->second;
       rows_owned.erase(i);
       break;
+    }
+  }
+  // update positions of cond_expr_list
+  if (off != 0) {
+    if (setup_cond_eval(off) == 0) {
+      for (cond_expr_data_list_t::iterator i = active_cond_expr_list.begin();
+	   i != active_cond_expr_list.end();
+	   ++i) {
+	if (off <= i->pos && cond_eval.evaluate(i->node)) {
+	  // todo: should find a way to obtain prev. row
+	  i->pos = 0;
+	}
+      }
+      for (cond_expr_data_list_t::iterator i = inactive_cond_expr_list.begin();
+	   i != inactive_cond_expr_list.end();
+	   ++i) {
+	if (off <= i->pos && cond_eval.evaluate(i->node)) {
+	  i->pos = 0;
+	}
+      }
     }
   }
   
@@ -810,6 +851,44 @@ pthread_t queue_share_t::find_owner(my_off_t off)
   return 0;
 }
 
+my_off_t queue_share_t::assign_owner(pthread_t owner,
+				     cond_expr_t *cond_expr)
+{
+  my_off_t off = cond_expr != NULL ? cond_expr->pos() : NULL;
+  if (off == 0) {
+    off = _header.begin();
+  } else if (next(&off) != 0) {
+    return 0;
+  }
+  
+  while (off != _header.end()) {
+    if (cond_expr != NULL) {
+      cond_expr->set_pos(off);
+    }
+    if (find_owner(off) == 0) {
+      if (cond_expr == NULL) {
+	goto FOUND;
+      } else {
+	if (setup_cond_eval(off) != 0) {
+	  log("internal error, table corrupt?");
+	  return 0;
+	}
+	if (cond_eval.evaluate(cond_expr->node())) {
+	  goto FOUND;
+	}
+      }
+    }
+    if (next(&off) != 0) {
+      return 0;
+    }
+  }
+  return 0;
+  
+ FOUND:
+  rows_owned.push_back(queue_rows_owned_t::value_type(owner, off));
+  return off;
+}
+
 int queue_share_t::setup_cond_eval(my_off_t pos)
 {
   /* read row data */
@@ -841,34 +920,51 @@ int queue_share_t::setup_cond_eval(my_off_t pos)
   return 0;
 }
 
-my_off_t queue_share_t::assign_owner(pthread_t owner,
-				     const queue_cond_t::node_t *cond_expr)
+queue_share_t::cond_expr_t queue_share_t::compile_cond_expr(const char *expr,
+							    size_t len)
 {
-  my_off_t off = _header.begin();
-  
-  while (off != _header.end()) {
-    if (find_owner(off) == 0) {
-      if (cond_expr == NULL) {
-	goto FOUND;
-      } else {
-	if (setup_cond_eval(off) != 0) {
-	  log("internal error, table corrupt?");
-	  return 0;
-	}
-	if (cond_eval.evaluate(cond_expr)) {
-	  goto FOUND;
-	}
-      }
-    }
-    if (next(&off) != 0) {
-      return 0;
+  // return an existing one, if any
+  for (cond_expr_data_list_t::iterator i = active_cond_expr_list.begin();
+       i != active_cond_expr_list.end();
+       ++i) {
+    if (i->expr_len == len && memcmp(i->expr, expr, len) == 0) {
+      return cond_expr_t(&*i);
     }
   }
-  return 0;
+  for (cond_expr_data_list_t::iterator i = inactive_cond_expr_list.begin();
+       i != inactive_cond_expr_list.end();
+       ++i) {
+    if (i->expr_len == len && memcmp(i->expr, expr, len) == 0) {
+      active_cond_expr_list.push_back(*i);
+      inactive_cond_expr_list.erase(i);
+      return cond_expr_t(&active_cond_expr_list.back());
+    }
+  }
   
- FOUND:
-  rows_owned.push_back(queue_rows_owned_t::value_type(owner, off));
-  return off;
+  // compile and return
+  queue_cond_t::node_t *n = cond_eval.compile_expression(expr, len);
+  if (n == NULL) {
+    return cond_expr_t(NULL);
+  }
+  active_cond_expr_list.push_back(cond_expr_data_t(this, n, expr, len));
+  return cond_expr_t(&active_cond_expr_list.back());
+}
+
+void queue_share_t::release_cond_expr(cond_expr_data_t *d)
+{
+  for (cond_expr_data_list_t::iterator i = active_cond_expr_list.begin();
+       i != active_cond_expr_list.end();
+       ++i) {
+    if (&*i == d) {
+      inactive_cond_expr_list.push_back(*i);
+      active_cond_expr_list.erase(i);
+      break;
+    }
+  }
+  while (inactive_cond_expr_list.size() >= 100) {
+    inactive_cond_expr_list.front().release();
+    inactive_cond_expr_list.pop_front();
+  }
 }
 
 static void close_append_list(queue_share_t::append_list_t *l, int err)
@@ -1698,7 +1794,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
 			    char *error)
 {
   queue_share_t **shares;
-  queue_cond_t::node_t **cond_exprs;
+  queue_share_t::cond_expr_t **cond_exprs;
   time_t return_at = time(NULL) + timeout;
   int share_owned = -1;
   queue_connection_t *conn = queue_connection_t::current(true);
@@ -1709,8 +1805,8 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
   
   /* setup */
   if (my_multi_malloc(MY_ZEROFILL, &shares, num_shares * sizeof(queue_share_t*),
-		      &cond_exprs, num_shares * sizeof(queue_cond_t::node_t*),
-		      NullS)
+		      &cond_exprs,
+		      num_shares * sizeof(queue_share_t::cond_expr_t*), NullS)
       == NULL) {
     log("out of memory\n");
     *error = 1;
@@ -1740,14 +1836,14 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
     }
     shares[i]->lock();
     if (*last != '\0') {
-      if ((cond_exprs[i] =
-	   shares[i]->get_cond_eval()->compile_expression(last + 1,
-							  strlen(last + 1)))
-	  == NULL) {
+      queue_share_t::cond_expr_t e =
+	shares[i]->compile_cond_expr(last + 1, strlen(last + 1));
+      if (! e.is_valid()) {
 	log("failed to compile expression: %s\n", last + 1);
 	*error = 1;
 	break;
       }
+      cond_exprs[i] = new queue_share_t::cond_expr_t(e);
     }
     if (shares[i]->assign_owner(pthread_self(), cond_exprs[i]) != 0) {
       share_owned = i;

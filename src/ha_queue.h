@@ -214,6 +214,66 @@ class queue_share_t {
   };
   typedef std::vector<remove_t*> remove_list_t;
   
+  struct cond_expr_data_t {
+    queue_share_t *share;
+    queue_cond_t::node_t *node;
+    char *expr;
+    size_t expr_len;
+    size_t ref_cnt;
+    my_off_t pos;
+    cond_expr_data_t(queue_share_t *s, queue_cond_t::node_t *n, const char *e,
+		     size_t el)
+    : share(s), node(n), expr(new char [el]), expr_len(el), ref_cnt(0), pos(0)
+    {
+      std::copy(e, e + el, expr);
+    }
+    void release() {
+      delete expr;
+      delete node;
+    }
+  };
+  typedef std::list<cond_expr_data_t> cond_expr_data_list_t;
+  
+  class cond_expr_t {
+    cond_expr_data_t *d;
+  public:
+    cond_expr_t(cond_expr_data_t *_d) : d(_d) {
+      if (d != NULL) {
+	d->ref_cnt++;
+      }
+    }
+    cond_expr_t(const cond_expr_t &x) : d(x.d) {
+      if (d != NULL) {
+	d->ref_cnt++;
+      }
+    }
+    ~cond_expr_t() {
+      if (d != NULL) {
+	if (--d->ref_cnt == 0) {
+	  d->share->release_cond_expr(d);
+	}
+      }
+    }
+    cond_expr_t& operator=(const cond_expr_t& x) {
+      if (this != &x) {
+	if (d != NULL) {
+	  if (--d->ref_cnt == 0) {
+	    d->share->release_cond_expr(d);
+	  }
+	}
+	d = x.d;
+	if (d != NULL) {
+	  d->ref_cnt++;
+	}
+      }
+      return *this;
+    }
+    bool is_valid() const { return d != NULL; }
+    const queue_cond_t::node_t *node() const { return d->node; }
+    my_off_t pos() const { return d->pos; }
+    void set_pos(my_off_t pos) { d->pos = pos; }
+  };
+  
   struct listener_t {
     pthread_cond_t cond;
     queue_share_t *signalled_by;
@@ -225,8 +285,7 @@ class queue_share_t {
       pthread_cond_destroy(&cond);
     }
   };
-  typedef std::list<std::pair<listener_t*, const queue_cond_t::node_t*> >
-  listener_list_t;
+  typedef std::list<std::pair<listener_t*, cond_expr_t*> > listener_list_t;
   
  private:
   uint use_count;
@@ -258,6 +317,8 @@ class queue_share_t {
   append_list_t *append_list;
   remove_list_t *remove_list;
   queue_cond_t cond_eval;
+  cond_expr_data_list_t active_cond_expr_list;
+  cond_expr_data_list_t inactive_cond_expr_list;
   /* following fields are for V2 type table only */
   queue_fixed_field_t **fixed_fields;
   size_t null_bytes;
@@ -275,7 +336,7 @@ public:
   void unlock() { pthread_mutex_unlock(&mutex); }
   void lock_reader() { lock(); ++num_readers; unlock(); }
   void unlock_reader();
-  void register_listener(listener_t *l, const queue_cond_t::node_t *c) {
+  void register_listener(listener_t *l, cond_expr_t *c) {
     listener_list.push_back(std::make_pair(l, c));
   }
   void unregister_listener(listener_t *l);
@@ -286,7 +347,6 @@ public:
   const char *get_table_name() const { return table_name; }
   THR_LOCK *get_store_lock() { return &store_lock; }
   const queue_file_header_t *header() const { return &_header; }
-  queue_cond_t *get_cond_eval() { return &cond_eval; }
   queue_fixed_field_t * const *get_fixed_fields() const { return fixed_fields; }
   my_off_t reset_owner(pthread_t owner);
   int write_rows(const void *rows, size_t rows_size);
@@ -311,8 +371,10 @@ public:
   my_off_t get_owned_row(pthread_t owner, bool remove = false);
   int remove_rows(my_off_t *offsets, int cnt);
   pthread_t find_owner(my_off_t off);
+  my_off_t assign_owner(pthread_t owner, cond_expr_t *cond_expr);
   int setup_cond_eval(my_off_t pos);
-  my_off_t assign_owner(pthread_t owner, const queue_cond_t::node_t *cond_expr);
+  cond_expr_t compile_cond_expr(const char *expr, size_t len);
+  void release_cond_expr(cond_expr_data_t *d);
 private:
   int writer_do_append(append_list_t *l);
   void writer_do_remove(remove_list_t *l);
