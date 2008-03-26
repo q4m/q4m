@@ -74,6 +74,7 @@ $dbh = dbi_connect;
 ok($dbh->do('insert into q4m_t values (4)'));
 wait;
 ok($? == 0);
+sleep 2;
 is_deeply(
     $dbh->selectall_arrayref('select * from q4m_t'),
     [ [ 4 ] ],

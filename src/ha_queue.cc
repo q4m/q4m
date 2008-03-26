@@ -1214,14 +1214,18 @@ int queue_share_t::compact()
     for (cond_expr_data_list_t::iterator i = active_cond_expr_list.begin();
 	 i != active_cond_expr_list.end();
 	 ++i) {
-      if ((i->pos -= delta) < sizeof(queue_file_header_t)) {
+      if (i->pos >= delta + sizeof(queue_file_header_t)) {
+	i->pos -= delta;
+      } else {
 	i->pos = 0;
       }
     }
     for (cond_expr_data_list_t::iterator i = inactive_cond_expr_list.begin();
 	 i != inactive_cond_expr_list.end();
 	 ++i) {
-      if ((i->pos -= delta) < sizeof(queue_file_header_t)) {
+      if (i->pos >= delta + sizeof(queue_file_header_t)) {
+	i->pos -= delta;
+      } else {
 	i->pos = 0;
       }
     }
