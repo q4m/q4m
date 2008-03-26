@@ -366,55 +366,7 @@ static bool load_table(TABLE *table, const char *db_table_name)
   return false;
 }
 
-static queue_fixed_field_t **create_fixed_fields(TABLE *table)
-{
-  queue_fixed_field_t** map = new queue_fixed_field_t* [table->s->fields];
-  Field **field;
-  int field_index;
-  size_t off = table->s->null_bytes;
-  
-  for (field = table->field, field_index = 0;
-       *field != NULL;
-       field++, field_index++) {
-    switch ((*field)->type()) {
-#define TYPEMAP(type, cls) \
-      case MYSQL_TYPE_##type: \
-	map[field_index] = new cls; \
-        off += map[field_index]->size(); \
-	break
-      TYPEMAP(TINY, queue_int_field_t<1>(table, *field));
-      TYPEMAP(SHORT, queue_int_field_t<2>(table, *field));
-      TYPEMAP(INT24, queue_int_field_t<3>(table, *field));
-      TYPEMAP(LONG, queue_int_field_t<4>(table, *field));
-      TYPEMAP(LONGLONG, queue_int_field_t<8>(table, *field));
-      TYPEMAP(FLOAT, queue_fixed_field_t(table, *field, sizeof(float)));
-      TYPEMAP(DOUBLE, queue_fixed_field_t(table, *field, sizeof(double)));
-      TYPEMAP(TIMESTAMP, queue_int_field_t<4>(table, *field));
-      TYPEMAP(DATE, queue_int_field_t<4>(table, *field));
-      TYPEMAP(NEWDATE, queue_int_field_t<3>(table, *field));
-      TYPEMAP(TIME, queue_int_field_t<3>(table, *field));
-      TYPEMAP(DATETIME, queue_int_field_t<8>(table, *field));
-#undef TYPEMAP
-    default:
-      map[field_index] = NULL;
-      break;
-    }
-  }
-  
-  return map;
-}
-
-static void destroy_fixed_fields(queue_fixed_field_t **fields, size_t n)
-{
-  if (fields != NULL) {
-    for (size_t i = 0; i < n; i++) {
-      delete fields[i];
-    }
-    delete [] fields;
-  }
-}
-
-queue_share_t *queue_share_t::get_share(TABLE *table, const char *table_name)
+queue_share_t *queue_share_t::get_share(const char *table_name)
 {
   queue_share_t *share;
   uint table_name_length;
@@ -482,14 +434,6 @@ queue_share_t *queue_share_t::get_share(TABLE *table, const char *table_name)
   default:
     goto ERR_AFTER_FILEOPEN;
   }
-  /* load fixed-field info (initialized after releasing mutex if table==NULL */
-  if (share->_header.magic() == queue_file_header_t::MAGIC_V2) {
-    if (table != NULL) {
-      share->fixed_fields = create_fixed_fields(table);
-      share->null_bytes = table->s->null_bytes;
-      share->fields = table->s->fields;
-    }
-  }
   /* sanity check */
   if ((share->_header.attr() & queue_file_header_t::attr_is_dirty) != 0) {
     share->fixup_header();
@@ -514,32 +458,6 @@ queue_share_t *queue_share_t::get_share(TABLE *table, const char *table_name)
   
   /* success, unlock */
   pthread_mutex_unlock(&open_mutex);
-  
-  /* init fixed_fields */
-  if (share->_header.magic() == queue_file_header_t::MAGIC_V2
-      && share->fixed_fields == NULL) {
-    TABLE table_buf;
-    pthread_mutex_lock(&LOCK_open);
-    if (! load_table(&table_buf, table_name)) {
-      pthread_mutex_unlock(&LOCK_open);
-      share->release();
-      return NULL;
-    }
-    share->fixed_fields = create_fixed_fields(&table_buf);
-    share->null_bytes = table_buf.s->null_bytes;
-    share->fields = table_buf.s->fields;
-    closefrm(&table_buf, true);
-    pthread_mutex_unlock(&LOCK_open);
-  }
-  share->fixed_buf_size = share->null_bytes;
-  for (size_t i = 0; i < share->fields; i++) {
-    const queue_fixed_field_t *field = share->fixed_fields[i];
-    if (field != NULL && field->is_convertible()) {
-      share->cond_eval.add_column(field->name());
-      share->fixed_buf_size += field->size();
-    }
-  }
-  share->fixed_buf = new uchar [share->fixed_buf_size];
   
   return share;
   
@@ -575,7 +493,10 @@ void queue_share_t::release()
   
   if (--use_count == 0) {
     delete [] fixed_buf;
-    destroy_fixed_fields(fixed_fields, fields);
+    for (size_t i = 0; i < fields; i++) {
+      delete fixed_fields[i];
+    }
+    delete [] fixed_fields;
     hash_delete(&queue_open_tables, reinterpret_cast<uchar*>(this));
     writer_exit = true;
     pthread_cond_signal(&to_writer_cond);
@@ -610,6 +531,99 @@ void queue_share_t::release()
   }
   
   pthread_mutex_unlock(&open_mutex);
+}
+
+bool queue_share_t::init_fixed_fields(TABLE *_table)
+{
+  if (fixed_fields != NULL) {
+    return true;
+  }
+  
+  /* Lock and load table information if not given.   The lock order should
+   * always be LOCK_open -> queue_share_t::lock. */
+  TABLE *table;
+  TABLE table_buf;
+  if (_table == NULL) {
+    pthread_mutex_lock(&LOCK_open);
+    lock();
+    if (fixed_fields != NULL) {
+      unlock();
+      pthread_mutex_unlock(&LOCK_open);
+      return true;
+    }
+    if (! load_table(&table_buf, table_name)) {
+      unlock();
+      pthread_mutex_unlock(&LOCK_open);
+      return false;
+    }
+    table = &table_buf;
+  } else {
+    lock();
+    if (fixed_fields != NULL) {
+      unlock();
+      return true;
+    }
+    table = _table;
+  }
+  
+  /* setup fixed_fields */
+  fixed_fields = new queue_fixed_field_t* [table->s->fields];
+  if (_header.magic() == queue_file_header_t::MAGIC_V2) {
+    Field **field;
+    int field_index;
+    size_t off = table->s->null_bytes;
+    for (field = table->field, field_index = 0;
+	 *field != NULL;
+	 field++, field_index++) {
+      switch ((*field)->type()) {
+#define TYPEMAP(type, cls) \
+	case MYSQL_TYPE_##type:	\
+	  fixed_fields[field_index] = new cls; \
+          off += fixed_fields[field_index]->size(); \
+	  break
+	TYPEMAP(TINY, queue_int_field_t<1>(table, *field));
+	TYPEMAP(SHORT, queue_int_field_t<2>(table, *field));
+	TYPEMAP(INT24, queue_int_field_t<3>(table, *field));
+	TYPEMAP(LONG, queue_int_field_t<4>(table, *field));
+	TYPEMAP(LONGLONG, queue_int_field_t<8>(table, *field));
+	TYPEMAP(FLOAT, queue_fixed_field_t(table, *field, sizeof(float)));
+	TYPEMAP(DOUBLE, queue_fixed_field_t(table, *field, sizeof(double)));
+	TYPEMAP(TIMESTAMP, queue_int_field_t<4>(table, *field));
+	TYPEMAP(DATE, queue_int_field_t<4>(table, *field));
+	TYPEMAP(NEWDATE, queue_int_field_t<3>(table, *field));
+	TYPEMAP(TIME, queue_int_field_t<3>(table, *field));
+	TYPEMAP(DATETIME, queue_int_field_t<8>(table, *field));
+#undef TYPEMAP
+      default:
+	fixed_fields[field_index] = NULL;
+	break;
+      }
+    }
+  } else {
+    fill(fixed_fields, fixed_fields + table->s->fields,
+	 static_cast<queue_fixed_field_t*>(NULL));
+  }
+  /* setup other fields */
+  null_bytes = table->s->null_bytes;
+  fields = table->s->fields;
+  fixed_buf_size = null_bytes;
+  for (size_t i = 0; i < fields; i++) {
+    const queue_fixed_field_t *field = fixed_fields[i];
+    if (field != NULL && field->is_convertible()) {
+      cond_eval.add_column(field->name());
+      fixed_buf_size += field->size();
+    }
+  }
+  fixed_buf = new uchar [fixed_buf_size];
+  
+  /* unlock */
+  unlock();
+  if (_table == NULL) {
+    closefrm(table, true);
+    pthread_mutex_unlock(&LOCK_open);
+  }
+  
+  return true;
 }
 
 void queue_share_t::unlock_reader()
@@ -1354,9 +1368,10 @@ const char **ha_queue::bas_ext() const
 
 int ha_queue::open(const char *name, int mode, uint test_if_locked)
 {
-  if ((share = queue_share_t::get_share(table, name)) == NULL) {
+  if ((share = queue_share_t::get_share(name)) == NULL) {
     return 1;
   }
+  share->init_fixed_fields(table);
   thr_lock_data_init(share->get_store_lock(), &lock, NULL);
   
   return 0;
@@ -1700,14 +1715,14 @@ void ha_queue::unpack_row(uchar *buf)
   for (field = table->field, fixed = share->get_fixed_fields();
        *field != NULL;
        field++, fixed++) {
-    if (fixed != NULL && ! (*field)->is_null()) {
+    if (*fixed != NULL && ! (*field)->is_null()) {
       src = (*field)->unpack(buf + (*field)->offset(table->record[0]), src);
     }
   }
   for (field = table->field, fixed = share->get_fixed_fields();
        *field != NULL;
        field++, fixed++) {
-    if (fixed == NULL && ! (*field)->is_null()) {
+    if (*fixed == NULL && ! (*field)->is_null()) {
       src = (*field)->unpack(buf + (*field)->offset(table->record[0]), src);
     }
   }
@@ -1738,14 +1753,14 @@ size_t ha_queue::pack_row(uchar *buf, queue_source_t *source)
   for (field = table->field, fixed = share->get_fixed_fields();
        *field != NULL;
        field++, fixed++) {
-    if (fixed != NULL && ! (*field)->is_null()) {
+    if (*fixed != NULL && ! (*field)->is_null()) {
       dst = (*field)->pack(dst, buf + (*field)->offset(buf));
     }
   }
   for (field = table->field, fixed = share->get_fixed_fields();
        *field != NULL;
        field++, fixed++) {
-    if (fixed == NULL && ! (*field)->is_null()) {
+    if (*fixed == NULL && ! (*field)->is_null()) {
       dst = (*field)->pack(dst, buf + (*field)->offset(buf));
     }
   }
@@ -1790,7 +1805,13 @@ static queue_share_t* get_share_check(const char* db_table_name)
   }
   
   build_table_filename(path, FN_REFLEN - 1, db, tbl, "", 0);
-  return queue_share_t::get_share(NULL, path);
+  queue_share_t *share = queue_share_t::get_share(path);
+  if (! share->init_fixed_fields(NULL)) {
+    log("failed to initialize fixed field info.\n");
+    share->release();
+    share = NULL;
+  }
+  return share;
 }
 
 static int init_plugin(void *p)

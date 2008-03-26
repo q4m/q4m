@@ -289,8 +289,9 @@ public:
   void fixup_header();
   static uchar *get_share_key(queue_share_t *share, size_t *length,
 			      my_bool not_used);
-  static queue_share_t *get_share(TABLE *table, const char* table_name);
+  static queue_share_t *get_share(const char* table_name);
   void release();
+  bool init_fixed_fields(TABLE *_table);
   void lock() { pthread_mutex_lock(&mutex); }
   void unlock() { pthread_mutex_unlock(&mutex); }
   void lock_reader() { lock(); ++num_readers; unlock(); }
