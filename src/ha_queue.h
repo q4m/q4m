@@ -263,7 +263,7 @@ class queue_share_t {
   
   queue_rows_owned_t rows_owned;
   
-  listener_list_t listener_list; /* access serialized using g_mutex */
+  listener_list_t listener_list; /* access serialized using listener_mutex */
   
   int num_readers;
   

@@ -68,7 +68,17 @@ using namespace std;
 
 static HASH queue_open_tables;
 #ifdef SAFE_MUTEX
-static pthread_mutex_t g_mutex = {
+static pthread_mutex_t open_mutex = {
+#ifdef PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP
+  PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP,
+#else
+  PTHREAD_MUTEX_INITIALIZER,
+#endif
+  PTHREAD_MUTEX_INITIALIZER,
+  __FILE__,
+  __LINE__
+};
+static pthread_mutex_t listener_mutex = {
 #ifdef PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP
   PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP,
 #else
@@ -86,7 +96,8 @@ static int safe_cond_timedwait_relative_np(pthread_cond_t *cond,
 #define pthread_cond_timedwait_relative_np(A,B,C) safe_cond_timedwait_relative_np((A),(B),(C),__FILE__,__LINE__)
 #endif
 #else
-static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t open_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t listener_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 static handlerton *queue_hton;
@@ -410,7 +421,7 @@ queue_share_t *queue_share_t::get_share(TABLE *table, const char *table_name)
   char *tmp_name;
   char filename[FN_REFLEN];
   
-  pthread_mutex_lock(&g_mutex);
+  pthread_mutex_lock(&open_mutex);
   
   table_name_length = strlen(table_name);
   
@@ -418,7 +429,7 @@ queue_share_t *queue_share_t::get_share(TABLE *table, const char *table_name)
   if ((share = reinterpret_cast<queue_share_t*>(hash_search(&queue_open_tables, reinterpret_cast<const uchar*>(table_name), table_name_length)))
       != NULL) {
     ++share->use_count;
-    pthread_mutex_unlock(&g_mutex);
+    pthread_mutex_unlock(&open_mutex);
     return share;
   }
   
@@ -471,34 +482,13 @@ queue_share_t *queue_share_t::get_share(TABLE *table, const char *table_name)
   default:
     goto ERR_AFTER_FILEOPEN;
   }
-  /* load fixed-field info */
+  /* load fixed-field info (initialized after releasing mutex if table==NULL */
   if (share->_header.magic() == queue_file_header_t::MAGIC_V2) {
-    if (table == NULL) {
-      TABLE table_buf;
-      pthread_mutex_lock(&LOCK_open);
-      if (! load_table(&table_buf, table_name)) {
-	pthread_mutex_unlock(&LOCK_open);
-	goto ERR_AFTER_FILEOPEN;
-      }
-      share->fixed_fields = create_fixed_fields(&table_buf);
-      share->null_bytes = table_buf.s->null_bytes;
-      share->fields = table_buf.s->fields;
-      closefrm(&table_buf, true);
-      pthread_mutex_unlock(&LOCK_open);
-    } else {
+    if (table != NULL) {
       share->fixed_fields = create_fixed_fields(table);
       share->null_bytes = table->s->null_bytes;
       share->fields = table->s->fields;
     }
-    share->fixed_buf_size = share->null_bytes;
-    for (size_t i = 0; i < share->fields; i++) {
-      const queue_fixed_field_t *field = share->fixed_fields[i];
-      if (field != NULL && field->is_convertible()) {
-	share->cond_eval.add_column(field->name());
-	share->fixed_buf_size += field->size();
-      }
-    }
-    share->fixed_buf = new uchar [share->fixed_buf_size];
   }
   /* sanity check */
   if ((share->_header.attr() & queue_file_header_t::attr_is_dirty) != 0) {
@@ -522,8 +512,35 @@ queue_share_t *queue_share_t::get_share(TABLE *table, const char *table_name)
     goto ERR_AFTER_WRITER_START;
   }
   
-  /* success */
-  pthread_mutex_unlock(&g_mutex);
+  /* success, unlock */
+  pthread_mutex_unlock(&open_mutex);
+  
+  /* init fixed_fields */
+  if (share->_header.magic() == queue_file_header_t::MAGIC_V2
+      && share->fixed_fields == NULL) {
+    TABLE table_buf;
+    pthread_mutex_lock(&LOCK_open);
+    if (! load_table(&table_buf, table_name)) {
+      pthread_mutex_unlock(&LOCK_open);
+      share->release();
+      return NULL;
+    }
+    share->fixed_fields = create_fixed_fields(&table_buf);
+    share->null_bytes = table_buf.s->null_bytes;
+    share->fields = table_buf.s->fields;
+    closefrm(&table_buf, true);
+    pthread_mutex_unlock(&LOCK_open);
+  }
+  share->fixed_buf_size = share->null_bytes;
+  for (size_t i = 0; i < share->fields; i++) {
+    const queue_fixed_field_t *field = share->fixed_fields[i];
+    if (field != NULL && field->is_convertible()) {
+      share->cond_eval.add_column(field->name());
+      share->fixed_buf_size += field->size();
+    }
+  }
+  share->fixed_buf = new uchar [share->fixed_buf_size];
+  
   return share;
   
  ERR_AFTER_WRITER_START:
@@ -531,8 +548,6 @@ queue_share_t *queue_share_t::get_share(TABLE *table, const char *table_name)
   pthread_cond_signal(&share->to_writer_cond);
   pthread_join(share->writer_thread, NULL);
  ERR_AFTER_FILEOPEN:
-  delete [] share->fixed_buf;
-  destroy_fixed_fields(share->fixed_fields, share->fields);
   close(share->fd);
  ERR_ON_FILEOPEN:
   share->cond_expr_true.free_data();
@@ -550,15 +565,17 @@ queue_share_t *queue_share_t::get_share(TABLE *table, const char *table_name)
   pthread_mutex_destroy(&share->mutex);
   my_free(reinterpret_cast<uchar*>(share), MYF(0));
  ERR_RETURN:
-  pthread_mutex_unlock(&g_mutex);
+  pthread_mutex_unlock(&open_mutex);
   return NULL;
   }
 
 void queue_share_t::release()
 {
-  pthread_mutex_lock(&g_mutex);
+  pthread_mutex_lock(&open_mutex);
   
   if (--use_count == 0) {
+    delete [] fixed_buf;
+    destroy_fixed_fields(fixed_fields, fields);
     hash_delete(&queue_open_tables, reinterpret_cast<uchar*>(this));
     writer_exit = true;
     pthread_cond_signal(&to_writer_cond);
@@ -570,8 +587,6 @@ void queue_share_t::release()
     _header.set_attr(_header.attr() & ~queue_file_header_t::attr_is_dirty);
     _header.write(fd);
     sync_file(fd);
-    delete [] fixed_buf;
-    destroy_fixed_fields(fixed_fields, fields);
     close(fd);
     cond_expr_true.free_data();
     for (cond_expr_list_t::iterator i = inactive_cond_expr_list.begin();
@@ -594,7 +609,7 @@ void queue_share_t::release()
     my_free(reinterpret_cast<uchar*>(this), MYF(0));
   }
   
-  pthread_mutex_unlock(&g_mutex);
+  pthread_mutex_unlock(&open_mutex);
 }
 
 void queue_share_t::unlock_reader()
@@ -625,8 +640,8 @@ void queue_share_t::wake_listeners()
   bool use_cond_expr = false;
   my_off_t off = (my_off_t)-1;
   
-  // note: lock order should always be: g_mutex -> queue_share_t::mutex
-  pthread_mutex_lock(&g_mutex);
+  // note: lock order should always be: listener_mutex -> queue_share_t::mutex
+  pthread_mutex_lock(&listener_mutex);
   
   // remove listeners with signals received
   listener_list_t::iterator l = listener_list.begin();
@@ -694,7 +709,7 @@ void queue_share_t::wake_listeners()
   unlock();
   
  UNLOCK_G_RETURN:
-  pthread_mutex_unlock(&g_mutex);
+  pthread_mutex_unlock(&listener_mutex);
 }
 
 struct queue_reset_owner_update_cond_expr {
@@ -1893,7 +1908,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
   }
   if (share_owned == -1) {
     /* not yet found, lock global mutex and check once more */
-    pthread_mutex_lock(&g_mutex);
+    pthread_mutex_lock(&listener_mutex);
     for (int i = 0; i < num_shares; i++) {
       shares[i]->lock();
       if (shares[i]->assign_owner(pthread_self(), cond_exprs[i]) != 0) {
@@ -1913,10 +1928,10 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
       }
 #ifdef USE_RELATIVE_TIMEDWAIT
       timespec ts = { timeout, 0 };
-      pthread_cond_timedwait_relative_np(&listener.cond, &g_mutex, &ts);
+      pthread_cond_timedwait_relative_np(&listener.cond, &listener_mutex, &ts);
 #else
       timespec ts = { time(NULL) + timeout, 0 };
-      pthread_cond_timedwait(&listener.cond, &g_mutex, &ts);
+      pthread_cond_timedwait(&listener.cond, &listener_mutex, &ts);
 #endif
       for (int i = 0; i < num_shares; i++) {
 	if (listener.signalled_by == shares[i]) {
@@ -1926,7 +1941,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
 	}
       }
     }
-    pthread_mutex_unlock(&g_mutex);
+    pthread_mutex_unlock(&listener_mutex);
   }
   /* always enter owner-mode, regardless whether or not we own a row */
   conn->owner_mode = true;
