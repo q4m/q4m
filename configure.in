@@ -93,6 +93,10 @@ no)
     ;;
 esac
 
+if test "$OSNAME" = "darwin" ; then
+    AC_DEFINE([USE_RELATIVE_TIMEDWAIT],1,[use pthread_cond_timedwait_relative_np])
+fi
+
 if test -z "$DOC_ROOT"
 then
     DOC_ROOT='http://q4m.31tools.com/'

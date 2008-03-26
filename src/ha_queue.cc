@@ -78,6 +78,13 @@ static pthread_mutex_t g_mutex = {
   __FILE__,
   __LINE__
 };
+#ifdef USE_RELATIVE_TIMEDWAIT
+static int safe_cond_timedwait_relative_np(pthread_cond_t *cond,
+					   safe_mutex_t *mp,
+					   struct timespec *abstime,
+					   const char *file, uint line);
+#define pthread_cond_timedwait_relative_np(A,B,C) safe_cond_timedwait_relative_np((A),(B),(C),__FILE__,__LINE__)
+#endif
 #else
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
@@ -441,8 +448,11 @@ queue_share_t *queue_share_t::get_share(TABLE *table, const char *table_name)
   share->append_list = new append_list_t();
   share->remove_list = new remove_list_t();
   new (&share->cond_eval) queue_cond_t();
-  new (&share->active_cond_expr_list) cond_expr_data_list_t();
-  new (&share->inactive_cond_expr_list) cond_expr_data_list_t();
+  new (&share->active_cond_expr_list) cond_expr_list_t();
+  new (&share->inactive_cond_expr_list) cond_expr_list_t();
+  new (&share->cond_expr_true)
+    cond_expr_t(new queue_cond_t::const_node_t
+		(queue_cond_t::value_t::int_value(1)), "1", 1, 0);
   /* open file */
   fn_format(filename, share->table_name, "", Q4M,
 	    MY_REPLACE_EXT | MY_UNPACK_FILENAME);
@@ -525,8 +535,9 @@ queue_share_t *queue_share_t::get_share(TABLE *table, const char *table_name)
   destroy_fixed_fields(share->fixed_fields, share->fields);
   close(share->fd);
  ERR_ON_FILEOPEN:
-  share->inactive_cond_expr_list.~cond_expr_data_list_t();
-  share->active_cond_expr_list.~cond_expr_data_list_t();
+  share->cond_expr_true.free_data();
+  share->inactive_cond_expr_list.~cond_expr_list_t();
+  share->active_cond_expr_list.~cond_expr_list_t();
   share->cond_eval.~queue_cond_t();
   delete share->remove_list;
   delete share->append_list;
@@ -562,13 +573,14 @@ void queue_share_t::release()
     delete [] fixed_buf;
     destroy_fixed_fields(fixed_fields, fields);
     close(fd);
-    for (cond_expr_data_list_t::iterator i = inactive_cond_expr_list.begin();
+    cond_expr_true.free_data();
+    for (cond_expr_list_t::iterator i = inactive_cond_expr_list.begin();
 	 i != inactive_cond_expr_list.end();
 	 ++i) {
-      i->release();
+      i->free_data();
     }
-    inactive_cond_expr_list.~cond_expr_data_list_t();
-    active_cond_expr_list.~cond_expr_data_list_t();
+    inactive_cond_expr_list.~cond_expr_list_t();
+    active_cond_expr_list.~cond_expr_list_t();
     cond_eval.~queue_cond_t();
     delete remove_list;
     delete append_list;
@@ -611,7 +623,7 @@ void queue_share_t::unregister_listener(listener_t *l)
 void queue_share_t::wake_listeners()
 {
   bool use_cond_expr = false;
-  my_off_t off;
+  my_off_t off = (my_off_t)-1;
   
   // note: lock order should always be: g_mutex -> queue_share_t::mutex
   pthread_mutex_lock(&g_mutex);
@@ -622,9 +634,10 @@ void queue_share_t::wake_listeners()
     if (l->first->signalled_by != NULL) {
       l = listener_list.erase(l);
     } else {
-      if (l->second != NULL) {
+      if (l->second != &cond_expr_true) {
 	use_cond_expr = true;
       }
+      off = min(off, l->second->pos);
       ++l;
     }
   }
@@ -634,7 +647,12 @@ void queue_share_t::wake_listeners()
   
   // per-row test
   lock();
-  off = _header.begin();
+  if (off == 0) {
+    off = _header.begin();
+  } else if (next(&off) != 0) {
+    log("internal error, table corrupt?\n");
+    goto UNLOCK_ALL_RETURN;
+  }
   while (off != _header.end()) {
     while (find_owner(off) != 0) {
       if (next(&off) != 0) {
@@ -648,11 +666,11 @@ void queue_share_t::wake_listeners()
     }
     for (l = listener_list.begin(); l != listener_list.end(); ++l) {
       bool found = false;
-      if (l->second == NULL) {
+      if (l->second == &cond_expr_true) {
 	found = true;
-      } else if (l->second->pos() < off) {
-	l->second->set_pos(off);
-	if (cond_eval.evaluate(l->second->node())) {
+      } else if (l->second->pos < off) {
+	l->second->pos = off;
+	if (cond_eval.evaluate(l->second->node)) {
 	  found = true;
 	}
       }
@@ -679,6 +697,19 @@ void queue_share_t::wake_listeners()
   pthread_mutex_unlock(&g_mutex);
 }
 
+struct queue_reset_owner_update_cond_expr {
+  queue_share_t *share;
+  my_off_t off;
+  queue_reset_owner_update_cond_expr(queue_share_t *s, my_off_t o)
+  : share(s), off(o) {}
+  void operator()(queue_share_t::cond_expr_t& e) const {
+    if (off <= e.pos && share->cond_eval.evaluate(e.node)) {
+      // todo: should find a way to obtain prev. row
+      e.pos = 0;
+    }
+  }
+};
+
 my_off_t queue_share_t::reset_owner(pthread_t owner)
 {
   my_off_t off = 0;
@@ -697,21 +728,7 @@ my_off_t queue_share_t::reset_owner(pthread_t owner)
   // update positions of cond_expr_list
   if (off != 0) {
     if (setup_cond_eval(off) == 0) {
-      for (cond_expr_data_list_t::iterator i = active_cond_expr_list.begin();
-	   i != active_cond_expr_list.end();
-	   ++i) {
-	if (off <= i->pos && cond_eval.evaluate(i->node)) {
-	  // todo: should find a way to obtain prev. row
-	  i->pos = 0;
-	}
-      }
-      for (cond_expr_data_list_t::iterator i = inactive_cond_expr_list.begin();
-	   i != inactive_cond_expr_list.end();
-	   ++i) {
-	if (off <= i->pos && cond_eval.evaluate(i->node)) {
-	  i->pos = 0;
-	}
-      }
+      apply_cond_expr_list(queue_reset_owner_update_cond_expr(this, off));
     }
   }
   
@@ -852,10 +869,9 @@ pthread_t queue_share_t::find_owner(my_off_t off)
   return 0;
 }
 
-my_off_t queue_share_t::assign_owner(pthread_t owner,
-				     cond_expr_t *cond_expr)
+my_off_t queue_share_t::assign_owner(pthread_t owner, cond_expr_t *cond_expr)
 {
-  my_off_t off = cond_expr != NULL ? cond_expr->pos() : 0;
+  my_off_t off = cond_expr->pos;
   if (off == 0) {
     off = _header.begin();
   } else if (next(&off) != 0) {
@@ -863,18 +879,16 @@ my_off_t queue_share_t::assign_owner(pthread_t owner,
   }
   
   while (off != _header.end()) {
-    if (cond_expr != NULL) {
-      cond_expr->set_pos(off);
-    }
+    cond_expr->pos = off;
     if (find_owner(off) == 0) {
-      if (cond_expr == NULL) {
+      if (cond_expr == &cond_expr_true) {
 	goto FOUND;
       } else {
 	if (setup_cond_eval(off) != 0) {
 	  log("internal error, table corrupt?");
 	  return 0;
 	}
-	if (cond_eval.evaluate(cond_expr->node())) {
+	if (cond_eval.evaluate(cond_expr->node)) {
 	  goto FOUND;
 	}
       }
@@ -921,50 +935,59 @@ int queue_share_t::setup_cond_eval(my_off_t pos)
   return 0;
 }
 
-queue_share_t::cond_expr_t queue_share_t::compile_cond_expr(const char *expr,
-							    size_t len)
+queue_share_t::cond_expr_t *
+queue_share_t::compile_cond_expr(const char *expr, size_t len)
 {
+  if (expr == NULL) {
+    return &cond_expr_true;
+  }
+  
   // return an existing one, if any
-  for (cond_expr_data_list_t::iterator i = active_cond_expr_list.begin();
+  for (cond_expr_list_t::iterator i = active_cond_expr_list.begin();
        i != active_cond_expr_list.end();
        ++i) {
     if (i->expr_len == len && memcmp(i->expr, expr, len) == 0) {
-      return cond_expr_t(&*i);
+      i->ref_cnt++;
+      return &*i;
     }
   }
-  for (cond_expr_data_list_t::iterator i = inactive_cond_expr_list.begin();
+  for (cond_expr_list_t::iterator i = inactive_cond_expr_list.begin();
        i != inactive_cond_expr_list.end();
        ++i) {
     if (i->expr_len == len && memcmp(i->expr, expr, len) == 0) {
       active_cond_expr_list.push_back(*i);
       inactive_cond_expr_list.erase(i);
-      return cond_expr_t(&active_cond_expr_list.back());
+      cond_expr_t *e = &active_cond_expr_list.back();
+      e->ref_cnt++;
+      return e;
     }
   }
   
   // compile and return
   queue_cond_t::node_t *n = cond_eval.compile_expression(expr, len);
   if (n == NULL) {
-    return cond_expr_t(NULL);
+    return NULL;
   }
-  active_cond_expr_list.push_back(cond_expr_data_t(this, n, expr, len));
-  return cond_expr_t(&active_cond_expr_list.back());
+  active_cond_expr_list.push_back(cond_expr_t(n, expr, len, 0));
+  return &active_cond_expr_list.back();
 }
 
-void queue_share_t::release_cond_expr(cond_expr_data_t *d)
+void queue_share_t::release_cond_expr(cond_expr_t *e)
 {
-  for (cond_expr_data_list_t::iterator i = active_cond_expr_list.begin();
-       i != active_cond_expr_list.end();
-       ++i) {
-    if (&*i == d) {
-      inactive_cond_expr_list.push_back(*i);
-      active_cond_expr_list.erase(i);
-      break;
+  if (e != &cond_expr_true && --e->ref_cnt == 0) {
+    for (cond_expr_list_t::iterator i = active_cond_expr_list.begin();
+	 i != active_cond_expr_list.end();
+	 ++i) {
+      if (&*i == e) {
+	inactive_cond_expr_list.push_back(*i);
+	active_cond_expr_list.erase(i);
+	break;
+      }
     }
-  }
-  while (inactive_cond_expr_list.size() >= 100) {
-    inactive_cond_expr_list.front().release();
-    inactive_cond_expr_list.pop_front();
+    while (inactive_cond_expr_list.size() >= 100) {
+      inactive_cond_expr_list.front().free_data();
+      inactive_cond_expr_list.pop_front();
+    }
   }
 }
 
@@ -1158,6 +1181,18 @@ static int copy_file_content(int src_fd, my_off_t begin, my_off_t end,
   return 0;
 }
 
+struct queue_compact_update_cond_expr {
+  my_off_t delta;
+  queue_compact_update_cond_expr(my_off_t d) : delta(d) {}
+  void operator()(queue_share_t::cond_expr_t& e) const {
+    if (e.pos >= delta + sizeof(queue_file_header_t)) {
+      e.pos -= delta;
+    } else {
+      e.pos = 0;
+    }
+  }
+};
+
 int queue_share_t::compact()
 {
   log("starting table compaction: %s\n", table_name);
@@ -1211,24 +1246,7 @@ int queue_share_t::compact()
       i->second -= delta;
     }
     cache.off = 0; /* invalidate, since it may go below sizeof(_header) */
-    for (cond_expr_data_list_t::iterator i = active_cond_expr_list.begin();
-	 i != active_cond_expr_list.end();
-	 ++i) {
-      if (i->pos >= delta + sizeof(queue_file_header_t)) {
-	i->pos -= delta;
-      } else {
-	i->pos = 0;
-      }
-    }
-    for (cond_expr_data_list_t::iterator i = inactive_cond_expr_list.begin();
-	 i != inactive_cond_expr_list.end();
-	 ++i) {
-      if (i->pos >= delta + sizeof(queue_file_header_t)) {
-	i->pos -= delta;
-      } else {
-	i->pos = 0;
-      }
-    }
+    apply_cond_expr_list(queue_compact_update_cond_expr(delta));
   }
   
   log("finished table compaction: %s\n", table_name);
@@ -1814,7 +1832,6 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
 {
   queue_share_t **shares;
   queue_share_t::cond_expr_t **cond_exprs;
-  time_t return_at = time(NULL) + timeout;
   int share_owned = -1;
   queue_connection_t *conn = queue_connection_t::current(true);
   
@@ -1854,15 +1871,14 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
       break;
     }
     shares[i]->lock();
-    if (*last != '\0') {
-      queue_share_t::cond_expr_t e =
-	shares[i]->compile_cond_expr(last + 1, strlen(last + 1));
-      if (! e.is_valid()) {
-	log("failed to compile expression: %s\n", last + 1);
-	*error = 1;
-	break;
-      }
-      cond_exprs[i] = new queue_share_t::cond_expr_t(e);
+    if ((cond_exprs[i] =
+	 *last != '\0'
+	 ? shares[i]->compile_cond_expr(last + 1, strlen(last + 1))
+	 : shares[i]->compile_cond_expr(NULL, 0))
+	== NULL) {
+      log("failed to compile expression: %s\n", share_names[i]);
+      *error = 1;
+      break;
     }
     if (shares[i]->assign_owner(pthread_self(), cond_exprs[i]) != 0) {
       share_owned = i;
@@ -1895,8 +1911,13 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
 	shares[i]->register_listener(&listener, cond_exprs[i]);
 	shares[i]->unlock();
       }
-      timespec ts = { return_at, 0 };
+#ifdef USE_RELATIVE_TIMEDWAIT
+      timespec ts = { timeout, 0 };
+      pthread_cond_timedwait_relative_np(&listener.cond, &g_mutex, &ts);
+#else
+      timespec ts = { time(NULL) + timeout, 0 };
       pthread_cond_timedwait(&listener.cond, &g_mutex, &ts);
+#endif
       for (int i = 0; i < num_shares; i++) {
 	if (listener.signalled_by == shares[i]) {
 	  share_owned = i;
@@ -1912,8 +1933,8 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
   conn->share_owned = share_owned != -1 ? shares[share_owned] : NULL;
   
  EXIT:
-  for (int i = 0; i < num_shares; i++) {
-    delete cond_exprs[i];
+  for (int i = 0; i < num_shares && cond_exprs[i] != NULL; i++) {
+    shares[i]->release_cond_expr(cond_exprs[i]);
   }
   for (int i = 0; i < num_shares && shares[i] != NULL; i++) {
     if (i != share_owned) {
@@ -2104,3 +2125,45 @@ long long queue_set_srcid(UDF_INIT *initid __attribute__((unused)),
   conn->source = queue_source_t(sender, *(long long*)args->args[2]);
   return 1;
 }
+
+#if defined(USE_RELATIVE_TIMEDWAIT) && defined(SAFE_MUTEX)
+#undef pthread_mutex_lock
+#undef pthread_mutex_unlock
+#undef pthread_cond_timedwait_relative_np
+int safe_cond_timedwait_relative_np(pthread_cond_t *cond, safe_mutex_t *mp,
+				    struct timespec *abstime, const char *file,
+				    uint line)
+{
+  int error;
+  pthread_mutex_lock(&mp->global);
+  if (mp->count != 1 || !pthread_equal(pthread_self(),mp->thread))
+  {
+    fprintf(stderr,"safe_mutex: Trying to cond_wait at %s, line %d on a not hold mutex\n",file,line);
+    fflush(stderr);
+    abort();
+  }
+  mp->count--;                                  /* Mutex will be released */
+  pthread_mutex_unlock(&mp->global);
+  error=pthread_cond_timedwait_relative_np(cond,&mp->mutex,abstime);
+#ifdef EXTRA_DEBUG
+  if (error && (error != EINTR && error != ETIMEDOUT && error != ETIME))
+  {
+    fprintf(stderr,"safe_mutex: Got error: %d (%d) when doing a safe_mutex_timedwait at %s, line %d\n", error, errno, file, line);
+  }
+#endif
+  pthread_mutex_lock(&mp->global);
+  mp->thread=pthread_self();
+  if (mp->count++)
+  {
+    fprintf(stderr,
+            "safe_mutex:  Count was %d in thread 0x%lx when locking mutex at %s, line %d (error: %d (%d))\n",
+            mp->count-1, my_thread_dbug_id(), file, line, error, error);
+    fflush(stderr);
+    abort();
+  }
+  mp->file= file;
+  mp->line=line;
+  pthread_mutex_unlock(&mp->global);
+  return error;
+}
+#endif

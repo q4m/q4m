@@ -214,65 +214,23 @@ class queue_share_t {
   };
   typedef std::vector<remove_t*> remove_list_t;
   
-  struct cond_expr_data_t {
-    queue_share_t *share;
+  struct cond_expr_t {
     queue_cond_t::node_t *node;
     char *expr;
     size_t expr_len;
     size_t ref_cnt;
     my_off_t pos;
-    cond_expr_data_t(queue_share_t *s, queue_cond_t::node_t *n, const char *e,
-		     size_t el)
-    : share(s), node(n), expr(new char [el]), expr_len(el), ref_cnt(0), pos(0)
+    cond_expr_t(queue_cond_t::node_t *n, const char *e, size_t el, my_off_t p)
+    : node(n), expr(new char [el]), expr_len(el), ref_cnt(1), pos(p)
     {
       std::copy(e, e + el, expr);
     }
-    void release() {
+    void free_data() {
       delete expr;
       delete node;
     }
   };
-  typedef std::list<cond_expr_data_t> cond_expr_data_list_t;
-  
-  class cond_expr_t {
-    cond_expr_data_t *d;
-  public:
-    cond_expr_t(cond_expr_data_t *_d) : d(_d) {
-      if (d != NULL) {
-	d->ref_cnt++;
-      }
-    }
-    cond_expr_t(const cond_expr_t &x) : d(x.d) {
-      if (d != NULL) {
-	d->ref_cnt++;
-      }
-    }
-    ~cond_expr_t() {
-      if (d != NULL) {
-	if (--d->ref_cnt == 0) {
-	  d->share->release_cond_expr(d);
-	}
-      }
-    }
-    cond_expr_t& operator=(const cond_expr_t& x) {
-      if (this != &x) {
-	if (d != NULL) {
-	  if (--d->ref_cnt == 0) {
-	    d->share->release_cond_expr(d);
-	  }
-	}
-	d = x.d;
-	if (d != NULL) {
-	  d->ref_cnt++;
-	}
-      }
-      return *this;
-    }
-    bool is_valid() const { return d != NULL; }
-    const queue_cond_t::node_t *node() const { return d->node; }
-    my_off_t pos() const { return d->pos; }
-    void set_pos(my_off_t pos) { d->pos = pos; }
-  };
+  typedef std::list<cond_expr_t> cond_expr_list_t;
   
   struct listener_t {
     pthread_cond_t cond;
@@ -317,8 +275,9 @@ class queue_share_t {
   append_list_t *append_list;
   remove_list_t *remove_list;
   queue_cond_t cond_eval;
-  cond_expr_data_list_t active_cond_expr_list;
-  cond_expr_data_list_t inactive_cond_expr_list;
+  cond_expr_list_t active_cond_expr_list;
+  cond_expr_list_t inactive_cond_expr_list;
+  cond_expr_t cond_expr_true;
   /* following fields are for V2 type table only */
   queue_fixed_field_t **fixed_fields;
   size_t null_bytes;
@@ -368,13 +327,20 @@ public:
     }
   }
   int next(my_off_t *off);
+  template <typename Func> void apply_cond_expr_list(const Func& f) {
+    std::for_each(active_cond_expr_list.begin(), active_cond_expr_list.end(),
+		  f);
+    std::for_each(inactive_cond_expr_list.begin(),
+		  inactive_cond_expr_list.end(), f);
+    f(cond_expr_true);
+  }
   my_off_t get_owned_row(pthread_t owner, bool remove = false);
   int remove_rows(my_off_t *offsets, int cnt);
   pthread_t find_owner(my_off_t off);
   my_off_t assign_owner(pthread_t owner, cond_expr_t *cond_expr);
   int setup_cond_eval(my_off_t pos);
-  cond_expr_t compile_cond_expr(const char *expr, size_t len);
-  void release_cond_expr(cond_expr_data_t *d);
+  cond_expr_t* compile_cond_expr(const char *expr, size_t len);
+  void release_cond_expr(cond_expr_t *e);
 private:
   int writer_do_append(append_list_t *l);
   void writer_do_remove(remove_list_t *l);
@@ -387,6 +353,8 @@ private:
   ~queue_share_t();
   queue_share_t(const queue_share_t&);
   queue_share_t& operator=(const queue_share_t&);
+
+  friend struct queue_reset_owner_update_cond_expr;
 };
 
 struct queue_connection_t {
