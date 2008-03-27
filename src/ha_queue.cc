@@ -67,37 +67,18 @@ using namespace std;
 #define Q4T ".Q4T"
 
 static HASH queue_open_tables;
-#ifdef SAFE_MUTEX
-static pthread_mutex_t open_mutex = {
-#ifdef PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP
-  PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP,
-#else
-  PTHREAD_MUTEX_INITIALIZER,
-#endif
-  PTHREAD_MUTEX_INITIALIZER,
-  __FILE__,
-  __LINE__
-};
-static pthread_mutex_t listener_mutex = {
-#ifdef PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP
-  PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP,
-#else
-  PTHREAD_MUTEX_INITIALIZER,
-#endif
-  PTHREAD_MUTEX_INITIALIZER,
-  __FILE__,
-  __LINE__
-};
+static pthread_mutex_t open_mutex, listener_mutex;
+
 #ifdef USE_RELATIVE_TIMEDWAIT
+# ifdef SAFE_MUTEX
 static int safe_cond_timedwait_relative_np(pthread_cond_t *cond,
 					   safe_mutex_t *mp,
 					   struct timespec *abstime,
 					   const char *file, uint line);
 #define pthread_cond_timedwait_relative_np(A,B,C) safe_cond_timedwait_relative_np((A),(B),(C),__FILE__,__LINE__)
-#endif
-#else
-static pthread_mutex_t open_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t listener_mutex = PTHREAD_MUTEX_INITIALIZER;
+# elif defined(MY_PTHREAD_FASTMUTEX)
+#define pthread_cond_timedwait_relative_np(A,B,C) pthread_cond_timedwait_relative_np((A),&(B)->mutex,(C))
+# endif
 #endif
 
 static handlerton *queue_hton;
@@ -1816,9 +1797,10 @@ static queue_share_t* get_share_check(const char* db_table_name)
 
 static int init_plugin(void *p)
 {
-  
   queue_hton = (handlerton *)p;
   
+  pthread_mutex_init(&open_mutex, MY_MUTEX_INIT_FAST);
+  pthread_mutex_init(&listener_mutex, MY_MUTEX_INIT_FAST);
   hash_init(&queue_open_tables, system_charset_info, 32, 0, 0,
 	    reinterpret_cast<hash_get_key>(queue_share_t::get_share_key), 0, 0);
   queue_hton->state = SHOW_OPTION_YES;
@@ -1837,6 +1819,8 @@ static int deinit_plugin(void *p)
   }
   
   hash_free(&queue_open_tables);
+  pthread_mutex_destroy(&listener_mutex);
+  pthread_mutex_destroy(&open_mutex);
   queue_hton = NULL;
   
   return 0;
