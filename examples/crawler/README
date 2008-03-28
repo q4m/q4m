@@ -1,0 +1,23 @@
+Steps to use the example crawler.
+
+1) Initialize the database
+
+% mysql -u root -p test < initdb.sql
+
+Two tables, `url` and `crawler_queue` will be created.
+The script will also create a trigger that kicks the crawler when a new url
+is inserted into the `url` table.
+
+2) Start the crawler
+
+% ./crawler --dbi='dbi:mysql:test;user=root;password=pass;mysql_enable_utf8=1'
+
+For more options, try --help option.
+
+3) Start adding urls to the `url` table
+
+When a url is inserted into the `url` table, trigger set up in step 1 will
+automatically copy the id of the created row into `crawler_queue` table, and
+in turn kicks the crawler subscribing to the table.  The crawler will update
+the `title` column of `url` table if it succeeds, or, upon failure, schedule
+a retry.
