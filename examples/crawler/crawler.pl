@@ -14,6 +14,7 @@ my $workers = 32;
 my $reqs_per_child = 100;
 my $max_retries = 5;
 my $retry_interval = 15; # in minutes
+my $help;
 
 GetOptions(
     'dbi=s'            => \$dbi,
@@ -21,7 +22,23 @@ GetOptions(
     'reqs-per-child=i' => \$reqs_per_child,
     'max-reties=i'     => \$max_retries,
     'retry-interval=i' => \$retry_interval,
-);
+    'help'             => \$help,
+) or exit 99;
+if ($help) {
+    print <<"EOT"
+Usage: $0 [options]
+Options: --dbi=dbi_uri          DBI-style URI of MySQL database
+         --workers=num_workers  number of workers to spawn (or 0 not to spawn)
+         --reqs-per-child=num   number of requests to be handled by a worker
+                                process before it shuts down
+         --max-retries=num      maximum number of retries to fetch a URL upon
+                                failures
+         --retry-interval=min   interval between retries in minutes
+EOT
+;
+    exit 0;
+}
+
 $reqs_per_child = 0 unless $workers;
 
 my $ua = LWP::UserAgent->new;
@@ -87,7 +104,8 @@ sub run {
                 dbh->do(
                     'insert into crawler_queue (id,fail_cnt,failed_at) values (?,?,?)',
                     {},
-                    $row->{id}, $row->{fail_cnt} + 1,
+                    $row->{id},
+                    $row->{fail_cnt} + 1,
                     int(time / 60),
                 ) or die dbh->errstr;
             }
