@@ -6,7 +6,7 @@ use warnings;
 use DBI;
 use POSIX qw/:sys_wait_h/;
 
-use Test::More tests => 133;
+use Test::More tests => 253;
 
 sub dbi_uri {
     my $uri = $ENV{DBI} || 'dbi:mysql:database=test;host=localhost';
@@ -81,7 +81,7 @@ is_deeply(
 # compaction test
 my $s = '0123456789abcdef' x 128 x 255;
 
-for (my $i = 0; $i < 40; $i++) {
+for (my $i = 0; $i < 80; $i++) {
     ok($src->do('insert into q4m_t values (?,?)', {}, $i, $s));
     is_deeply(
         $dst->selectall_arrayref('select queue_wait("q4m_t2",10)'),

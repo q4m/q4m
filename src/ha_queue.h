@@ -36,11 +36,13 @@ class queue_row_t {
   uchar _bytes[1];
 public:
   enum {
-    type_mask         = 0xe0000000,
-    type_row          = 0x00000000,
-    type_row_received = 0x20000000,
-    type_checksum     = 0x40000000,
-    type_flag_removed = 0x80000000,
+    type_mask                 = 0xe0000000,
+    type_row                  = 0x00000000,
+    type_row_received         = 0x20000000,
+    type_checksum             = 0x40000000,
+    type_row_removed          = 0x80000000,
+    type_row_received_removed = 0xa0000000,
+    type_num_rows_removed     = 0xc0000000,
     size_mask         = ~type_mask,
     max_size          = ~type_mask
   };
@@ -71,10 +73,22 @@ public:
     return header_size() + sizeof(my_off_t);
   }
   my_off_t next(my_off_t off) {
-    return off + header_size()
-      + (type() != type_checksum ? size() : sizeof(my_off_t));
+    off += header_size();
+    switch (type()) {
+    case type_checksum:
+      off += sizeof(my_off_t);
+      break;
+    case type_num_rows_removed:
+      break;
+    default:
+      off += size();
+      break;
+    }
+    return off;
   }
   my_off_t validate_checksum(int fd, my_off_t off);
+  static void queue_row_t::create_checksum(queue_row_t *checksum, my_off_t sz,
+					   uint32_t adler);
   // my_free should be used on deallocation
   static queue_row_t *create_checksum(const iovec* iov, int iovcnt);
 private:
@@ -94,7 +108,7 @@ private:
   char _attr[4];
   char _end[8];
   char _begin[8];
-  char _compaction_offset[8];
+  char _begin_row_id[8];
   char _last_received_offsets[QUEUE_MAX_SOURCES][8];
   unsigned _padding[1024 - (4 + 4 + 8 + 8 + 8 + QUEUE_MAX_SOURCES * 8)];
 public:
@@ -105,9 +119,11 @@ public:
   my_off_t end() const { return uint8korr(_end); }
   void set_end(my_off_t e) { int8store(_end, e); }
   my_off_t begin() const { return uint8korr(_begin); }
-  void set_begin(my_off_t b) { int8store(_begin, b); }
-  my_off_t compaction_offset() const { return uint8korr(_compaction_offset); }
-  void set_compaction_offset(my_off_t co) { int8store(_compaction_offset, co); }
+  my_off_t begin_row_id() const { return uint8korr(_begin_row_id); }
+  void set_begin(my_off_t b, my_off_t i) {
+    int8store(_begin, b);
+    int8store(_begin_row_id, i);
+  }
   my_off_t last_received_offset(unsigned i) const {
     return uint8korr(_last_received_offsets[i]);
   }
@@ -185,11 +201,19 @@ public:
   }
 };
 
-typedef std::list<std::pair<pthread_t, my_off_t> > queue_rows_owned_t;
+struct queue_owned_row_t {
+  pthread_t owner;
+  my_off_t off;
+  my_off_t row_id;
+  queue_owned_row_t(pthread_t ow, my_off_t o, my_off_t i)
+  : owner(ow), off(o), row_id(i) {}
+};
+
+typedef std::list<queue_owned_row_t> queue_owned_row_list_t;
 
 class queue_share_t {
   
- public:
+public:
   struct append_t {
     const void *rows;
     size_t rows_size;
@@ -220,8 +244,10 @@ class queue_share_t {
     size_t expr_len;
     size_t ref_cnt;
     my_off_t pos;
-    cond_expr_t(queue_cond_t::node_t *n, const char *e, size_t el, my_off_t p)
-    : node(n), expr(new char [el]), expr_len(el), ref_cnt(1), pos(p)
+    my_off_t row_id;
+    cond_expr_t(queue_cond_t::node_t *n, const char *e, size_t el, my_off_t p,
+		my_off_t i)
+    : node(n), expr(new char [el]), expr_len(el), ref_cnt(1), pos(p), row_id(i)
     {
       std::copy(e, e + el, expr);
     }
@@ -229,6 +255,11 @@ class queue_share_t {
       delete expr;
       delete node;
     }
+    struct reset_pos {
+      void operator()(cond_expr_t& e) const {
+	e.pos = 0;
+      }
+    };
   };
   typedef std::list<cond_expr_t> cond_expr_list_t;
   
@@ -245,7 +276,7 @@ class queue_share_t {
   };
   typedef std::list<std::pair<listener_t*, cond_expr_t*> > listener_list_t;
   
- private:
+private:
   uint use_count;
   char *table_name;
   uint table_name_length;
@@ -261,7 +292,7 @@ class queue_share_t {
     char buf[4096];
   } cache;
   
-  queue_rows_owned_t rows_owned;
+  queue_owned_row_list_t rows_owned;
   
   listener_list_t listener_list; /* access serialized using listener_mutex */
   
@@ -278,6 +309,7 @@ class queue_share_t {
   cond_expr_list_t active_cond_expr_list;
   cond_expr_list_t inactive_cond_expr_list;
   cond_expr_t cond_expr_true;
+  my_off_t bytes_removed;
   /* following fields are for V2 type table only */
   queue_fixed_field_t **fixed_fields;
   size_t null_bytes;
@@ -327,7 +359,7 @@ public:
 	     min(size - (cache.off - off), sizeof(cache.buf)));
     }
   }
-  int next(my_off_t *off);
+  int next(my_off_t *off, my_off_t* row_id);
   template <typename Func> void apply_cond_expr_list(const Func& f) {
     std::for_each(active_cond_expr_list.begin(), active_cond_expr_list.end(),
 		  f);
@@ -335,7 +367,8 @@ public:
 		  inactive_cond_expr_list.end(), f);
     f(cond_expr_true);
   }
-  my_off_t get_owned_row(pthread_t owner, bool remove = false);
+  my_off_t get_owned_row(pthread_t owner, my_off_t *row_id,
+			 bool remove = false);
   int remove_rows(my_off_t *offsets, int cnt);
   pthread_t find_owner(my_off_t off);
   my_off_t assign_owner(pthread_t owner, cond_expr_t *cond_expr);
