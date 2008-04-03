@@ -694,6 +694,8 @@ void queue_share_t::wake_listeners()
       if (next(&off, &row_id) != 0) {
 	log("internal error, table corrupt?\n");
 	goto UNLOCK_ALL_RETURN;
+      } else if (off == _header.end()) {
+	goto UNLOCK_ALL_RETURN;
       }
     }
     if (use_cond_expr && setup_cond_eval(off) != 0) {
@@ -1039,14 +1041,14 @@ void queue_share_t::release_cond_expr(cond_expr_t *e)
 	 i != active_cond_expr_list.end();
 	 ++i) {
       if (&*i == e) {
-	inactive_cond_expr_list.push_back(*i);
+	inactive_cond_expr_list.push_front(*i);
 	active_cond_expr_list.erase(i);
 	break;
       }
     }
     while (inactive_cond_expr_list.size() >= 100) {
-      inactive_cond_expr_list.front().free_data();
-      inactive_cond_expr_list.pop_front();
+      inactive_cond_expr_list.back().free_data();
+      inactive_cond_expr_list.pop_back();
     }
   }
 }
@@ -1114,7 +1116,8 @@ int queue_share_t::writer_do_append(append_list_t *l)
   /* update begin, end, cache, last_received_offset */
   pthread_mutex_lock(&mutex);
   if (_header.begin() == _header.end()) {
-    _header.set_begin(_header.begin() + iov[0].iov_len, _header.begin_row_id());
+    _header.set_begin(_header.begin() + queue_row_t::checksum_size(),
+		      _header.begin_row_id());
   }
   for (vector<iovec>::const_iterator i = iov.begin(); i != iov.end(); ++i) {
     update_cache(i->iov_base, _header.end(), i->iov_len);
@@ -1144,7 +1147,7 @@ void queue_share_t::writer_do_remove(remove_list_t* l)
     for (int j = 0; err == 0 && j < (*i)->cnt; j++) {
       queue_row_t row;
       my_off_t off = (*i)->offsets[j];
-      if (read(&row, off, queue_row_t::header_size(), false)
+      if (read(&row, off, queue_row_t::header_size(), true)
 	  == static_cast<ssize_t>(queue_row_t::header_size())) {
 	switch (row.type()) {
 	case queue_row_t::type_row:
@@ -1154,7 +1157,8 @@ void queue_share_t::writer_do_remove(remove_list_t* l)
 	  row.set_type(queue_row_t::type_row_received_removed);
 	  break;
 	default:
-	  log("internal inconsistency found\n");
+	  log("internal inconsistency found, removing row with type: %08x\n",
+	      row.type());
 	  err = HA_ERR_CRASHED_ON_USAGE;
 	  break;
 	}
@@ -2126,7 +2130,9 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
   
  EXIT:
   for (int i = 0; i < num_shares && cond_exprs[i] != NULL; i++) {
+    shares[i]->lock();
     shares[i]->release_cond_expr(cond_exprs[i]);
+    shares[i]->unlock();
   }
   for (int i = 0; i < num_shares && shares[i] != NULL; i++) {
     if (i != share_owned) {

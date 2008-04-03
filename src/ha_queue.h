@@ -253,7 +253,9 @@ public:
     }
     void free_data() {
       delete expr;
+      expr = NULL;
       delete node;
+      node = NULL;
     }
     struct reset_pos {
       void operator()(cond_expr_t& e) const {
