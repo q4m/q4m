@@ -83,8 +83,62 @@ static int safe_cond_timedwait_relative_np(pthread_cond_t *cond,
 
 static handlerton *queue_hton;
 
+/* stat */
+static pthread_mutex_t stat_mutex;
+struct stat_value {
+  my_off_t value;
+  stat_value() : value(0) {}
+  void incr(my_off_t d = 1) {
+    pthread_mutex_lock(&stat_mutex);
+    value += d;
+    pthread_mutex_unlock(&stat_mutex);
+  }
+};
+#define STAT_VALUE(n) stat_value stat_##n;
+STAT_VALUE(sys_read);
+STAT_VALUE(sys_write);
+STAT_VALUE(sys_sync);
+STAT_VALUE(read_cachehit);
+STAT_VALUE(writer_append);
+STAT_VALUE(writer_remove);
+STAT_VALUE(cond_eval);
+STAT_VALUE(cond_compile);
+STAT_VALUE(cond_compile_cachehit);
+STAT_VALUE(rows_written);
+STAT_VALUE(rows_removed);
+STAT_VALUE(queue_wait);
+STAT_VALUE(queue_end);
+STAT_VALUE(queue_abort);
+STAT_VALUE(queue_rowid);
+STAT_VALUE(queue_set_srcid);
+#undef STAT_VALUE
+  
 static void log(const char *fmt, ...) __attribute__((format(printf,1,2)));
 static void kill_proc(const char *fmt, ...) __attribute__((format(printf,1,2)));
+
+inline ssize_t sys_pread(int d, void *b, size_t n, my_off_t o)
+{
+  stat_sys_read.incr();
+  return ::pread(d, b, n, o);
+}
+
+inline ssize_t sys_write(int d, const void *b, size_t n)
+{
+  stat_sys_write.incr();
+  return ::write(d, b, n);
+}
+
+inline ssize_t sys_pwrite(int d, const void *b, size_t n, my_off_t o)
+{
+  stat_sys_write.incr();
+  return ::pwrite(d, b, n, o);
+}
+
+inline ssize_t sys_writev(int d, const iovec *iov, int iovcnt)
+{
+  stat_sys_write.incr();
+  return ::writev(d, iov, iovcnt);
+}
 
 static void vlog(const char *fmt, va_list args)
 {
@@ -130,6 +184,7 @@ static void sync_file(int fd)
       ) {
     kill_proc("failed to sync disk\n");
   }
+  stat_sys_sync.incr();
 }
 
 my_off_t queue_row_t::validate_checksum(int fd, my_off_t off)
@@ -139,7 +194,7 @@ my_off_t queue_row_t::validate_checksum(int fd, my_off_t off)
   
   /* read checksum size */
   off += queue_row_t::header_size();
-  if (::pread(fd, _len, sizeof(_len), off) != sizeof(_len)) {
+  if (sys_pread(fd, _len, sizeof(_len), off) != sizeof(_len)) {
     return 0;
   }
   off += sizeof(_len);
@@ -150,7 +205,7 @@ my_off_t queue_row_t::validate_checksum(int fd, my_off_t off)
     /* read header */
     queue_row_t r;
     if (off_end - off < header_size()
-	|| ::pread(fd, &r, header_size(), off)
+	|| sys_pread(fd, &r, header_size(), off)
 	!= static_cast<ssize_t>(header_size())) {
       return 0;
     }
@@ -176,7 +231,7 @@ my_off_t queue_row_t::validate_checksum(int fd, my_off_t off)
     while (off != row_end) {
       char buf[4096];
       ssize_t bs = min(row_end - off, sizeof(buf));
-      if (::pread(fd, buf, bs, off) != bs) {
+      if (sys_pread(fd, buf, bs, off) != bs) {
 	return 0;
       }
       adler = adler32(adler, buf, bs);
@@ -224,7 +279,7 @@ queue_file_header_t::queue_file_header_t()
 
 void queue_file_header_t::write(int fd)
 {
-  if (pwrite(fd, this, sizeof(*this), 0) != sizeof(*this)) {
+  if (sys_pwrite(fd, this, sizeof(*this), 0) != sizeof(*this)) {
     kill_proc("failed to update header\n");
   }
 }
@@ -427,7 +482,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
     goto ERR_ON_FILEOPEN;
   }
   /* load header */
-  if (::pread(share->fd, &share->_header, sizeof(share->_header), 0)
+  if (sys_pread(share->fd, &share->_header, sizeof(share->_header), 0)
       != sizeof(share->_header)) {
     goto ERR_AFTER_FILEOPEN;
   }
@@ -708,6 +763,7 @@ void queue_share_t::wake_listeners()
 	found = true;
       } else if (l->second->pos < off) {
 	l->second->pos = off;
+	stat_cond_eval.incr();
 	if (cond_eval.evaluate(l->second->node)) {
 	  found = true;
 	}
@@ -742,9 +798,12 @@ struct queue_reset_owner_update_cond_expr {
   queue_reset_owner_update_cond_expr(queue_share_t *s, my_off_t o)
   : share(s), off(o) {}
   void operator()(queue_share_t::cond_expr_t& e) const {
-    if (off <= e.pos && share->cond_eval.evaluate(e.node)) {
-      // todo: should find a way to obtain prev. row
-      e.pos = 0;
+    if (off <= e.pos) {
+      stat_cond_eval.incr();
+      if (share->cond_eval.evaluate(e.node)) {
+	// todo: should find a way to obtain prev. row
+	e.pos = 0;
+      }
     }
   }
 };
@@ -814,12 +873,13 @@ const void *queue_share_t::read_cache(my_off_t off, ssize_t size,
   }
   if (cache.off != 0
       && cache.off <= off && off + size <= cache.off + sizeof(cache.buf)) {
+    stat_read_cachehit.incr();
     return cache.buf + off - cache.off;
   }
   if (! populate_cache) {
     return NULL;
   }
-  if (pread(fd, cache.buf, sizeof(cache.buf), off) < size) {
+  if (sys_pread(fd, cache.buf, sizeof(cache.buf), off) < size) {
     cache.off = 0; // invalidate
     return NULL;
   }
@@ -835,7 +895,7 @@ ssize_t queue_share_t::read(void *data, my_off_t off, ssize_t size,
     memcpy(data, cp, size);
     return size;
   }
-  return pread(fd, data, size, off);
+  return sys_pread(fd, data, size, off);
 }
 
 int queue_share_t::next(my_off_t *off, my_off_t *row_id)
@@ -950,6 +1010,7 @@ my_off_t queue_share_t::assign_owner(pthread_t owner, cond_expr_t *cond_expr)
 	  log("internal error, table corrupt?");
 	  return 0;
 	}
+	stat_cond_eval.incr();
 	if (cond_eval.evaluate(cond_expr->node)) {
 	  goto FOUND;
 	}
@@ -1004,12 +1065,15 @@ queue_share_t::compile_cond_expr(const char *expr, size_t len)
     return &cond_expr_true;
   }
   
+  stat_cond_compile.incr();
+  
   // return an existing one, if any
   for (cond_expr_list_t::iterator i = active_cond_expr_list.begin();
        i != active_cond_expr_list.end();
        ++i) {
     if (i->expr_len == len && memcmp(i->expr, expr, len) == 0) {
       i->ref_cnt++;
+      stat_cond_compile_cachehit.incr();
       return &*i;
     }
   }
@@ -1021,6 +1085,7 @@ queue_share_t::compile_cond_expr(const char *expr, size_t len)
       inactive_cond_expr_list.erase(i);
       cond_expr_t *e = &active_cond_expr_list.back();
       e->ref_cnt++;
+      stat_cond_compile_cachehit.incr();
       return e;
     }
   }
@@ -1065,6 +1130,7 @@ static void close_append_list(queue_share_t::append_list_t *l, int err)
 
 int queue_share_t::writer_do_append(append_list_t *l)
 {
+  stat_writer_append.incr();
   /* build iovec */
   vector<iovec> iov;
   my_off_t total_len = 0;
@@ -1084,7 +1150,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
     my_off_t new_len =
       ((_header.end() + total_len) / EXPAND_BY + 1) * EXPAND_BY;
     if (lseek(fd, new_len - 1, SEEK_SET) == -1
-	|| write(fd, "", 1) != 1
+	|| sys_write(fd, "", 1) != 1
 	|| lseek(fd, _header.end(), SEEK_SET) == -1) {
       /* expansion failed */
       return HA_ERR_RECORD_FILE_FULL;
@@ -1098,7 +1164,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
 	 ++i) {
       if (i - writev_from >= IOV_MAX
 	  || writev_len + i->iov_len > SSIZE_MAX / 2) {
-	if (writev(fd, &*writev_from, i - writev_from) != writev_len) {
+	if (sys_writev(fd, &*writev_from, i - writev_from) != writev_len) {
 	  my_free(iov[0].iov_base, MYF(0));
 	  return HA_ERR_CRASHED_ON_USAGE;
 	}
@@ -1107,7 +1173,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
       }
       writev_len += i->iov_len;
     }
-    if (writev(fd, &*writev_from, iov.end() - writev_from) != writev_len) {
+    if (sys_writev(fd, &*writev_from, iov.end() - writev_from) != writev_len) {
       my_free(iov[0].iov_base, MYF(0));
       return HA_ERR_CRASHED_ON_USAGE;
     }
@@ -1137,6 +1203,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
 
 void queue_share_t::writer_do_remove(remove_list_t* l)
 {
+  stat_writer_remove.incr();
   remove_list_t::iterator i;
   int err = 0;
   
@@ -1162,12 +1229,13 @@ void queue_share_t::writer_do_remove(remove_list_t* l)
 	  err = HA_ERR_CRASHED_ON_USAGE;
 	  break;
 	}
-	if (pwrite(fd, &row, queue_row_t::header_size(), off)
+	if (sys_pwrite(fd, &row, queue_row_t::header_size(), off)
 	    != static_cast<ssize_t>(queue_row_t::header_size())) {
 	  err = HA_ERR_CRASHED_ON_USAGE;
 	}
 	update_cache(&row, off, queue_row_t::header_size());
 	bytes_removed += queue_row_t::header_size() + row.size();
+	stat_rows_removed.incr();
 	if (_header.begin() == off) {
 	  my_off_t row_id = _header.begin_row_id();
 	  if (next(&off, &row_id) == 0) {
@@ -1251,7 +1319,7 @@ struct queue_compact_writer {
   queue_compact_writer(queue_share_t *s, int f, my_off_t o)
   : share(s), fd(f), off(o), buf(), adler(1) {}
   bool flush() {
-    if (write(fd, &*buf.begin(), buf.size())
+    if (sys_write(fd, &*buf.begin(), buf.size())
 	!= static_cast<ssize_t>(buf.size())) {
       return false;
     }
@@ -1398,7 +1466,7 @@ int queue_share_t::compact()
     for (int i = 0; i < QUEUE_MAX_SOURCES; i++) {
       tmp_hdr.set_last_received_offset(i, _header.last_received_offset(i));
     }
-    if (pwrite(tmp_fd, &tmp_hdr, sizeof(tmp_hdr), 0) != sizeof(tmp_hdr)) {
+    if (sys_pwrite(tmp_fd, &tmp_hdr, sizeof(tmp_hdr), 0) != sizeof(tmp_hdr)) {
       goto ERR_OPEN;
     }
     /* write checksum */
@@ -1408,7 +1476,7 @@ int queue_share_t::compact()
 				   writer.off - sizeof(queue_file_header_t)
 				   - queue_row_t::checksum_size(),
 				   writer.adler);
-      if (pwrite(tmp_fd, cbuf, sizeof(cbuf), sizeof(tmp_hdr))
+      if (sys_pwrite(tmp_fd, cbuf, sizeof(cbuf), sizeof(tmp_hdr))
 	  != static_cast<ssize_t>(sizeof(cbuf))) {
 	goto ERR_OPEN;
       }
@@ -1701,11 +1769,11 @@ int ha_queue::create(const char *name, TABLE *table_arg,
     return HA_ERR_GENERIC; // ????
   }
   queue_file_header_t header;
-  if (write(fd, &header, sizeof(header)) != sizeof(header)) {
+  if (sys_write(fd, &header, sizeof(header)) != sizeof(header)) {
     goto ERROR;
   }
   if (lseek(fd, EXPAND_BY - 1, SEEK_SET) == -1
-      || write(fd, "", 1) != 1) {
+      || sys_write(fd, "", 1) != 1) {
     goto ERROR;
   }
   sync_file(fd);
@@ -1734,6 +1802,9 @@ int ha_queue::end_bulk_insert()
     switch (ret) {
     case QUEUE_ERR_RECORD_EXISTS:
       ret = 0;
+      break;
+    case 0:
+      stat_rows_written.incr(bulk_insert_rows);
       break;
     }
     rows_size = 0;
@@ -1785,6 +1856,9 @@ int ha_queue::write_row(uchar *buf)
     int err = share->write_rows(rows, sz);
     free_rows_buffer();
     switch (err) {
+    case 0:
+      stat_rows_written.incr();
+      break;
     case QUEUE_ERR_RECORD_EXISTS:
       err = 0;
       break;
@@ -1971,17 +2045,82 @@ static queue_share_t* get_share_check(const char* db_table_name)
   return share;
 }
 
+static bool show_engine_status(handlerton *hton, THD *thd, stat_print_fn *print)
+{
+  vector<char> out;
+  char buf[256];
+  
+  // dump stat values
+  pthread_mutex_lock(&stat_mutex);
+
+#define SEP "\n------------------------------------\n"
+#define HEADER(N) do { \
+    const char *sep = SEP, * n = N; \
+    out.push_back('\n'); \
+    out.insert(out.end(), n, n + sizeof(N) - 1); \
+    out.insert(out.end(), sep, sep + sizeof(SEP) - 1); \
+  } while (0)
+#define DUMP2(n, l) do { \
+    sprintf(buf, "%-16s %20llu\n", l, stat_##n.value); \
+    out.insert(out.end(), buf, buf + strlen(buf)); \
+  } while (0)
+#define DUMP(n) DUMP2(n, #n)
+  
+  HEADER("I/O calls");
+  DUMP(sys_read);
+  DUMP(sys_write);
+  DUMP(sys_sync);
+  DUMP(read_cachehit);
+  HEADER("Writer thread");
+  DUMP2(writer_append, "append");
+  DUMP2(writer_remove, "remove");
+  HEADER("Conditional subscription");
+  DUMP2(cond_eval, "evaluation");
+  DUMP2(cond_compile, "compile");
+  DUMP2(cond_compile_cachehit, "compile_cachehit");
+  HEADER("High-level stats");
+  DUMP(rows_written);
+  DUMP(rows_removed);
+  DUMP(queue_wait);
+  DUMP(queue_end);
+  DUMP(queue_abort);
+  DUMP(queue_rowid);
+  DUMP(queue_set_srcid);
+  
+#undef SEP
+#undef HEADER
+#undef DUMP2
+#undef DUMP
+  
+  pthread_mutex_unlock(&stat_mutex);
+  
+  return (*print)(thd, "QUEUE", 5, "", 0, &*out.begin(), out.size());
+}
+
+static bool show_status(handlerton *hton, THD *thd, stat_print_fn *print,
+			enum ha_stat_type stat)
+{
+  switch (stat) {
+  case HA_ENGINE_STATUS:
+    return show_engine_status(hton, thd, print);
+  default:
+    return FALSE;
+  }
+}
+
 static int init_plugin(void *p)
 {
   queue_hton = (handlerton *)p;
   
   pthread_mutex_init(&open_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&listener_mutex, MY_MUTEX_INIT_FAST);
+  pthread_mutex_init(&stat_mutex, MY_MUTEX_INIT_FAST);
   hash_init(&queue_open_tables, system_charset_info, 32, 0, 0,
 	    reinterpret_cast<hash_get_key>(queue_share_t::get_share_key), 0, 0);
   queue_hton->state = SHOW_OPTION_YES;
   queue_hton->close_connection = queue_connection_t::close;
   queue_hton->create = create_handler;
+  queue_hton->show_status = show_status;
   queue_hton->flags = HTON_CAN_RECREATE;
   
   return 0;
@@ -1995,6 +2134,7 @@ static int deinit_plugin(void *p)
   }
   
   hash_free(&queue_open_tables);
+  pthread_mutex_destroy(&stat_mutex);
   pthread_mutex_destroy(&listener_mutex);
   pthread_mutex_destroy(&open_mutex);
   queue_hton = NULL;
@@ -2168,6 +2308,7 @@ void queue_wait_deinit(UDF_INIT *initid __attribute__((unused)))
 long long queue_wait(UDF_INIT *initid __attribute__((unused)), UDF_ARGS *args,
 		     char *is_null, char *error)
 {
+  stat_queue_wait.incr();
   int timeout = args->arg_count >= 2
     ? *reinterpret_cast<long long*>(args->args[args->arg_count - 1]) : 60;
   
@@ -2193,6 +2334,7 @@ long long queue_end(UDF_INIT *initid __attribute__((unused)),
 		    UDF_ARGS *args __attribute__((unused)),
 		    char *is_null, char *error __attribute__((unused)))
 {
+  stat_queue_end.incr();
   queue_connection_t *conn;
   
   if ((conn = queue_connection_t::current()) != NULL) {
@@ -2223,6 +2365,7 @@ void queue_abort_deinit(UDF_INIT *initid)
 long long queue_abort(UDF_INIT *initid, UDF_ARGS *args __attribute__((unused)),
 		      char *is_null, char *error)
 {
+  stat_queue_abort.incr();
   queue_connection_t *conn;
   
   if ((conn = queue_connection_t::current()) != NULL) {
@@ -2262,6 +2405,7 @@ void queue_rowid_deinit(UDF_INIT *initid __attribute__((unused)))
 long long queue_rowid(UDF_INIT *initid __attribute__((unused)), UDF_ARGS *args,
 		      char *is_null, char *error)
 {
+  stat_queue_rowid.incr();
   queue_connection_t *conn;
   if ((conn = queue_connection_t::current()) == NULL) {
     log("internal error, unexpectedly conn==NULL\n");
@@ -2304,6 +2448,7 @@ long long queue_set_srcid(UDF_INIT *initid __attribute__((unused)),
 			  UDF_ARGS *args, char *is_null __attribute__((unused)),
 			  char *error)
 {
+  stat_queue_set_srcid.incr();
   long long sender = *(long long*)args->args[0];
   if (sender < 0 || QUEUE_MAX_SOURCES <= sender) {
     log("queue_set_srcid: source number exceeds limit: %lld\n", sender);
