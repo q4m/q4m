@@ -265,7 +265,7 @@ public:
   };
   struct pow_func : public binary_op<pow_func> {
     value_t bop(const value_t &x, const value_t &y) const {
-      return value_t::int_value(powl(x.l, y.l));
+      return value_t::int_value(static_cast<long long>(powl(x.l, y.l)));
     }
   };
 
