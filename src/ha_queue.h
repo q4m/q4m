@@ -87,8 +87,8 @@ public:
     return off;
   }
   my_off_t validate_checksum(int fd, my_off_t off);
-  static void queue_row_t::create_checksum(queue_row_t *checksum, my_off_t sz,
-					   uint32_t adler);
+  static void create_checksum(queue_row_t *checksum, my_off_t sz,
+			      uint32_t adler);
   // my_free should be used on deallocation
   static queue_row_t *create_checksum(const iovec* iov, int iovcnt);
 private:
