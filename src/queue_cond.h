@@ -263,6 +263,11 @@ public:
       return value_t::int_value((! x.l) ^ (! y.l));
     }
   };
+  struct pow_func : public binary_op<pow_func> {
+    value_t bop(const value_t &x, const value_t &y) const {
+      return value_t::int_value(powl(x.l, y.l));
+    }
+  };
 
 protected:  
   std::vector<std::pair<char*, value_t> > columns;

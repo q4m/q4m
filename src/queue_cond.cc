@@ -225,6 +225,8 @@ struct wait_expr_t : public grammar<wait_expr_t> {
 	('-' >> unary_expr)[pop_action<queue_cond_t::neg_op>(s.ctx)] |
 	('~' >> unary_expr)[pop_action<queue_cond_t::bitinv_op>(s.ctx)] |
 	('(' >> or_expr >> ')') |
+	("pow(" >> or_expr >> ',' >> or_expr >> ')')
+	[pop_action<queue_cond_t::pow_func>(s.ctx)] |
 	as_lower_d[NULL_TOKEN][null_action(s.ctx)] |
 #if 0
 	str_node |
