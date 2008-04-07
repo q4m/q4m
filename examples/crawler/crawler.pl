@@ -20,6 +20,7 @@ my $ua = LWP::UserAgent->new;
 my $_dbh;
 
 GetOptions(
+    'dbi:s'            => \$dbi,
     'reqs-per-child:i' => \$reqs_per_child,
     'retry-interval:i' => \$retry_interval,
     'max-retries:i'    => \$max_retries,
