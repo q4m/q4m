@@ -1223,6 +1223,10 @@ void queue_share_t::writer_do_remove(remove_list_t* l)
 	case queue_row_t::type_row_received:
 	  row.set_type(queue_row_t::type_row_received_removed);
 	  break;
+	case queue_row_t::type_row_removed:
+	case queue_row_t::type_row_received_removed:
+	  // rows might be DELETEed by its owner while in owner-mode
+	  break;
 	default:
 	  log("internal inconsistency found, removing row with type: %08x\n",
 	      row.type());
@@ -1666,6 +1670,12 @@ int ha_queue::rnd_next(uchar *buf)
     if (share->read(&hdr, pos, queue_row_t::header_size(), true)
 	!= static_cast<ssize_t>(queue_row_t::header_size())) {
       err = HA_ERR_CRASHED_ON_USAGE;
+      goto EXIT;
+    }
+    switch (hdr.type()) {
+    case queue_row_t::type_row_removed:
+    case queue_row_t::type_row_received_removed:
+      /* owned row removed by owner */
       goto EXIT;
     }
     if (prepare_rows_buffer(queue_row_t::header_size() + hdr.size()) != 0) {
