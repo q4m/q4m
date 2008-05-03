@@ -30,7 +30,10 @@ fi
 # change libdir to prefix/lib/mysql unless otherwise specified
 if test "$libdir" = '${exec_prefix}/lib'
 then
-  if test -d "${prefix}/lib/mysql"
+  if test -d "${prefix}/lib/mysql/plugin"
+  then
+    libdir="${libdir}/mysql/plugin"
+  elif test -d "${prefix}/lib/mysql"
   then
     libdir="${libdir}/mysql"
   fi
