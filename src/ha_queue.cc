@@ -1521,10 +1521,11 @@ size_t queue_connection_t::cnt = 0;
 queue_connection_t *queue_connection_t::current(bool create_if_empty)
 {
   queue_connection_t *conn =
-    static_cast<queue_connection_t*>(current_thd->ha_data[queue_hton->slot]);
+    static_cast<queue_connection_t*>(thd_get_ha_data(current_thd, queue_hton));
+  
   if (conn == NULL && create_if_empty) {
     conn = new queue_connection_t();
-    current_thd->ha_data[queue_hton->slot] = conn;
+    thd_set_ha_data(current_thd, queue_hton, conn);
     cnt++;
   }
   return conn;
@@ -1533,7 +1534,7 @@ queue_connection_t *queue_connection_t::current(bool create_if_empty)
 int queue_connection_t::close(handlerton *hton, THD *thd)
 {
   queue_connection_t *conn =
-    static_cast<queue_connection_t*>(thd->ha_data[queue_hton->slot]);
+    static_cast<queue_connection_t*>(thd_get_ha_data(current_thd, queue_hton));
   
   if (conn->share_owned != NULL) {
     if (conn->share_owned->reset_owner(pthread_self()) != 0) {
