@@ -1757,9 +1757,7 @@ int ha_queue::rnd_pos(uchar *buf, uchar *_pos)
 
 int ha_queue::info(uint flag)
 {
-  // records = share->rows.size();
-  // deleted = 0;
-  
+  stats.records = 2;
   return 0;
 }
 
