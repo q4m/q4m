@@ -1614,17 +1614,31 @@ int ha_queue::close()
   return 0;
 }
 
+int ha_queue::external_lock(THD *thd, int lock_type)
+{
+  switch (lock_type) {
+  case F_RDLCK:
+  case F_WRLCK:
+    share->lock_reader();
+    break;
+  case F_UNLCK:
+    share->unlock_reader();
+    free_rows_buffer();
+    break;
+  default:
+    break;
+  }
+  return 0;
+}
+
 int ha_queue::rnd_init(bool scan)
 {
-  share->lock_reader();
   pos = 0;
   return 0;
 }
 
 int ha_queue::rnd_end()
 {
-  share->unlock_reader();
-  free_rows_buffer();
   return 0;
 }
 

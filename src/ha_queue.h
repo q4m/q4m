@@ -442,6 +442,7 @@ class ha_queue: public handler
   
   int open(const char *name, int mode, uint test_if_locked);
   int close();
+  int external_lock(THD *thd, int lock_type);
   int rnd_init(bool scan);
   int rnd_end();
   int rnd_next(uchar *buf);
