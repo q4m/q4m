@@ -10,7 +10,7 @@ use DBI;
 use List::MoreUtils qw/uniq/;
 
 my $NUM_CHILDREN = $ENV{CONCURRENCY} || 32;
-my $NUM_MESSAGES = $NUM_CHILDREN * 200;
+my $NUM_MESSAGES = $ENV{MESSAGES} || ($NUM_CHILDREN * 200);
 my $BLOCK_SIZE = 100;
 
 sub dbi_connect {
