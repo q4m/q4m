@@ -33,9 +33,9 @@ then
   if test -d "${prefix}/lib/mysql/plugin"
   then
     libdir="${libdir}/mysql/plugin"
-  elif test -d "${prefix}/lib/mysql"
+  elif test -d "${prefix}/lib/plugin"
   then
-    libdir="${libdir}/mysql"
+    libdir="${libdir}/plugin"
   fi
 fi
 
@@ -55,6 +55,11 @@ PROCNAME=`uname -p | tr "[[:upper:]]" "[[:lower:]]"`
 if test "$PROCNAME" = "i686"
 then
     PROCNAME="i386"
+fi
+if test "$OSNAME" = "linux" -a "$PROCNAME" = "x86_64"
+then
+    CFLAGS="$CFLAGS -fpic"
+    CXXFLAGS="$CXXFLAGS -fpic"
 fi
 
 AC_ARG_WITH(debug,
