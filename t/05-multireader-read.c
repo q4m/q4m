@@ -27,7 +27,7 @@ int main(int argc, char **argv)
     *password = getenv("MYSQL_PASSWORD"),
     *db = getenv("MYSQL_DB"),
     *port_str = getenv("MYSQL_PORT"),
-    *unix_socket = getenv("MYSQL_UNIX_SOCKET");
+    *unix_socket = getenv("MYSQL_SOCKET");
   unsigned short port;
   unsigned i, loop;
   MYSQL_RES *res;

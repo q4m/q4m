@@ -39,8 +39,11 @@ unless ($params[0] =~ /=/) {
     $ENV{MYSQL_DB} = shift @params;
 }
 foreach my $p (@params) {
-    if ($p =~ /=/) {
-        $ENV{"MYSQL_" . uc $`} = $';
+    if ($p =~ /^=/) {
+        my ($n, $v) = ($`, $');
+        $n .= 'MYSQL_'
+            unless $n =~ /^mysql_/i;
+        $ENV{uc $n} = $v;
     }
 }
 
