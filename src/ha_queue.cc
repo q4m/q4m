@@ -468,7 +468,10 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   share->from_writer_cond = &share->_from_writer_conds[0];
   share->writer_exit = false;
   share->append_list = new append_list_t();
+#if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
+#else
   share->remove_list = new remove_list_t();
+#endif
   new (&share->cond_eval) queue_cond_t();
   new (&share->active_cond_expr_list) cond_expr_list_t();
   new (&share->inactive_cond_expr_list) cond_expr_list_t();
@@ -531,7 +534,10 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   share->inactive_cond_expr_list.~cond_expr_list_t();
   share->active_cond_expr_list.~cond_expr_list_t();
   share->cond_eval.~queue_cond_t();
+#if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
+#else
   delete share->remove_list;
+#endif
   delete share->append_list;
   pthread_cond_destroy(&share->_from_writer_conds[0]);
   pthread_cond_destroy(&share->_from_writer_conds[1]);
@@ -577,7 +583,10 @@ void queue_share_t::release()
     inactive_cond_expr_list.~cond_expr_list_t();
     active_cond_expr_list.~cond_expr_list_t();
     cond_eval.~queue_cond_t();
+#if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
+#else
     delete remove_list;
+#endif
     delete append_list;
     pthread_cond_destroy(&_from_writer_conds[0]);
     pthread_cond_destroy(&_from_writer_conds[1]);
@@ -970,11 +979,16 @@ int queue_share_t::remove_rows(my_off_t *offsets, int cnt)
   if ((err = do_remove_rows(offsets, cnt)) != 0) {
     return err;
   }
+#ifdef FDATASYNC_SKIP
+  return 0;
+#endif
   remove_t r;
 #else
   remove_t r(offsets, cnt);
 #endif
   
+#if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
+#else
   remove_list->push_back(&r);
   pthread_cond_t *c = from_writer_cond;
   pthread_cond_signal(&to_writer_cond);
@@ -983,6 +997,7 @@ int queue_share_t::remove_rows(my_off_t *offsets, int cnt)
   } while (r.err == -1);
   
   return r.err;
+#endif
 }
 
 pthread_t queue_share_t::find_owner(my_off_t off)
@@ -1264,6 +1279,8 @@ int queue_share_t::do_remove_rows(my_off_t *offsets, int cnt)
   return err;
 }
 
+#if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
+#else
 void queue_share_t::writer_do_remove(remove_list_t* l)
 {
   stat_writer_remove.incr();
@@ -1280,6 +1297,7 @@ void queue_share_t::writer_do_remove(remove_list_t* l)
   }
   pthread_mutex_unlock(&mutex);
 }
+#endif
 
 void *queue_share_t::writer_start()
 {
@@ -1287,7 +1305,12 @@ void *queue_share_t::writer_start()
   
   while (1) {
     /* wait for signal if we do not have any pending writes */
-    while (remove_list->size() == 0 && append_list->size() == 0) {
+    while (append_list->size() == 0
+#if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
+#else
+	   && remove_list->size() == 0
+#endif
+	   ) {
       if (writer_exit) {
 	goto EXIT;
       } else if (num_readers == 0
@@ -1300,12 +1323,15 @@ void *queue_share_t::writer_start()
       }
     }
     /* detach operation lists */
+#if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
+#else
     remove_list_t *rl = NULL;
-    append_list_t *al = NULL;
     if (remove_list->size() != 0) {
       rl = remove_list;
       remove_list = new remove_list_t();
     }
+#endif
+    append_list_t *al = NULL;
     if (append_list->size() != 0) {
       al = append_list;
       append_list = new append_list_t();
@@ -1314,10 +1340,13 @@ void *queue_share_t::writer_start()
     from_writer_cond = _from_writer_conds + (_from_writer_conds == notify_cond);
     /* do the task and send back the results */
     pthread_mutex_unlock(&mutex);
+#if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
+#else
     if (rl != NULL) {
       writer_do_remove(rl);
       delete rl;
     }
+#endif
     if (al != NULL) {
       int err = 0;
       if ((err = writer_do_append(al)) != 0) {

@@ -308,7 +308,10 @@ private:
   pthread_cond_t _from_writer_conds[2];
   bool writer_exit;
   append_list_t *append_list;
+#if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
+#else
   remove_list_t *remove_list;
+#endif
   queue_cond_t cond_eval;
   cond_expr_list_t active_cond_expr_list;
   cond_expr_list_t inactive_cond_expr_list;
@@ -382,7 +385,10 @@ public:
 private:
   int writer_do_append(append_list_t *l);
   int do_remove_rows(my_off_t *offsets, int cnt);
+#if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
+#else
   void writer_do_remove(remove_list_t *l);
+#endif
   void *writer_start();
   static void *_writer_start(void* self) {
     return static_cast<queue_share_t*>(self)->writer_start();
