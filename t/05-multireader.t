@@ -39,7 +39,7 @@ unless ($params[0] =~ /=/) {
     $ENV{MYSQL_DB} = shift @params;
 }
 foreach my $p (@params) {
-    if ($p =~ /^=/) {
+    if ($p =~ /=/) {
         my ($n, $v) = ($`, $');
         $n = "MYSQL_$n"
             unless $n =~ /^mysql_/i;
