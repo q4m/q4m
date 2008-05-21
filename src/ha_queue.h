@@ -229,12 +229,14 @@ public:
   typedef std::vector<append_t*> append_list_t;
   
   struct remove_t {
+    int err; /* -1 if not completed, otherwise HA_ERR_XXX or 0 */
+#ifdef USE_MT_PWRITE
+    remove_t() : err(-1) {}
+#else
     my_off_t *offsets;
     int cnt;
-    int err; /* -1 if not completed, otherwise HA_ERR_XXX or 0 */
-    remove_t(my_off_t *o, int c)
-    : offsets(o), cnt(c), err(-1) {
-    }
+    remove_t(my_off_t *o, int c) : err(-1), offsets(o), cnt(c) {}
+#endif
   };
   typedef std::vector<remove_t*> remove_list_t;
   
@@ -379,6 +381,7 @@ public:
   void release_cond_expr(cond_expr_t *e);
 private:
   int writer_do_append(append_list_t *l);
+  int do_remove_rows(my_off_t *offsets, int cnt);
   void writer_do_remove(remove_list_t *l);
   void *writer_start();
   static void *_writer_start(void* self) {

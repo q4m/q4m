@@ -965,7 +965,15 @@ my_off_t queue_share_t::get_owned_row(pthread_t owner, my_off_t *row_id,
 
 int queue_share_t::remove_rows(my_off_t *offsets, int cnt)
 {
+#ifdef USE_MT_PWRITE
+  int err;
+  if ((err = do_remove_rows(offsets, cnt)) != 0) {
+    return err;
+  }
+  remove_t r;
+#else
   remove_t r(offsets, cnt);
+#endif
   
   remove_list->push_back(&r);
   pthread_cond_t *c = from_writer_cond;
@@ -1201,60 +1209,76 @@ int queue_share_t::writer_do_append(append_list_t *l)
   return 0;
 }
 
+int queue_share_t::do_remove_rows(my_off_t *offsets, int cnt)
+{
+  int err = 0;
+  
+  for (int i = 0; i < cnt && err == 0; i++) {
+    queue_row_t row;
+    my_off_t off = offsets[i];
+    if (read(&row, off, queue_row_t::header_size(), true)
+	== static_cast<ssize_t>(queue_row_t::header_size())) {
+#ifdef USE_MT_PWRITE
+      pthread_mutex_unlock(&mutex);
+#endif
+      switch (row.type()) {
+      case queue_row_t::type_row:
+	row.set_type(queue_row_t::type_row_removed);
+	break;
+      case queue_row_t::type_row_received:
+	row.set_type(queue_row_t::type_row_received_removed);
+	break;
+      case queue_row_t::type_row_removed:
+      case queue_row_t::type_row_received_removed:
+	// rows might be DELETEed by its owner while in owner-mode
+	break;
+      default:
+	log("internal inconsistency found, removing row with type: %08x\n",
+	    row.type());
+	err = HA_ERR_CRASHED_ON_USAGE;
+	break;
+      }
+      if (sys_pwrite(fd, &row, queue_row_t::header_size(), off)
+	  != static_cast<ssize_t>(queue_row_t::header_size())) {
+	err = HA_ERR_CRASHED_ON_USAGE;
+      }
+#ifdef USE_MT_PWRITE
+      pthread_mutex_lock(&mutex);
+#endif
+      update_cache(&row, off, queue_row_t::header_size());
+      bytes_removed += queue_row_t::header_size() + row.size();
+      stat_rows_removed.incr();
+      if (_header.begin() == off) {
+	my_off_t row_id = _header.begin_row_id();
+	if (next(&off, &row_id) == 0) {
+	  _header.set_begin(off, row_id);
+	} else {
+	  err = HA_ERR_CRASHED_ON_USAGE;
+	}
+      }
+    } else {
+      err = HA_ERR_CRASHED_ON_USAGE;
+    }
+  }
+  
+  return err;
+}
+
 void queue_share_t::writer_do_remove(remove_list_t* l)
 {
   stat_writer_remove.incr();
   remove_list_t::iterator i;
-  int err = 0;
   
+  pthread_mutex_lock(&mutex);
   for (remove_list_t::iterator i = l->begin(); i != l->end(); ++i) {
-    /* lock mutex for each bulk delete, so as to make the deletion atomic to the
-     * deleter (would not be atomic for non-owner selects, but who cares :-o */
-    pthread_mutex_lock(&mutex);
-    for (int j = 0; err == 0 && j < (*i)->cnt; j++) {
-      queue_row_t row;
-      my_off_t off = (*i)->offsets[j];
-      if (read(&row, off, queue_row_t::header_size(), true)
-	  == static_cast<ssize_t>(queue_row_t::header_size())) {
-	switch (row.type()) {
-	case queue_row_t::type_row:
-	  row.set_type(queue_row_t::type_row_removed);
-	  break;
-	case queue_row_t::type_row_received:
-	  row.set_type(queue_row_t::type_row_received_removed);
-	  break;
-	case queue_row_t::type_row_removed:
-	case queue_row_t::type_row_received_removed:
-	  // rows might be DELETEed by its owner while in owner-mode
-	  break;
-	default:
-	  log("internal inconsistency found, removing row with type: %08x\n",
-	      row.type());
-	  err = HA_ERR_CRASHED_ON_USAGE;
-	  break;
-	}
-	if (sys_pwrite(fd, &row, queue_row_t::header_size(), off)
-	    != static_cast<ssize_t>(queue_row_t::header_size())) {
-	  err = HA_ERR_CRASHED_ON_USAGE;
-	}
-	update_cache(&row, off, queue_row_t::header_size());
-	bytes_removed += queue_row_t::header_size() + row.size();
-	stat_rows_removed.incr();
-	if (_header.begin() == off) {
-	  my_off_t row_id = _header.begin_row_id();
-	  if (next(&off, &row_id) == 0) {
-	    _header.set_begin(off, row_id);
-	  } else {
-	    err = HA_ERR_CRASHED_ON_USAGE;
-	  }
-	}
-      } else {
-	err = HA_ERR_CRASHED_ON_USAGE;
-      }
-    }
-    (*i)->err = err;
-    pthread_mutex_unlock(&mutex);
+    remove_t* r = *i;
+#ifdef USE_MT_PWRITE
+    r->err = 0;
+#else
+    r->err = do_remove_rows(r->offsets, r->cnt);
+#endif
   }
+  pthread_mutex_unlock(&mutex);
 }
 
 void *queue_share_t::writer_start()
