@@ -41,7 +41,7 @@ unless ($params[0] =~ /=/) {
 foreach my $p (@params) {
     if ($p =~ /^=/) {
         my ($n, $v) = ($`, $');
-        $n .= 'MYSQL_'
+        $n = "MYSQL_$n"
             unless $n =~ /^mysql_/i;
         $ENV{uc $n} = $v;
     }
