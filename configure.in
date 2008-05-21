@@ -74,6 +74,16 @@ fi
 ],
     [ with_debug=no ])
 
+AC_ARG_WITH(mt_pwrite,
+    [   --with-mt-pwrite=yes    do not serialize pwrite (default)
+   --with-mt-pwrite=no     serialize pwrite ],
+    [ with_mt_pwrite=$withval ],
+    [ with_mt_pwrite=yes ])
+if test "$with_mt_pwrite" = "yes"
+then
+    AC_DEFINE([USE_MT_PWRITE],1,[do not serialize pwrite])
+fi
+
 AC_ARG_WITH(sync,
     [   --with-sync=yes         commit to disk at checkpoints (default)
    --with-sync=no          do not commit explicitly to disk
