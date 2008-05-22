@@ -429,7 +429,10 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   share->table_name_length = table_name_length;
   pthread_mutex_init(&share->mutex, MY_MUTEX_INIT_FAST);
   thr_lock_init(&share->store_lock);
+#ifdef USE_MT_PREAD
+#else
   share->cache.off = 0;
+#endif
   new (&share->rows_owned) queue_owned_row_list_t();
   new (&share->listener_list) listener_list_t();
   share->num_readers = 0;
@@ -1550,7 +1553,10 @@ int queue_share_t::compact()
   /* update internal info */
   _header = tmp_hdr;
   rows_owned = tmp_rows_owned;
+#ifdef USE_MT_PREAD
+#else
   cache.off = 0; /* invalidate, since it may go below sizeof(_header) */
+#endif
   apply_cond_expr_list(cond_expr_t::reset_pos());
   
   log("finished table compaction: %s\n", table_name);
