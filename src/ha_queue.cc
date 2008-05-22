@@ -112,9 +112,9 @@ STAT_VALUE(queue_abort);
 STAT_VALUE(queue_rowid);
 STAT_VALUE(queue_set_srcid);
 #undef STAT_VALUE
-  
-static void log(const char *fmt, ...) __attribute__((format(printf,1,2)));
-static void kill_proc(const char *fmt, ...) __attribute__((format(printf,1,2)));
+
+#define log(...) (fprintf(stderr, "ha_queue:" __FILE__ ":%d: ", __LINE__), fprintf(stderr, __VA_ARGS__))
+#define kill_proc(...) (log(__VA_ARGS__), abort(), *(char*)NULL = 1)
 
 inline ssize_t sys_pread(int d, void *b, size_t n, my_off_t o)
 {
@@ -138,35 +138,6 @@ inline ssize_t sys_writev(int d, const iovec *iov, int iovcnt)
 {
   stat_sys_write.incr();
   return ::writev(d, iov, iovcnt);
-}
-
-static void vlog(const char *fmt, va_list args)
-{
-  fputs("ha_queue: ", stderr);
-  vfprintf(stderr, fmt, args);
-}
-
-static void log(const char *fmt, ...)
-{
-  va_list args;
-  va_start(args, fmt);
-  vlog(fmt, args);
-  va_end(args);
-}
-
-static void kill_proc(const char *fmt, ...)
-{
-  va_list args;
-  
-  va_start(args, fmt);
-  vlog(fmt, args);
-  va_end(args);
-  
-  abort();
-  static char *np = NULL;
-  if (*np) {
-    *np = NULL;
-  }
 }
 
 static void sync_file(int fd)
@@ -1248,8 +1219,7 @@ int queue_share_t::do_remove_rows(my_off_t *offsets, int cnt)
 	// rows might be DELETEed by its owner while in owner-mode
 	break;
       default:
-	log("internal inconsistency found, removing row with type: %08x\n",
-	    row.type());
+	log("internal inconsistency found, removing row with type: %08x at %llu\n", row.type(), off);
 	err = HA_ERR_CRASHED_ON_USAGE;
 	break;
       }
@@ -1443,7 +1413,7 @@ int queue_share_t::compact()
   { 
     queue_compact_writer writer(this, tmp_fd,
 				sizeof(tmp_hdr) + queue_row_t::checksum_size());
-    my_off_t off;
+    my_off_t off, new_begin = 0;
     size_t rows_removed;
     /* write content to new file */
     if (lseek(tmp_fd, sizeof(tmp_hdr) + queue_row_t::checksum_size(), SEEK_SET)
@@ -1462,6 +1432,16 @@ int queue_share_t::compact()
       switch (row.type()) {
       case queue_row_t::type_row:
       case queue_row_t::type_row_received:
+	if (rows_removed != 0) {
+	  if (! writer.append_rows_removed(rows_removed)) {
+	    log("I/O error\n");
+	    goto ERR_OPEN;
+	  }
+	  rows_removed = 0;
+	}
+	if (new_begin == 0) {
+	  new_begin = writer.off;
+	}
 	for (queue_owned_row_list_t::const_iterator i = rows_owned.begin();
 	     i != rows_owned.end();
 	     ++i) {
@@ -1470,14 +1450,12 @@ int queue_share_t::compact()
 						       i->row_id));
 	  }
 	}
-	if ((rows_removed != 0 && ! writer.append_rows_removed(rows_removed))
-	    || ! writer.append_row_header(&row)
+	if (! writer.append_row_header(&row)
 	    || ! writer.copy_data(off + queue_row_t::header_size(),
 				  row.size())) {
 	  log("I/O error\n");
 	  goto ERR_OPEN;
 	}
-	rows_removed = 0;
 	break;
       case queue_row_t::type_row_removed:
       case queue_row_t::type_row_received_removed:
@@ -1515,10 +1493,7 @@ int queue_share_t::compact()
       }
       writer.off = sizeof(queue_file_header_t);
     }
-    /* write header */
-    tmp_hdr.set_begin(min(writer.off,
-			  sizeof(tmp_hdr) + queue_row_t::checksum_size()),
-		      _header.begin_row_id());
+    tmp_hdr.set_begin(min(writer.off, new_begin), _header.begin_row_id());
     tmp_hdr.set_end(writer.off);
     for (int i = 0; i < QUEUE_MAX_SOURCES; i++) {
       tmp_hdr.set_last_received_offset(i, _header.last_received_offset(i));

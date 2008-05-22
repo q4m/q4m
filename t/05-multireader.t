@@ -26,7 +26,11 @@ sub dbi_connect {
 my $dbh = dbi_connect();
 $dbh->do('drop table if exists q4m_t')
     or die $dbh->errstr;
-$dbh->do('create table q4m_t (v int not null) engine=queue')
+$dbh->do(
+    'create table q4m_t (v int not null'
+        . ($ENV{VAR_LENGTH} ? ',s longtext not null' : '')
+            . ') engine=queue'
+        )
     or die $dbh->errstr;
 $dbh->disconnect;
 
@@ -75,15 +79,24 @@ for (my $i = 0; $i < $NUM_CHILDREN; $i++) {
     }
 }
 
+sub blob_str {
+    return '' unless $ENV{VAR_LENGTH};
+    q(,') . ('z' x $ENV{VAR_LENGTH}) . q(');
+}
+
 my $start = time;
 
 # start adding messages
 $dbh = dbi_connect();
 for (my $i = 0; $i < $NUM_MESSAGES; $i += $BLOCK_SIZE) {
     $dbh->do(
-        'insert into q4m_t (v) values '
-            . join(',', map { '(' . ($i + $_) . ')' } (1..$BLOCK_SIZE)))
-        or die $dbh->errstr;
+        'insert into q4m_t (v' . ($ENV{VAR_LENGTH} ? ',s' : '') . ') values '
+            . join(',',
+                   map {
+                       '(' . ($i + $_) . blob_str() . ')'
+                   } (1..$BLOCK_SIZE)
+               ),
+    ) or die $dbh->errstr;
 }
 
 # wait until all subscribers stop
