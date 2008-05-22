@@ -291,10 +291,13 @@ private:
   int fd;
   queue_file_header_t _header;
   
+#ifdef USE_MT_PREAD
+#else
   struct {
     my_off_t off;
     char buf[4096];
   } cache;
+#endif
   
   queue_owned_row_list_t rows_owned;
   
@@ -350,8 +353,10 @@ public:
   my_off_t reset_owner(pthread_t owner);
   int write_rows(const void *rows, size_t rows_size);
   /* functions below requires lock */
+#ifdef USE_MT_PREAD
+  void update_cache(const void *, my_off_t, size_t) {}
+#else
   const void *read_cache(my_off_t off, ssize_t size, bool populate_cache);
-  ssize_t read(void *data, my_off_t off, ssize_t size, bool populate_cache);
   void update_cache(const void *data, my_off_t off, size_t size) {
     if (cache.off == 0
 	|| cache.off + sizeof(cache.buf) <= off || off + size <= cache.off) {
@@ -366,6 +371,8 @@ public:
 	     min(size - (cache.off - off), sizeof(cache.buf)));
     }
   }
+#endif
+  ssize_t read(void *data, my_off_t off, ssize_t size, bool populate_cache);
   int next(my_off_t *off, my_off_t* row_id);
   template <typename Func> void apply_cond_expr_list(const Func& f) {
     std::for_each(active_cond_expr_list.begin(), active_cond_expr_list.end(),

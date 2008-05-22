@@ -845,6 +845,16 @@ int queue_share_t::write_rows(const void *rows, size_t rows_size)
   return a.err;
 }
 
+#ifdef USE_MT_PREAD
+
+ssize_t queue_share_t::read(void *data, my_off_t off, ssize_t size,
+			    bool populate_cache __attribute__((unused)))
+{
+  return sys_pread(fd, data, size, off);
+}
+
+#else
+
 const void *queue_share_t::read_cache(my_off_t off, ssize_t size,
 				      bool populate_cache)
 {
@@ -877,6 +887,8 @@ ssize_t queue_share_t::read(void *data, my_off_t off, ssize_t size,
   }
   return sys_pread(fd, data, size, off);
 }
+
+#endif
 
 int queue_share_t::next(my_off_t *_off, my_off_t *row_id)
 {
