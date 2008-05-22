@@ -60,7 +60,9 @@ for (my $i = 0; $i < $NUM_CHILDREN; $i++) {
         my $loop = $NUM_MESSAGES / $NUM_CHILDREN;
         open STDOUT, '>', "$$.log" or die $!;
         # use C version if exists
-        { exec('t/05-multireader-read', $loop) };
+        if ($ENV{USE_C_CLIENT}) {
+            exec('t/05-multireader-read', $loop)
+        }
         # use perl version
         $dbh = dbi_connect();
         for (my $j = 0; $j < $loop; $j++) {
@@ -117,14 +119,14 @@ foreach my $pid (@children) {
     }
     close $logfh;
     unlink "$pid.log"
-	unless $ENV{Q4M_TEST_PRESERVE_LOG};
+        unless $ENV{Q4M_TEST_PRESERVE_LOG};
 }
 @recvs = sort { $a <=> $b } uniq @recvs;
 
-is(scalar @recvs, $NUM_MESSAGES);
-is($recvs[0], 1);
-is($recvs[-1], $NUM_MESSAGES);
-is($dbh->selectrow_array('select count(*) from q4m_t'), 0);
+is(scalar @recvs, $NUM_MESSAGES, 'check number of messages');
+is($recvs[0], 1, 'min value of received message');
+is($recvs[-1], $NUM_MESSAGES, 'max value of received message');
+is($dbh->selectrow_array('select count(*) from q4m_t'), 0, 'should have no rows in table');
 
 print STDERR "\n\nMultireader benchmark result:\n";
 printf STDERR "    Number of messages: %d\n", $NUM_MESSAGES;

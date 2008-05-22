@@ -113,7 +113,7 @@ STAT_VALUE(queue_rowid);
 STAT_VALUE(queue_set_srcid);
 #undef STAT_VALUE
 
-#define log(...) (fprintf(stderr, "ha_queue:" __FILE__ ":%d: ", __LINE__), fprintf(stderr, __VA_ARGS__))
+#define log(fmt, ...) fprintf(stderr, "ha_queue:" __FILE__ ":%d: " fmt, __LINE__, ## __VA_ARGS__)
 #define kill_proc(...) (log(__VA_ARGS__), abort(), *(char*)NULL = 1)
 
 inline ssize_t sys_pread(int d, void *b, size_t n, my_off_t o)
@@ -727,7 +727,7 @@ void queue_share_t::wake_listeners()
   while (off != _header.end()) {
     while (find_owner(off) != 0) {
       if (next(&off, &row_id) != 0) {
-	log("internal error, table corrupt?\n");
+	log("internal error, table corrupt? (off:%llu)\n", off);
 	goto UNLOCK_ALL_RETURN;
       } else if (off == _header.end()) {
 	goto UNLOCK_ALL_RETURN;
@@ -761,7 +761,7 @@ void queue_share_t::wake_listeners()
       }
     }
     if (next(&off, &row_id) != 0) {
-      log("internal error, table corrupt?\n");
+      log("internal error, table corrupt? (off:%llu)\n", off);
       goto UNLOCK_ALL_RETURN;
     }
   }
@@ -878,25 +878,28 @@ ssize_t queue_share_t::read(void *data, my_off_t off, ssize_t size,
   return sys_pread(fd, data, size, off);
 }
 
-int queue_share_t::next(my_off_t *off, my_off_t *row_id)
+int queue_share_t::next(my_off_t *_off, my_off_t *row_id)
 {
-  if (*off == _header.end()) {
+  my_off_t off = *_off;
+  
+  if (off == _header.end()) {
     return 0;
   }
   queue_row_t row;
-  if (read(&row, *off, queue_row_t::header_size(), true)
+  if (read(&row, off, queue_row_t::header_size(), true)
       != static_cast<ssize_t>(queue_row_t::header_size())) {
     return -1;
   }
-  *off = row.next(*off);
+  off = row.next(off);
   while (1) {
-    if (*off == _header.end()) {
+    if (off == _header.end()) {
       if (row_id != NULL) {
 	++*row_id;
       }
+      *_off = off;
       return 0;
     }
-    if (read(&row, *off, queue_row_t::header_size(), true)
+    if (read(&row, off, queue_row_t::header_size(), true)
 	!= static_cast<ssize_t>(queue_row_t::header_size())) {
       return -1;
     }
@@ -906,6 +909,7 @@ int queue_share_t::next(my_off_t *off, my_off_t *row_id)
       if (row_id != NULL) {
 	++*row_id;
       }
+      *_off = off;
       return 0;
     case queue_row_t::type_row_removed:
     case queue_row_t::type_row_received_removed:
@@ -919,7 +923,7 @@ int queue_share_t::next(my_off_t *off, my_off_t *row_id)
       }
       break;
     }
-    *off = row.next(*off);
+    off = row.next(off);
   }
 }
 
@@ -1205,6 +1209,7 @@ int queue_share_t::do_remove_rows(my_off_t *offsets, int cnt)
     if (read(&row, off, queue_row_t::header_size(), true)
 	== static_cast<ssize_t>(queue_row_t::header_size())) {
 #ifdef USE_MT_PWRITE
+      num_readers++; // block compaction
       pthread_mutex_unlock(&mutex);
 #endif
       switch (row.type()) {
@@ -1229,6 +1234,7 @@ int queue_share_t::do_remove_rows(my_off_t *offsets, int cnt)
       }
 #ifdef USE_MT_PWRITE
       pthread_mutex_lock(&mutex);
+      --num_readers;
 #endif
       update_cache(&row, off, queue_row_t::header_size());
       bytes_removed += queue_row_t::header_size() + row.size();
