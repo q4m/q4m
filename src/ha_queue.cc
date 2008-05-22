@@ -1499,7 +1499,8 @@ int queue_share_t::compact()
       }
       writer.off = sizeof(queue_file_header_t);
     }
-    tmp_hdr.set_begin(min(writer.off, new_begin), _header.begin_row_id());
+    tmp_hdr.set_begin(max(sizeof(queue_file_header_t), new_begin),
+		      _header.begin_row_id());
     tmp_hdr.set_end(writer.off);
     for (int i = 0; i < QUEUE_MAX_SOURCES; i++) {
       tmp_hdr.set_last_received_offset(i, _header.last_received_offset(i));
