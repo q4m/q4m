@@ -57,9 +57,14 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 
 using namespace std;
 
-#define MIN_ROWS_BUFFER_SIZE (4096)
-#define COMPACT_THRESHOLD (16777216)
-#define EXPAND_BY (1048576)
+#define MIN_ROWS_BUFFER_SIZE (4 * 1024)
+#define COMPACT_THRESHOLD (16 * 1024 * 1024)
+#define EXPAND_BY (4 * 1024 * 1024)
+#if SIZEOF_INTP == 4
+# define MMAP_MAX (1024ULL * 1024 * 1024)
+#else
+# define MMAP_MAX (64ULL * 1024 * 1024 * 1024 * 1024) // 64 terabytes
+#endif
 
 #define DO_COMPACT(all, free) \
     ((all) >= COMPACT_THRESHOLD && (free) * 2 >= (all))
@@ -268,7 +273,7 @@ void queue_share_t::fixup_header()
   my_off_t off = _header.end();
   while (1) {
     queue_row_t row;
-    if (read(&row, off, queue_row_t::header_size(), true)
+    if (read(&row, off, queue_row_t::header_size())
 	!= static_cast<ssize_t>(queue_row_t::header_size())) {
       break;
     }
@@ -284,7 +289,7 @@ void queue_share_t::fixup_header()
   off = _header.begin();
   while (off < _header.end()) {
     queue_row_t row;
-    if (read(&row, off, queue_row_t::header_size(), true)
+    if (read(&row, off, queue_row_t::header_size())
 	!= static_cast<ssize_t>(queue_row_t::header_size())) {
       kill_proc("I/O error: %s\n", table_name);
     }
@@ -293,7 +298,7 @@ void queue_share_t::fixup_header()
       queue_source_t source(0, 0);
       if (read(&source,
 	       off + queue_row_t::header_size() + row.size() - sizeof(source),
-	       sizeof(source), true)
+	       sizeof(source))
 	  != sizeof(source)) {
 	kill_proc("corrupt table: %s\n", table_name);
       }
@@ -309,7 +314,7 @@ void queue_share_t::fixup_header()
   my_off_t row_id = _header.begin_row_id();
   while (off < _header.end()) {
     queue_row_t row;
-    if (read(&row, off, queue_row_t::header_size(), true)
+    if (read(&row, off, queue_row_t::header_size())
 	!= static_cast<ssize_t>(queue_row_t::header_size())) {
       kill_proc("I/O error: %s\n", table_name);
     }
@@ -428,24 +433,23 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   strmov(share->table_name, table_name);
   share->table_name_length = table_name_length;
   pthread_mutex_init(&share->mutex, MY_MUTEX_INIT_FAST);
+  pthread_rwlock_init(&share->rwlock, NULL);
   thr_lock_init(&share->store_lock);
-#ifdef USE_MT_PREAD
-#else
-  share->cache.off = 0;
-#endif
   new (&share->rows_owned) queue_owned_row_list_t();
   new (&share->listener_list) listener_list_t();
-  share->num_readers = 0;
   pthread_cond_init(&share->to_writer_cond, NULL);
   pthread_cond_init(&share->_from_writer_conds[0], NULL);
   pthread_cond_init(&share->_from_writer_conds[1], NULL);
   share->from_writer_cond = &share->_from_writer_conds[0];
+  pthread_cond_init(&share->wake_listener_cond, NULL);
+  share->do_wake_listener = false;
   share->writer_exit = false;
   share->append_list = new append_list_t();
 #if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
 #else
   share->remove_list = new remove_list_t();
 #endif
+  share->do_compact_cond = NULL;
   new (&share->cond_eval) queue_cond_t();
   new (&share->active_cond_expr_list) cond_expr_list_t();
   new (&share->inactive_cond_expr_list) cond_expr_list_t();
@@ -483,9 +487,38 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   if (lseek(share->fd, share->_header.end(), SEEK_SET) == -1) {
     goto ERR_AFTER_FILEOPEN;
   }
-  /* start writer thread */
+  { /* resize file to multiple of EXPAND_BY */
+    struct stat st;
+    if (fstat(share->fd, &st) != 0) {
+      goto ERR_AFTER_FILEOPEN;
+    }
+    if (st.st_size % EXPAND_BY != 0
+	&& ftruncate(share->fd,
+		     (st.st_size + EXPAND_BY - 1) / EXPAND_BY * EXPAND_BY)
+	!= 0) {
+      log("failed to resize file to boundary: %s\n", filename);
+      goto ERR_AFTER_FILEOPEN;
+    }
+  }
+  /* mmap */
+  share->map_len =
+    max(min((share->_header.end() + EXPAND_BY - 1) / EXPAND_BY * EXPAND_BY,
+	    MMAP_MAX),
+	EXPAND_BY);
+  if ((share->map = static_cast<char*>(mmap(NULL, share->map_len, PROT_READ,
+					    MAP_SHARED, share->fd, 0)))
+      == NULL) {
+    log("mmap failed\n");
+    goto ERR_AFTER_MMAP;
+  }
+  /* start threads */
+  if (pthread_create(&share->wake_listener_thread, NULL, _wake_listener_start,
+		     share)
+      != 0) {
+    goto ERR_AFTER_MMAP;
+  }
   if (pthread_create(&share->writer_thread, NULL, _writer_start, share) != 0) {
-    goto ERR_AFTER_FILEOPEN;
+    goto ERR_AFTER_WAKE_LISTENER_START;
   }
   /* add to open_tables */
   if (my_hash_insert(&queue_open_tables, reinterpret_cast<uchar*>(share))) {
@@ -497,10 +530,15 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   
   return share;
   
- ERR_AFTER_WRITER_START:
   share->writer_exit = true;
+ ERR_AFTER_WRITER_START:
   pthread_cond_signal(&share->to_writer_cond);
   pthread_join(share->writer_thread, NULL);
+  ERR_AFTER_WAKE_LISTENER_START:
+  pthread_cond_signal(&share->wake_listener_cond);
+  pthread_join(share->wake_listener_thread, NULL);
+ ERR_AFTER_MMAP:
+  munmap(share->map, share->map_len);
  ERR_AFTER_FILEOPEN:
   close(share->fd);
  ERR_ON_FILEOPEN:
@@ -513,12 +551,14 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   delete share->remove_list;
 #endif
   delete share->append_list;
+  pthread_cond_destroy(&share->wake_listener_cond);
   pthread_cond_destroy(&share->_from_writer_conds[0]);
   pthread_cond_destroy(&share->_from_writer_conds[1]);
   pthread_cond_destroy(&share->to_writer_cond);
   share->listener_list.~list();
   share->rows_owned.~list();
   thr_lock_delete(&share->store_lock);
+  pthread_rwlock_destroy(&share->rwlock);
   pthread_mutex_destroy(&share->mutex);
   my_free(reinterpret_cast<uchar*>(share), MYF(0));
  ERR_RETURN:
@@ -542,6 +582,11 @@ void queue_share_t::release()
     if (pthread_join(writer_thread, NULL) != 0) {
       kill_proc("failed to join writer thread\n");
     }
+    pthread_cond_signal(&wake_listener_cond);
+    if (pthread_join(wake_listener_thread, NULL) != 0) {
+      kill_proc("failed to join wake_listener thread");
+    }
+    munmap(map, map_len);
     _header.write(fd);
     sync_file(fd);
     _header.set_attr(_header.attr() & ~queue_file_header_t::attr_is_dirty);
@@ -562,12 +607,14 @@ void queue_share_t::release()
     delete remove_list;
 #endif
     delete append_list;
+    pthread_cond_destroy(&wake_listener_cond);
     pthread_cond_destroy(&_from_writer_conds[0]);
     pthread_cond_destroy(&_from_writer_conds[1]);
     pthread_cond_destroy(&to_writer_cond);
     listener_list.~list();
     rows_owned.~list();
     thr_lock_delete(&store_lock);
+    pthread_rwlock_destroy(&rwlock);
     pthread_mutex_destroy(&mutex);
     my_free(reinterpret_cast<uchar*>(this), MYF(0));
   }
@@ -668,14 +715,50 @@ bool queue_share_t::init_fixed_fields(TABLE *_table)
   return true;
 }
 
-void queue_share_t::unlock_reader()
+void queue_share_t::lock_reader(bool remap)
 {
-  lock();
-  if (--num_readers == 0
-      && DO_COMPACT(_header.end() - sizeof(_header), bytes_removed)) {
-    pthread_cond_signal(&to_writer_cond);
+  if (map_len < min(_header.end(), MMAP_MAX)) {
+    pthread_rwlock_wrlock(&rwlock);
+    if (map_len < min(_header.end(), MMAP_MAX)) {
+      log("remap: %p -> ", map);
+      munmap(map, map_len);
+      map_len =
+	min((_header.end() + EXPAND_BY - 1) / EXPAND_BY * EXPAND_BY, MMAP_MAX);
+      map = static_cast<char*>(mmap(NULL, map_len, PROT_READ, MAP_SHARED, fd,
+				    0));
+      log("%p\n", map);
+      if (map == NULL) {
+	log("mmap failed: size=%lu\n", static_cast<unsigned long>(map_len));
+      }
+    }
+    pthread_rwlock_unlock(&rwlock);
   }
-  unlock();
+  
+  pthread_rwlock_rdlock(&rwlock);
+}
+
+void queue_share_t::unlock_reader(bool compact)
+{
+  pthread_rwlock_unlock(&rwlock);
+  
+  // trigger compactation
+  if (compact && DO_COMPACT(_header.end() - sizeof(_header), bytes_removed)) {
+    pthread_rwlock_wrlock(&rwlock);
+    if (do_compact_cond == NULL
+        && DO_COMPACT(_header.end() - sizeof(_header), bytes_removed)) {
+      pthread_cond_t c;
+      pthread_cond_init(&c, NULL);
+      lock();
+      do_compact_cond = &c;
+      pthread_cond_signal(&to_writer_cond);
+      while (do_compact_cond != NULL) {
+        pthread_cond_wait(&c, &mutex);
+      }
+      unlock();
+      pthread_cond_destroy(&c);
+    }
+    pthread_rwlock_unlock(&rwlock);
+  }
 }
 
 void queue_share_t::unregister_listener(listener_t *l)
@@ -690,13 +773,14 @@ void queue_share_t::unregister_listener(listener_t *l)
   }
 }
 
-void queue_share_t::wake_listeners()
+void queue_share_t::wake_listeners(bool remap)
 {
   bool use_cond_expr = false;
   my_off_t off = (my_off_t)-1, row_id = 0;
   
-  // note: lock order should always be: listener_mutex -> queue_share_t::mutex
+  /* note: lock order should always be: listener_mutex -> rwlock -> mutex */
   pthread_mutex_lock(&listener_mutex);
+  lock_reader(remap);
   
   // remove listeners with signals received
   listener_list_t::iterator l = listener_list.begin();
@@ -772,6 +856,7 @@ void queue_share_t::wake_listeners()
   unlock();
   
  UNLOCK_G_RETURN:
+  unlock_reader();
   pthread_mutex_unlock(&listener_mutex);
 }
 
@@ -848,50 +933,14 @@ int queue_share_t::write_rows(const void *rows, size_t rows_size)
   return a.err;
 }
 
-#ifdef USE_MT_PREAD
-
-ssize_t queue_share_t::read(void *data, my_off_t off, ssize_t size,
-			    bool populate_cache __attribute__((unused)))
+ssize_t queue_share_t::read(void *data, my_off_t off, ssize_t size)
 {
-  return sys_pread(fd, data, size, off);
-}
-
-#else
-
-const void *queue_share_t::read_cache(my_off_t off, ssize_t size,
-				      bool populate_cache)
-{
-  if (size > static_cast<ssize_t>(sizeof(cache.buf))) {
-    return NULL;
-  }
-  if (cache.off != 0
-      && cache.off <= off && off + size <= cache.off + sizeof(cache.buf)) {
-    stat_read_cachehit.incr();
-    return cache.buf + off - cache.off;
-  }
-  if (! populate_cache) {
-    return NULL;
-  }
-  if (sys_pread(fd, cache.buf, sizeof(cache.buf), off) < size) {
-    cache.off = 0; // invalidate
-    return NULL;
-  }
-  cache.off = off;
-  return cache.buf;
-}
-
-ssize_t queue_share_t::read(void *data, my_off_t off, ssize_t size,
-			    bool populate_cache)
-{
-  const void* cp;
-  if ((cp = read_cache(off, size, populate_cache)) != NULL) {
-    memcpy(data, cp, size);
+  if (off + size <= map_len) {
+    memcpy(data, map + off, size);
     return size;
   }
   return sys_pread(fd, data, size, off);
 }
-
-#endif
 
 int queue_share_t::next(my_off_t *_off, my_off_t *row_id)
 {
@@ -901,7 +950,7 @@ int queue_share_t::next(my_off_t *_off, my_off_t *row_id)
     return 0;
   }
   queue_row_t row;
-  if (read(&row, off, queue_row_t::header_size(), true)
+  if (read(&row, off, queue_row_t::header_size())
       != static_cast<ssize_t>(queue_row_t::header_size())) {
     return -1;
   }
@@ -914,7 +963,7 @@ int queue_share_t::next(my_off_t *_off, my_off_t *row_id)
       *_off = off;
       return 0;
     }
-    if (read(&row, off, queue_row_t::header_size(), true)
+    if (read(&row, off, queue_row_t::header_size())
 	!= static_cast<ssize_t>(queue_row_t::header_size())) {
       return -1;
     }
@@ -979,12 +1028,14 @@ int queue_share_t::remove_rows(my_off_t *offsets, int cnt)
   
 #if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
 #else
+  pthread_mutex_lock(&mutex);
   remove_list->push_back(&r);
   pthread_cond_t *c = from_writer_cond;
   pthread_cond_signal(&to_writer_cond);
   do {
     pthread_cond_wait(c, &mutex);
   } while (r.err == -1);
+  pthread_mutex_unlock(&mutex);
   
   return r.err;
 #endif
@@ -1044,12 +1095,12 @@ int queue_share_t::setup_cond_eval(my_off_t pos)
 {
   /* read row data */
   queue_row_t hdr;
-  if (read(&hdr, pos, queue_row_t::header_size(), true)
+  if (read(&hdr, pos, queue_row_t::header_size())
       != static_cast<ssize_t>(queue_row_t::header_size())) {
     return HA_ERR_CRASHED_ON_USAGE;
   }
   if (read(fixed_buf, pos + queue_row_t::header_size(),
-	   min(hdr.size(), fixed_buf_size), true)
+	   min(hdr.size(), fixed_buf_size))
       != static_cast<ssize_t>(min(hdr.size(), fixed_buf_size))) {
     return HA_ERR_CRASHED_ON_USAGE;
   }
@@ -1199,7 +1250,6 @@ int queue_share_t::writer_do_append(append_list_t *l)
 		      _header.begin_row_id());
   }
   for (vector<iovec>::const_iterator i = iov.begin(); i != iov.end(); ++i) {
-    update_cache(i->iov_base, _header.end(), i->iov_len);
     _header.set_end(_header.end() + i->iov_len);
   }
   for (append_list_t::iterator i = l->begin(); i != l->end(); ++i) {
@@ -1221,12 +1271,8 @@ int queue_share_t::do_remove_rows(my_off_t *offsets, int cnt)
   for (int i = 0; i < cnt && err == 0; i++) {
     queue_row_t row;
     my_off_t off = offsets[i];
-    if (read(&row, off, queue_row_t::header_size(), true)
+    if (read(&row, off, queue_row_t::header_size())
 	== static_cast<ssize_t>(queue_row_t::header_size())) {
-#ifdef USE_MT_PWRITE
-      num_readers++; // block compaction
-      pthread_mutex_unlock(&mutex);
-#endif
       switch (row.type()) {
       case queue_row_t::type_row:
 	row.set_type(queue_row_t::type_row_removed);
@@ -1247,11 +1293,7 @@ int queue_share_t::do_remove_rows(my_off_t *offsets, int cnt)
 	  != static_cast<ssize_t>(queue_row_t::header_size())) {
 	err = HA_ERR_CRASHED_ON_USAGE;
       }
-#ifdef USE_MT_PWRITE
       pthread_mutex_lock(&mutex);
-      --num_readers;
-#endif
-      update_cache(&row, off, queue_row_t::header_size());
       bytes_removed += queue_row_t::header_size() + row.size();
       stat_rows_removed.incr();
       if (_header.begin() == off) {
@@ -1262,6 +1304,7 @@ int queue_share_t::do_remove_rows(my_off_t *offsets, int cnt)
 	  err = HA_ERR_CRASHED_ON_USAGE;
 	}
       }
+      pthread_mutex_unlock(&mutex);
     } else {
       err = HA_ERR_CRASHED_ON_USAGE;
     }
@@ -1277,7 +1320,7 @@ void queue_share_t::writer_do_remove(remove_list_t* l)
   stat_writer_remove.incr();
   remove_list_t::iterator i;
   
-  pthread_mutex_lock(&mutex);
+  lock();
   for (remove_list_t::iterator i = l->begin(); i != l->end(); ++i) {
     remove_t* r = *i;
 #ifdef USE_MT_PWRITE
@@ -1286,7 +1329,7 @@ void queue_share_t::writer_do_remove(remove_list_t* l)
     r->err = do_remove_rows(r->offsets, r->cnt);
 #endif
   }
-  pthread_mutex_unlock(&mutex);
+  unlock();
 }
 #endif
 
@@ -1296,19 +1339,21 @@ void *queue_share_t::writer_start()
   
   while (1) {
     /* wait for signal if we do not have any pending writes */
-    while (append_list->size() == 0
+    while (1) {
+      if (do_compact_cond != NULL) {
+        bytes_removed = 0;
+        compact();
+        pthread_cond_signal(do_compact_cond);
+        do_compact_cond = NULL;
+      } else if (append_list->size() != 0
 #if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
 #else
-	   && remove_list->size() == 0
+		 || remove_list->size() != 0
 #endif
-	   ) {
-      if (writer_exit) {
+		 ) {
+	break;
+      } else if (writer_exit) {
 	goto EXIT;
-      } else if (num_readers == 0
-		 && DO_COMPACT(_header.end() - sizeof(_header),
-			       bytes_removed)) {
-	bytes_removed = 0;
-	compact();
       } else {
 	pthread_cond_wait(&to_writer_cond, &mutex);
       }
@@ -1345,12 +1390,13 @@ void *queue_share_t::writer_start()
       }
       close_append_list(al, err);
       pthread_cond_broadcast(notify_cond);
-      wake_listeners();
-    } else {
+     } else {
       sync_file(fd);
       pthread_cond_broadcast(notify_cond);
     }
     pthread_mutex_lock(&mutex);
+    do_wake_listener = true;
+    pthread_cond_signal(&wake_listener_cond);
   }
   
  EXIT:
@@ -1403,7 +1449,7 @@ struct queue_compact_writer {
   bool copy_data(my_off_t src, size_t sz) {
     off += sz;
     buf.resize(buf.size() + sz);
-    if (share->read(&*buf.begin() + buf.size() - sz, src, sz, false)
+    if (share->read(&*buf.begin() + buf.size() - sz, src, sz)
 	!= static_cast<ssize_t>(sz)) {
       return false;
     }
@@ -1445,7 +1491,7 @@ int queue_share_t::compact()
     rows_removed = 0;
     while (off != _header.end()) {
       queue_row_t row;
-      if (read(&row, off, queue_row_t::header_size(), true)
+      if (read(&row, off, queue_row_t::header_size())
 	  != static_cast<ssize_t>(queue_row_t::header_size())) {
 	log("file corrupt\n");
 	goto ERR_OPEN;
@@ -1505,14 +1551,13 @@ int queue_share_t::compact()
       goto ERR_OPEN;
     }
     writer.flush();
-    /* adjust file size and write position */
+    /* adjust write position if file is empty */
     if (writer.off
 	== sizeof(queue_file_header_t) + queue_row_t::checksum_size()) {
-      if (lseek(tmp_fd, sizeof(queue_file_header_t), SEEK_SET) == -1
-	  || ftruncate(tmp_fd, sizeof(queue_file_header_t)) != 0) {
+      writer.off = sizeof(queue_file_header_t);
+      if (lseek(tmp_fd, sizeof(queue_file_header_t), SEEK_SET) == -1) {
 	goto ERR_OPEN;
       }
-      writer.off = sizeof(queue_file_header_t);
     }
     tmp_hdr.set_begin(max(sizeof(queue_file_header_t), new_begin),
 		      _header.begin_row_id());
@@ -1535,6 +1580,11 @@ int queue_share_t::compact()
 	goto ERR_OPEN;
       }
     }
+    /* adjust file size */
+    if (ftruncate(tmp_fd, (writer.off + EXPAND_BY - 1) / EXPAND_BY * EXPAND_BY)
+	!= 0) {
+      goto ERR_OPEN;
+    }
     /* sync */
     sync_file(tmp_fd);
   }
@@ -1547,16 +1597,22 @@ int queue_share_t::compact()
   if (fsync(tmp_fd) != 0) {
     kill_proc("failed to sync disk\n");
   }
-  /* replace fd */
+  /* replace fd and mmap */
   close(fd);
   fd = tmp_fd;
+  log("remap: %p -> ", map);
+  munmap(map, map_len);
+  map_len =
+    min((tmp_hdr.end() + EXPAND_BY - 1) / EXPAND_BY * EXPAND_BY, MMAP_MAX);
+  map = static_cast<char*>(mmap(NULL, map_len, PROT_READ, MAP_SHARED, fd,
+				0));
+  log("%p\n", map);
+  if (map == NULL) {
+    log("mmap failed: size=%lu\n", static_cast<unsigned long>(map_len));
+  }
   /* update internal info */
   _header = tmp_hdr;
   rows_owned = tmp_rows_owned;
-#ifdef USE_MT_PREAD
-#else
-  cache.off = 0; /* invalidate, since it may go below sizeof(_header) */
-#endif
   apply_cond_expr_list(cond_expr_t::reset_pos());
   
   log("finished table compaction: %s\n", table_name);
@@ -1567,6 +1623,32 @@ int queue_share_t::compact()
   unlink(tmp_filename);
  ERR_RETURN:
   return -1;
+}
+
+void *queue_share_t::wake_listener_start()
+{
+  lock();
+  
+  while (1) {
+    /* signal loop */
+    while (1) {
+      if (do_wake_listener) {
+	do_wake_listener = false;
+	break;
+      } else if (writer_exit) {
+	goto EXIT;
+      }
+      pthread_cond_wait(&wake_listener_cond, &mutex);
+    }
+    /* unlock mutex and wake listeners */
+    unlock();
+    wake_listeners(true);
+    lock();
+  }
+  
+ EXIT:
+  unlock();
+  return NULL;
 }
 
 size_t queue_connection_t::cnt = 0;
@@ -1604,15 +1686,19 @@ int queue_connection_t::close(handlerton *hton, THD *thd)
 void queue_connection_t::erase_owned()
 {
   if (share_owned != NULL) {
+    share_owned->lock_reader();
     share_owned->lock();
     my_off_t off = share_owned->get_owned_row(pthread_self(), NULL);
+    share_owned->unlock();
     if (off != 0) {
       /* note that when the server runs in the order: remove_row -> compact
 	 -> get_owned_row(,,true), the row may be removed by compact() */
       share_owned->remove_rows(&off, 1);
+      share_owned->lock();
       share_owned->get_owned_row(pthread_self(), NULL, true);
+      share_owned->unlock();
     }
-    share_owned->unlock();
+    share_owned->unlock_reader();
     share_owned->release();
     share_owned = NULL;
   }
@@ -1707,35 +1793,37 @@ int ha_queue::rnd_next(uchar *buf)
     if (pos == 0 && (pos = share->get_owned_row(pthread_self(), NULL)) != 0) {
       // ok
     } else {
-      goto EXIT;
+      goto EXIT_UNLOCK;
     }
   } else {
     if (pos == 0) {
       if ((pos = share->header()->begin()) == share->header()->end()) {
-	goto EXIT;
+	goto EXIT_UNLOCK;
       }
     } else {
       if (share->next(&pos, NULL) != 0) {
 	err = HA_ERR_CRASHED_ON_USAGE;
-	goto EXIT;
+	goto EXIT_UNLOCK;
       } else if (pos == share->header()->end()) {
-	goto EXIT;
+	goto EXIT_UNLOCK;
       }
     }
     while (share->find_owner(pos) != 0) {
       if (share->next(&pos, NULL) != 0) {
 	err = HA_ERR_CRASHED_ON_USAGE;
-	goto EXIT;
+	goto EXIT_UNLOCK;
       }
       if (pos == share->header()->end()) {
-	goto EXIT;
+	goto EXIT_UNLOCK;
       }
     }
   }
   
+  share->unlock();
+  
   { /* read data to row buffer */
     queue_row_t hdr;
-    if (share->read(&hdr, pos, queue_row_t::header_size(), true)
+    if (share->read(&hdr, pos, queue_row_t::header_size())
 	!= static_cast<ssize_t>(queue_row_t::header_size())) {
       err = HA_ERR_CRASHED_ON_USAGE;
       goto EXIT;
@@ -1750,7 +1838,7 @@ int ha_queue::rnd_next(uchar *buf)
       err = HA_ERR_OUT_OF_MEM;
       goto EXIT;
     }
-    if (share->read(rows, pos, queue_row_t::header_size() + hdr.size(), false)
+    if (share->read(rows, pos, queue_row_t::header_size() + hdr.size())
 	!= static_cast<ssize_t>(queue_row_t::header_size() + hdr.size())) {
       err = HA_ERR_CRASHED_ON_USAGE;
       goto EXIT;
@@ -1758,12 +1846,12 @@ int ha_queue::rnd_next(uchar *buf)
   }
   
   /* unlock and convert to internal representation */
-  share->unlock();
   unpack_row(buf);
   return 0;
   
- EXIT:
+ EXIT_UNLOCK:
   share->unlock();
+ EXIT:
   return err;
 }
 
@@ -1777,35 +1865,24 @@ int ha_queue::rnd_pos(uchar *buf, uchar *_pos)
   assert(rows_size == 0);
   
   pos = my_get_ptr(_pos, ref_length);
-  int err = 0;
   
-  share->lock();
   /* we should return the row even if it had the deleted flag set during the
    * execution by other threads
    */
   queue_row_t hdr;
-  if (share->read(&hdr, pos, queue_row_t::header_size(), true)
+  if (share->read(&hdr, pos, queue_row_t::header_size())
       != static_cast<ssize_t>(queue_row_t::header_size())) {
-    err = HA_ERR_CRASHED_ON_USAGE;
-    goto EXIT;
+    return HA_ERR_CRASHED_ON_USAGE;
   }
   if (prepare_rows_buffer(queue_row_t::header_size() + hdr.size()) != 0) {
-    err = HA_ERR_OUT_OF_MEM;
-    goto EXIT;
+    return HA_ERR_OUT_OF_MEM;
   }
-  if (share->read(rows, pos, hdr.size(), false)
-      != static_cast<ssize_t>(hdr.size())) {
-    err = HA_ERR_CRASHED_ON_USAGE;
-    goto EXIT;
+  if (share->read(rows, pos, hdr.size()) != static_cast<ssize_t>(hdr.size())) {
+    return HA_ERR_CRASHED_ON_USAGE;
   }
-  share->unlock();
   
   unpack_row(buf);
   return 0;
-  
- EXIT:
-  share->unlock();
-  return err;
 }
 
 int ha_queue::info(uint flag)
@@ -1904,10 +1981,8 @@ int ha_queue::end_bulk_delete()
   
   assert(bulk_delete_rows != NULL);
   if (bulk_delete_rows->size() != 0) {
-    share->lock();
     ret =
       share->remove_rows(&bulk_delete_rows->front(), bulk_delete_rows->size());
-    share->unlock();
   }
   delete bulk_delete_rows;
   bulk_delete_rows = NULL;
@@ -1959,18 +2034,12 @@ int ha_queue::delete_row(const uchar *buf __attribute__((unused)))
 {
   int err = 0;
   
-  share->lock();
-  pthread_t owner = share->find_owner(pos);
-  if (owner != 0 && owner != pthread_self()) {
-    share->unlock();
-    return HA_ERR_RECORD_DELETED;
-  }
   if (bulk_delete_rows != NULL) {
-    share->unlock();
     bulk_delete_rows->push_back(pos);
   } else {
+    share->lock_reader();
     err = share->remove_rows(&pos, 1);
-    share->unlock();
+    share->unlock_reader();
   }
   
   return err;
@@ -2282,6 +2351,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
       *error = 1;
       break;
     }
+    shares[i]->lock_reader();
     shares[i]->lock();
     if ((cond_exprs[i] =
 	 *last != '\0'
@@ -2299,6 +2369,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
   }
   for (int i = 0; i < num_shares && shares[i] != NULL; i++) {
     shares[i]->unlock();
+    shares[i]->unlock_reader();
   }
   if (*error != 0) {
     goto EXIT;
@@ -2307,10 +2378,12 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
     /* not yet found, lock global mutex and check once more */
     pthread_mutex_lock(&listener_mutex);
     for (int i = 0; i < num_shares; i++) {
+      shares[i]->lock_reader();
       shares[i]->lock();
       if (shares[i]->assign_owner(pthread_self(), cond_exprs[i]) != 0) {
 	for (int j = 0; j <= i; j++) {
 	  shares[j]->unlock();
+	  shares[j]->unlock_reader();
 	}
 	share_owned = i;
 	break;
@@ -2322,6 +2395,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
       for (int i = 0; i < num_shares; i++) {
 	shares[i]->register_listener(&listener, cond_exprs[i]);
 	shares[i]->unlock();
+	shares[i]->unlock_reader();
       }
 #ifdef USE_RELATIVE_TIMEDWAIT
       timespec ts = { timeout, 0 };

@@ -239,6 +239,7 @@ public:
 #endif
   };
   typedef std::vector<remove_t*> remove_list_t;
+  pthread_cond_t *do_compact_cond;
   
   struct cond_expr_t {
     queue_cond_t::node_t *node;
@@ -285,36 +286,34 @@ private:
   char *table_name;
   uint table_name_length;
   
-  pthread_mutex_t mutex, append_mutex;
+  /* lock order: rwlock -> mutex
+   */
+  pthread_mutex_t mutex;
+  pthread_rwlock_t rwlock;
+  
   THR_LOCK store_lock;
   
   int fd;
   queue_file_header_t _header;
-  
-#ifdef USE_MT_PREAD
-#else
-  struct {
-    my_off_t off;
-    char buf[4096];
-  } cache;
-#endif
+  char *map;
+  size_t map_len;
   
   queue_owned_row_list_t rows_owned;
   
   listener_list_t listener_list; /* access serialized using listener_mutex */
   
-  int num_readers;
-  
-  pthread_t writer_thread;
+  pthread_t writer_thread, wake_listener_thread;
   pthread_cond_t to_writer_cond;
   pthread_cond_t *from_writer_cond;
   pthread_cond_t _from_writer_conds[2];
-  bool writer_exit;
+  pthread_cond_t wake_listener_cond;
+  bool do_wake_listener, writer_exit;
   append_list_t *append_list;
 #if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
 #else
   remove_list_t *remove_list;
 #endif
+  
   queue_cond_t cond_eval;
   cond_expr_list_t active_cond_expr_list;
   cond_expr_list_t inactive_cond_expr_list;
@@ -336,13 +335,13 @@ public:
   bool init_fixed_fields(TABLE *_table);
   void lock() { pthread_mutex_lock(&mutex); }
   void unlock() { pthread_mutex_unlock(&mutex); }
-  void lock_reader() { lock(); ++num_readers; unlock(); }
-  void unlock_reader();
+  void lock_reader(bool remap = false);
+  void unlock_reader(bool compact = true);
   void register_listener(listener_t *l, cond_expr_t *c) {
     listener_list.push_back(std::make_pair(l, c));
   }
   void unregister_listener(listener_t *l);
-  void wake_listeners();
+  void wake_listeners(bool remap = false);
   static int wait_multi(const std::list<queue_share_t*> &shares,
 			pthread_cond_t *c, time_t t);
   
@@ -353,26 +352,7 @@ public:
   my_off_t reset_owner(pthread_t owner);
   int write_rows(const void *rows, size_t rows_size);
   /* functions below requires lock */
-#ifdef USE_MT_PREAD
-  void update_cache(const void *, my_off_t, size_t) {}
-#else
-  const void *read_cache(my_off_t off, ssize_t size, bool populate_cache);
-  void update_cache(const void *data, my_off_t off, size_t size) {
-    if (cache.off == 0
-	|| cache.off + sizeof(cache.buf) <= off || off + size <= cache.off) {
-      // nothing to do
-    } else if (cache.off <= off) {
-      memcpy(cache.buf + off - cache.off,
-	     data,
-	     min(size, sizeof(cache.buf) - (off - cache.off)));
-    } else {
-      memcpy(cache.buf,
-	     static_cast<const char*>(data) + cache.off - off,
-	     min(size - (cache.off - off), sizeof(cache.buf)));
-    }
-  }
-#endif
-  ssize_t read(void *data, my_off_t off, ssize_t size, bool populate_cache);
+  ssize_t read(void *data, my_off_t off, ssize_t size);
   int next(my_off_t *off, my_off_t* row_id);
   template <typename Func> void apply_cond_expr_list(const Func& f) {
     std::for_each(active_cond_expr_list.begin(), active_cond_expr_list.end(),
@@ -401,6 +381,10 @@ private:
     return static_cast<queue_share_t*>(self)->writer_start();
   }
   int compact();
+  void *wake_listener_start();
+  static void *_wake_listener_start(void *self) {
+    return static_cast<queue_share_t*>(self)->wake_listener_start();
+  }
   queue_share_t();
   ~queue_share_t();
   queue_share_t(const queue_share_t&);

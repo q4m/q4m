@@ -90,16 +90,23 @@ my $start = time;
 
 # start adding messages
 $dbh = dbi_connect();
+my $sth = $dbh->prepare(
+    'insert into q4m_t values '
+        . join(',',
+               map {
+                   '(?' . ($ENV{VAR_LENGTH} ? ',?' : '') . ')'
+               } (1..$BLOCK_SIZE),
+           ),
+) or die $dbh->errstr;
 for (my $i = 0; $i < $NUM_MESSAGES; $i += $BLOCK_SIZE) {
-    $dbh->do(
-        'insert into q4m_t (v' . ($ENV{VAR_LENGTH} ? ',s' : '') . ') values '
-            . join(',',
-                   map {
-                       '(' . ($i + $_) . blob_str() . ')'
-                   } (1..$BLOCK_SIZE)
-               ),
+    $sth->execute(
+        $ENV{VAR_LENGTH}
+            ? map { ($i + $_, 'z' x $ENV{VAR_LENGTH}) } (1..$BLOCK_SIZE)
+                : map { $i + $_ } (1..$BLOCK_SIZE),
     ) or die $dbh->errstr;
 }
+
+print STDERR "insertion complete\n";
 
 # wait until all subscribers stop
 for (my $i = 0; $i < $NUM_CHILDREN; $i++) {
