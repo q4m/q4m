@@ -22,16 +22,20 @@ sub dbi_connect {
         or die 'connection failed:';
 }
 
-# create table
+# create tables (q4m_t2 used to notify consumers to start operation)
 my $dbh = dbi_connect();
 $dbh->do('drop table if exists q4m_t')
+    or die $dbh->errstr;
+$dbh->do('drop table if exists q4m_t2')
     or die $dbh->errstr;
 $dbh->do(
     'create table q4m_t (v int not null'
         . ($ENV{VAR_LENGTH} ? ',s longtext not null' : '')
-            . ') engine=queue'
-        )
-    or die $dbh->errstr;
+            . ') engine=queue',
+) or die $dbh->errstr;
+$dbh->do(
+    'create table q4m_t2 (v int not null) engine=queue',
+) or die $dbh->errstr;
 $dbh->disconnect;
 
 # parse DBI string to be passed to C version of reader
@@ -65,9 +69,14 @@ for (my $i = 0; $i < $NUM_CHILDREN; $i++) {
         }
         # use perl version
         $dbh = dbi_connect();
+        while (1) {
+            my @w = $dbh->selectrow_array("select queue_wait('q4m_t2')")
+                or die $dbh->errstr;
+            last if $w[0];
+        }
         for (my $j = 0; $j < $loop; $j++) {
             while (1) {
-                my @w = $dbh->selectrow_array("select queue_wait('test.q4m_t')")
+                my @w = $dbh->selectrow_array("select queue_wait('q4m_t')")
                     or die $dbh->errstr;
                 last if $w[0];
                 print STDERR "queue_wait timeout\n";
@@ -85,8 +94,6 @@ sub blob_str {
     return '' unless $ENV{VAR_LENGTH};
     q(,') . ('z' x $ENV{VAR_LENGTH}) . q(');
 }
-
-my $start = time;
 
 # start adding messages
 $dbh = dbi_connect();
@@ -106,7 +113,13 @@ for (my $i = 0; $i < $NUM_MESSAGES; $i += $BLOCK_SIZE) {
     ) or die $dbh->errstr;
 }
 
-print STDERR "insertion complete\n";
+my $start = time;
+
+# notify all clients to start
+$dbh->do(
+    'insert into q4m_t2 values '
+        . join (',', map { '(1)' } (1..$NUM_CHILDREN)),
+) or die $dbh->errstr;
 
 # wait until all subscribers stop
 for (my $i = 0; $i < $NUM_CHILDREN; $i++) {

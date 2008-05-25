@@ -54,6 +54,17 @@ int main(int argc, char **argv)
     exit(2);
   }
   
+  /* wait until q4m_t2 becomes readable */
+  while (1) {
+    res = do_select("SELECT queue_wait('q4m_t2')");
+    if (mysql_num_rows(res) == 0) {
+      fprintf(stderr, "unexpected response from queue_wait\n");
+      exit(3);
+    }
+    if (strcmp(mysql_fetch_row(res)[0], "0") != 0) {
+      break;
+    }
+  }
   for (i = 0; i < loop; i++) {
     /* queue_wait */
     res = do_select("SELECT queue_wait('q4m_t')");
