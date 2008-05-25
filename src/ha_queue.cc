@@ -67,7 +67,7 @@ using namespace std;
 #endif
 
 #define DO_COMPACT(all, free) \
-    ((all) >= COMPACT_THRESHOLD && (free) * 2 >= (all))
+  ((all) >= COMPACT_THRESHOLD && (free) * 4 >= (all) * 3)
 #define Q4M ".Q4M"
 #define Q4T ".Q4T"
 
@@ -720,13 +720,11 @@ void queue_share_t::lock_reader(bool remap)
   if (map_len < min(_header.end(), MMAP_MAX)) {
     pthread_rwlock_wrlock(&rwlock);
     if (map_len < min(_header.end(), MMAP_MAX)) {
-      log("remap: %p -> ", map);
       munmap(map, map_len);
       map_len =
 	min((_header.end() + EXPAND_BY - 1) / EXPAND_BY * EXPAND_BY, MMAP_MAX);
       map = static_cast<char*>(mmap(NULL, map_len, PROT_READ, MAP_SHARED, fd,
 				    0));
-      log("%p\n", map);
       if (map == NULL) {
 	log("mmap failed: size=%lu\n", static_cast<unsigned long>(map_len));
       }
@@ -1598,13 +1596,11 @@ int queue_share_t::compact()
   /* replace fd and mmap */
   close(fd);
   fd = tmp_fd;
-  log("remap: %p -> ", map);
   munmap(map, map_len);
   map_len =
     min((tmp_hdr.end() + EXPAND_BY - 1) / EXPAND_BY * EXPAND_BY, MMAP_MAX);
   map = static_cast<char*>(mmap(NULL, map_len, PROT_READ, MAP_SHARED, fd,
 				0));
-  log("%p\n", map);
   if (map == NULL) {
     log("mmap failed: size=%lu\n", static_cast<unsigned long>(map_len));
   }
