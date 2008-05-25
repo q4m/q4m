@@ -1594,9 +1594,7 @@ int queue_share_t::compact()
     goto ERR_OPEN;
   }
   // is the directory entry synced with fsync?
-  if (fsync(tmp_fd) != 0) {
-    kill_proc("failed to sync disk\n");
-  }
+  sync_file(tmp_fd);
   /* replace fd and mmap */
   close(fd);
   fd = tmp_fd;
