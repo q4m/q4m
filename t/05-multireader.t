@@ -113,6 +113,8 @@ for (my $i = 0; $i < $NUM_MESSAGES; $i += $BLOCK_SIZE) {
     ) or die $dbh->errstr;
 }
 
+print STDERR "starting...\n"
+    if $ENV{VERBOSE};
 my $start = time;
 
 # notify all clients to start

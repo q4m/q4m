@@ -230,7 +230,7 @@ public:
   
   struct remove_t {
     int err; /* -1 if not completed, otherwise HA_ERR_XXX or 0 */
-#ifdef USE_MT_PWRITE
+#ifdef Q4M_USE_MT_PWRITE
     remove_t() : err(-1) {}
 #else
     my_off_t *offsets;
@@ -295,8 +295,10 @@ private:
   
   int fd;
   queue_file_header_t _header;
+#ifdef Q4M_USE_MMAP
   char *map;
   size_t map_len;
+#endif
   
   queue_owned_row_list_t rows_owned;
   
@@ -309,7 +311,7 @@ private:
   pthread_cond_t wake_listener_cond;
   bool do_wake_listener, writer_exit;
   append_list_t *append_list;
-#if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
+#if defined(Q4M_USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
 #else
   remove_list_t *remove_list;
 #endif
@@ -372,7 +374,7 @@ public:
 private:
   int writer_do_append(append_list_t *l);
   int do_remove_rows(my_off_t *offsets, int cnt);
-#if defined(USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
+#if defined(Q4M_USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
 #else
   void writer_do_remove(remove_list_t *l);
 #endif

@@ -74,16 +74,6 @@ fi
 ],
     [ with_debug=no ])
 
-AC_ARG_WITH(mt_pwrite,
-    [   --with-mt-pwrite=yes    do not serialize pwrite (default)
-   --with-mt-pwrite=no     serialize pwrite ],
-    [ with_mt_pwrite=$withval ],
-    [ with_mt_pwrite=yes ])
-if test "$with_mt_pwrite" = "yes"
-then
-    AC_DEFINE([USE_MT_PWRITE],1,[do not serialize pwrite])
-fi
-
 AC_ARG_WITH(sync,
     [   --with-sync=yes         commit to disk at checkpoints (default)
    --with-sync=no          do not commit explicitly to disk
@@ -111,8 +101,18 @@ no)
     ;;
 esac
 
+dnl no support for disabling the feature
+AC_DEFINE([Q4M_USE_MT_PWRITE],1,[do not serialize pwrite])
+
+AC_ARG_ENABLE(mmap,
+    [   --enable-mmap           use mmap for reading data (default:yes)])
+if test "$enable_mmap" != "no"
+then
+    AC_DEFINE([Q4M_USE_MMAP],1,[use mmap for reading data])
+fi
+    
 if test "$OSNAME" = "darwin" ; then
-    AC_DEFINE([USE_RELATIVE_TIMEDWAIT],1,[use pthread_cond_timedwait_relative_np])
+    AC_DEFINE([Q4M_USE_RELATIVE_TIMEDWAIT],1,[use pthread_cond_timedwait_relative_np])
 fi
 
 if test -z "$DOC_ROOT"
