@@ -18,6 +18,7 @@
 #ifndef HA_QUEUE_H
 #define HA_QUEUE_H
 
+#include "dllist.h"
 #include "queue_cond.h"
 
 // error numbers should be less than HA_ERR_FIRST
@@ -91,6 +92,9 @@ public:
 			      uint32_t adler);
   // my_free should be used on deallocation
   static queue_row_t *create_checksum(const iovec* iov, int iovcnt);
+  static void copy_flags(queue_row_t *dst, const queue_row_t *src) {
+    dst->_size[3] = src->_size[3];
+  }
 private:
   queue_row_t(const queue_row_t&);
   queue_row_t& operator=(const queue_row_t&);
@@ -201,15 +205,7 @@ public:
   }
 };
 
-struct queue_owned_row_t {
-  pthread_t owner;
-  my_off_t off;
-  my_off_t row_id;
-  queue_owned_row_t(pthread_t ow, my_off_t o, my_off_t i)
-  : owner(ow), off(o), row_id(i) {}
-};
-
-typedef std::list<queue_owned_row_t> queue_owned_row_list_t;
+struct queue_connection_t;
 
 class queue_share_t {
   
@@ -241,7 +237,7 @@ public:
   typedef std::vector<remove_t*> remove_list_t;
   pthread_cond_t *do_compact_cond;
   
-  struct cond_expr_t {
+  struct cond_expr_t : public dllist<cond_expr_t> {
     queue_cond_t::node_t *node;
     char *expr;
     size_t expr_len;
@@ -250,11 +246,15 @@ public:
     my_off_t row_id;
     cond_expr_t(queue_cond_t::node_t *n, const char *e, size_t el, my_off_t p,
 		my_off_t i)
-    : node(n), expr(new char [el]), expr_len(el), ref_cnt(1), pos(p), row_id(i)
+    : dllist<cond_expr_t>(), node(n), expr(new char [el]), expr_len(el),
+      ref_cnt(1), pos(p), row_id(i)
     {
       std::copy(e, e + el, expr);
     }
-    void free_data() {
+    void free(cond_expr_t **list) {
+      if (list != NULL) {
+	detach(*list);
+      }
       delete expr;
       expr = NULL;
       delete node;
@@ -266,13 +266,11 @@ public:
       }
     };
   };
-  typedef std::list<cond_expr_t> cond_expr_list_t;
   
   struct listener_t {
     pthread_cond_t cond;
-    queue_share_t *signalled_by;
-    pthread_t listener;
-    listener_t(const pthread_t& t) : signalled_by(NULL), listener(t) {
+    queue_connection_t *listener;
+    listener_t(queue_connection_t *t) : listener(t) {
       pthread_cond_init(&cond, NULL);
     }
     ~listener_t() {
@@ -300,7 +298,8 @@ private:
   size_t map_len;
 #endif
   
-  queue_owned_row_list_t rows_owned;
+  queue_connection_t *rows_owned;
+  my_off_t max_owned_row_off;
   
   listener_list_t listener_list; /* access serialized using listener_mutex */
   
@@ -317,8 +316,9 @@ private:
 #endif
   
   queue_cond_t cond_eval;
-  cond_expr_list_t active_cond_expr_list;
-  cond_expr_list_t inactive_cond_expr_list;
+  cond_expr_t *active_cond_exprs;
+  cond_expr_t *inactive_cond_exprs;
+  size_t inactive_cond_expr_cnt;
   cond_expr_t cond_expr_true;
   my_off_t bytes_removed;
   /* following fields are for V2 type table only */
@@ -330,6 +330,9 @@ private:
   
 public:
   void fixup_header();
+#ifdef Q4M_USE_MMAP
+  int mmap_table(size_t new_size);
+#endif
   static uchar *get_share_key(queue_share_t *share, size_t *length,
 			      my_bool not_used);
   static queue_share_t *get_share(const char* table_name);
@@ -344,30 +347,34 @@ public:
   }
   void unregister_listener(listener_t *l);
   void wake_listeners(bool remap = false);
-  static int wait_multi(const std::list<queue_share_t*> &shares,
-			pthread_cond_t *c, time_t t);
   
   const char *get_table_name() const { return table_name; }
   THR_LOCK *get_store_lock() { return &store_lock; }
   const queue_file_header_t *header() const { return &_header; }
   queue_fixed_field_t * const *get_fixed_fields() const { return fixed_fields; }
-  my_off_t reset_owner(pthread_t owner);
+  my_off_t reset_owner(queue_connection_t *conn);
   int write_rows(const void *rows, size_t rows_size);
   /* functions below requires lock */
   ssize_t read(void *data, my_off_t off, ssize_t size);
   int next(my_off_t *off, my_off_t* row_id);
-  template <typename Func> void apply_cond_expr_list(const Func& f) {
-    std::for_each(active_cond_expr_list.begin(), active_cond_expr_list.end(),
-		  f);
-    std::for_each(inactive_cond_expr_list.begin(),
-		  inactive_cond_expr_list.end(), f);
+  template <typename Func> void apply_cond_exprs(const Func& f) {
+    cond_expr_t *e;
+    if ((e = active_cond_exprs) != NULL) {
+      do {
+	f(*e);
+      } while ((e = e->next()) != active_cond_exprs);
+    }
+    if ((e = inactive_cond_exprs) != NULL) {
+      do {
+	f(*e);
+      } while ((e = e->next()) != inactive_cond_exprs);
+    }
     f(cond_expr_true);
   }
-  my_off_t get_owned_row(pthread_t owner, my_off_t *row_id,
-			 bool remove = false);
   int remove_rows(my_off_t *offsets, int cnt);
-  pthread_t find_owner(my_off_t off);
-  my_off_t assign_owner(pthread_t owner, cond_expr_t *cond_expr);
+  void remove_owner(queue_connection_t *conn);
+  queue_connection_t *find_owner(my_off_t off);
+  my_off_t assign_owner(queue_connection_t *conn, cond_expr_t *cond_expr);
   int setup_cond_eval(my_off_t pos);
   cond_expr_t* compile_cond_expr(const char *expr, size_t len);
   void release_cond_expr(cond_expr_t *e);
@@ -395,9 +402,13 @@ private:
   friend struct queue_reset_owner_update_cond_expr;
 };
 
-struct queue_connection_t {
+struct queue_connection_t : private dllist<queue_connection_t> {
+  friend class dllist<queue_connection_t>;
   bool owner_mode;
   queue_share_t *share_owned;
+  my_off_t owned_row_off;
+  my_off_t owned_row_id;
+  my_off_t owned_row_off_post_compact;
   queue_source_t source;
   bool reset_source;
   void erase_owned();
@@ -406,8 +417,20 @@ struct queue_connection_t {
   static int close(handlerton *hton, THD *thd);
 private:
   queue_connection_t()
-  : owner_mode(false), share_owned(NULL), source(0, 0), reset_source(false) {}
+    : dllist<queue_connection_t>(), owner_mode(false), share_owned(NULL),
+      owned_row_off(0), owned_row_id(0), owned_row_off_post_compact(0),
+      source(0, 0), reset_source(false) {}
   ~queue_connection_t() {}
+public:
+  void add_to_owned_list(queue_connection_t *&head) {
+    attach_back(head);
+  }
+  queue_connection_t *remove_from_owned_list(queue_connection_t *&head) {
+    return detach(head);
+  }
+  queue_connection_t *next_owned() {
+    return next();
+  }
 };
 
 class ha_queue: public handler
@@ -469,7 +492,7 @@ class ha_queue: public handler
   int delete_row(const uchar *buf);
  private:
   int prepare_rows_buffer(size_t sz);
-  void free_rows_buffer();
+  void free_rows_buffer(bool force = false);
   void unpack_row(uchar *buf);
   size_t pack_row(uchar *buf, queue_source_t *source);
 };

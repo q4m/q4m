@@ -110,7 +110,19 @@ if test "$enable_mmap" != "no"
 then
     AC_DEFINE([Q4M_USE_MMAP],1,[use mmap for reading data])
 fi
-    
+
+AC_ARG_ENABLE(mmap_writes,
+    [   --enable-mmap-writes    permit write through mmap (default:no)])
+if test "$enable_mmap_writes" = "yes"
+then
+    if test "$enable_mmap" != "yes"
+    then
+        echo "--enable-mmap-writes requires --enable-mmap to be set" >&2
+        exit 1
+    fi
+    AC_DEFINE([Q4M_USE_MMAP_WRITES],1,[write through mmap])
+fi
+
 if test "$OSNAME" = "darwin" ; then
     AC_DEFINE([Q4M_USE_RELATIVE_TIMEDWAIT],1,[use pthread_cond_timedwait_relative_np])
 fi

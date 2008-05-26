@@ -58,6 +58,7 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 using namespace std;
 
 #define MIN_ROWS_BUFFER_SIZE (4 * 1024)
+#define FREE_ROWS_BUFFER_SIZE (64 * 1024)
 #define COMPACT_THRESHOLD (16 * 1024 * 1024)
 #define EXPAND_BY (4 * 1024 * 1024)
 #if SIZEOF_INTP == 4
@@ -342,6 +343,24 @@ void queue_share_t::fixup_header()
   sync_file(fd);
 }
 
+#ifdef Q4M_USE_MMAP
+int queue_share_t::mmap_table(size_t new_size)
+{
+  if (map != NULL) {
+    munmap(map, map_len);
+    map_len = 0;
+  }
+  if ((map = static_cast<char*>(mmap(NULL, new_size,
+				     PROT_READ | PROT_WRITE,
+				     MAP_SHARED, fd, 0)))
+      == NULL) {
+    return -1;
+  }
+  map_len = new_size;
+  return 0;
+}
+#endif
+
 static bool load_table(TABLE *table, const char *db_table_name)
 {
   // precondition: LOCK_open should be acquired
@@ -435,7 +454,8 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   pthread_mutex_init(&share->mutex, MY_MUTEX_INIT_FAST);
   pthread_rwlock_init(&share->rwlock, NULL);
   thr_lock_init(&share->store_lock);
-  new (&share->rows_owned) queue_owned_row_list_t();
+  share->rows_owned = NULL;
+  share->max_owned_row_off = 0;
   new (&share->listener_list) listener_list_t();
   pthread_cond_init(&share->to_writer_cond, NULL);
   pthread_cond_init(&share->_from_writer_conds[0], NULL);
@@ -451,8 +471,9 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
 #endif
   share->do_compact_cond = NULL;
   new (&share->cond_eval) queue_cond_t();
-  new (&share->active_cond_expr_list) cond_expr_list_t();
-  new (&share->inactive_cond_expr_list) cond_expr_list_t();
+  share->active_cond_exprs = NULL;
+  share->inactive_cond_exprs = NULL;
+  share->inactive_cond_expr_cnt = 0;
   new (&share->cond_expr_true)
     cond_expr_t(new queue_cond_t::const_node_t
 		(queue_cond_t::value_t::int_value(1)), "1", 1, 0, 0);
@@ -502,13 +523,11 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   }
 #ifdef Q4M_USE_MMAP
   /* mmap */
-  share->map_len =
-    max(min((share->_header.end() + EXPAND_BY - 1) / EXPAND_BY * EXPAND_BY,
-	    MMAP_MAX),
-	EXPAND_BY);
-  if ((share->map = static_cast<char*>(mmap(NULL, share->map_len, PROT_READ,
-					    MAP_SHARED, share->fd, 0)))
-      == NULL) {
+  if (share->mmap_table(max(min((share->_header.end() + EXPAND_BY - 1)
+				/ EXPAND_BY * EXPAND_BY,
+				MMAP_MAX),
+			    EXPAND_BY))
+      != 0) {
     log("mmap failed\n");
     goto ERR_AFTER_MMAP;
   }
@@ -546,9 +565,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
  ERR_AFTER_FILEOPEN:
   close(share->fd);
  ERR_ON_FILEOPEN:
-  share->cond_expr_true.free_data();
-  share->inactive_cond_expr_list.~cond_expr_list_t();
-  share->active_cond_expr_list.~cond_expr_list_t();
+  share->cond_expr_true.free(NULL);
   share->cond_eval.~queue_cond_t();
 #if defined(Q4M_USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
 #else
@@ -560,7 +577,6 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   pthread_cond_destroy(&share->_from_writer_conds[1]);
   pthread_cond_destroy(&share->to_writer_cond);
   share->listener_list.~list();
-  share->rows_owned.~list();
   thr_lock_delete(&share->store_lock);
   pthread_rwlock_destroy(&share->rwlock);
   pthread_mutex_destroy(&share->mutex);
@@ -599,14 +615,10 @@ void queue_share_t::release()
     _header.write(fd);
     sync_file(fd);
     close(fd);
-    cond_expr_true.free_data();
-    for (cond_expr_list_t::iterator i = inactive_cond_expr_list.begin();
-	 i != inactive_cond_expr_list.end();
-	 ++i) {
-      i->free_data();
+    cond_expr_true.free(NULL);
+    while (inactive_cond_exprs != NULL) {
+      inactive_cond_exprs->free(&inactive_cond_exprs);
     }
-    inactive_cond_expr_list.~cond_expr_list_t();
-    active_cond_expr_list.~cond_expr_list_t();
     cond_eval.~queue_cond_t();
 #if defined(Q4M_USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
 #else
@@ -618,7 +630,6 @@ void queue_share_t::release()
     pthread_cond_destroy(&_from_writer_conds[1]);
     pthread_cond_destroy(&to_writer_cond);
     listener_list.~list();
-    rows_owned.~list();
     thr_lock_delete(&store_lock);
     pthread_rwlock_destroy(&rwlock);
     pthread_mutex_destroy(&mutex);
@@ -727,12 +738,10 @@ void queue_share_t::lock_reader(bool remap)
   if (map_len < min(_header.end(), MMAP_MAX)) {
     pthread_rwlock_wrlock(&rwlock);
     if (map_len < min(_header.end(), MMAP_MAX)) {
-      munmap(map, map_len);
-      map_len =
-	min((_header.end() + EXPAND_BY - 1) / EXPAND_BY * EXPAND_BY, MMAP_MAX);
-      map = static_cast<char*>(mmap(NULL, map_len, PROT_READ, MAP_SHARED, fd,
-				    0));
-      if (map == NULL) {
+      if (mmap_table(min((_header.end() + EXPAND_BY - 1) / EXPAND_BY
+			 * EXPAND_BY,
+			 MMAP_MAX))
+	  != 0) {
 	log("mmap failed: size=%lu\n", static_cast<unsigned long>(map_len));
       }
     }
@@ -791,7 +800,7 @@ void queue_share_t::wake_listeners(bool remap)
   // remove listeners with signals received
   listener_list_t::iterator l = listener_list.begin();
   while (l != listener_list.end()) {
-    if (l->first->signalled_by != NULL) {
+    if (l->first->listener->share_owned != NULL) {
       l = listener_list.erase(l);
     } else {
       if (l->second != &cond_expr_true) {
@@ -842,9 +851,12 @@ void queue_share_t::wake_listeners(bool remap)
 	}
       }
       if (found) {
-	rows_owned.push_back(queue_owned_row_t(l->first->listener, off,
-					       row_id));
-	l->first->signalled_by = this;
+	queue_connection_t *conn = l->first->listener;
+	conn->share_owned = this;
+	conn->owned_row_off = off;
+	conn->owned_row_id = row_id;
+	conn->add_to_owned_list(rows_owned);
+	max_owned_row_off = max(off, max_owned_row_off);
 	pthread_cond_signal(&l->first->cond);
 	listener_list.erase(l);
 	if (listener_list.size() == 0) {
@@ -882,25 +894,17 @@ struct queue_reset_owner_update_cond_expr {
   }
 };
 
-my_off_t queue_share_t::reset_owner(pthread_t owner)
+my_off_t queue_share_t::reset_owner(queue_connection_t *conn)
 {
   my_off_t off = 0;
   lock();
   
   // find the row to be released, and remove it from owner list
-  for (queue_owned_row_list_t::iterator i = rows_owned.begin();
-       i != rows_owned.end();
-       ++i) {
-    if (i->owner == owner) {
-      off = i->off;
-      rows_owned.erase(i);
-      break;
-    }
-  }
-  // update positions of cond_expr_list
-  if (off != 0) {
+  if (conn->share_owned != NULL) {
+    conn->remove_from_owned_list(rows_owned);
+    off = conn->owned_row_off;
     if (setup_cond_eval(off) == 0) {
-      apply_cond_expr_list(queue_reset_owner_update_cond_expr(this, off));
+      apply_cond_exprs(queue_reset_owner_update_cond_expr(this, off));
     }
   }
   
@@ -999,26 +1003,6 @@ int queue_share_t::next(my_off_t *_off, my_off_t *row_id)
   }
 }
 
-my_off_t queue_share_t::get_owned_row(pthread_t owner, my_off_t *row_id,
-				      bool remove)
-{
-  for (queue_owned_row_list_t::iterator i = rows_owned.begin();
-       i != rows_owned.end();
-       ++i) {
-    if (i->owner == owner) {
-      my_off_t off = i->off;
-      if (row_id != NULL) {
-	*row_id = i->row_id;
-      }
-      if (remove) {
-	rows_owned.erase(i);
-      }
-      return off;
-    }
-  }
-  return 0;
-}
-
 int queue_share_t::remove_rows(my_off_t *offsets, int cnt)
 {
 #ifdef Q4M_USE_MT_PWRITE
@@ -1049,19 +1033,32 @@ int queue_share_t::remove_rows(my_off_t *offsets, int cnt)
 #endif
 }
 
-pthread_t queue_share_t::find_owner(my_off_t off)
+void queue_share_t::remove_owner(queue_connection_t *conn)
 {
-  for (queue_owned_row_list_t::const_iterator j = rows_owned.begin();
-       j != rows_owned.end();
-       ++j) {
-    if (off == j->off) {
-      return j->owner;
-    }
-  }
-  return 0;
+  conn->remove_from_owned_list(rows_owned);
 }
 
-my_off_t queue_share_t::assign_owner(pthread_t owner, cond_expr_t *cond_expr)
+queue_connection_t *queue_share_t::find_owner(my_off_t off)
+{
+  if (max_owned_row_off < off) {
+    return NULL;
+  }
+  queue_connection_t *c = rows_owned;
+  if (c != NULL) {
+    do {
+      my_off_t owned_off = c->owned_row_off;
+      max_owned_row_off = max(max_owned_row_off, owned_off);
+      if (off == owned_off) {
+	return c;
+      }
+      c = c->next_owned();
+    } while (c != rows_owned);
+  }
+  return NULL;
+}
+
+my_off_t queue_share_t::assign_owner(queue_connection_t *conn,
+				     cond_expr_t *cond_expr)
 {
   my_off_t off = cond_expr->pos, row_id = cond_expr->row_id;
   if (off == 0) {
@@ -1095,7 +1092,11 @@ my_off_t queue_share_t::assign_owner(pthread_t owner, cond_expr_t *cond_expr)
   return 0;
   
  FOUND:
-  rows_owned.push_back(queue_owned_row_t(owner, off, row_id));
+  conn->share_owned = this;
+  conn->owned_row_off = off;
+  conn->owned_row_id = row_id;
+  conn->add_to_owned_list(rows_owned);
+  max_owned_row_off = max(max_owned_row_off, off);
   return off;
 }
 
@@ -1133,6 +1134,8 @@ int queue_share_t::setup_cond_eval(my_off_t pos)
 queue_share_t::cond_expr_t *
 queue_share_t::compile_cond_expr(const char *expr, size_t len)
 {
+  cond_expr_t *e;
+  
   if (expr == NULL) {
     return &cond_expr_true;
   }
@@ -1140,26 +1143,26 @@ queue_share_t::compile_cond_expr(const char *expr, size_t len)
   stat_cond_compile.incr();
   
   // return an existing one, if any
-  for (cond_expr_list_t::iterator i = active_cond_expr_list.begin();
-       i != active_cond_expr_list.end();
-       ++i) {
-    if (i->expr_len == len && memcmp(i->expr, expr, len) == 0) {
-      i->ref_cnt++;
-      stat_cond_compile_cachehit.incr();
-      return &*i;
-    }
+  if ((e = active_cond_exprs) != NULL) {
+    do {
+      if (e->expr_len == len && memcmp(e->expr, expr, len) == 0) {
+	e->ref_cnt++;
+	stat_cond_compile_cachehit.incr();
+	return e;
+      }
+    } while ((e = e->next()) != active_cond_exprs);
   }
-  for (cond_expr_list_t::iterator i = inactive_cond_expr_list.begin();
-       i != inactive_cond_expr_list.end();
-       ++i) {
-    if (i->expr_len == len && memcmp(i->expr, expr, len) == 0) {
-      active_cond_expr_list.push_back(*i);
-      inactive_cond_expr_list.erase(i);
-      cond_expr_t *e = &active_cond_expr_list.back();
-      e->ref_cnt++;
-      stat_cond_compile_cachehit.incr();
-      return e;
-    }
+  if ((e = inactive_cond_exprs) != NULL) {
+    do {
+      if (e->expr_len == len && memcmp(e->expr, expr, len) == 0) {
+	e->detach(inactive_cond_exprs);
+	inactive_cond_expr_cnt--;
+	e->attach_front(active_cond_exprs);
+	e->ref_cnt++;
+	stat_cond_compile_cachehit.incr();
+	return e;
+      }
+    } while ((e = e->next()) != inactive_cond_exprs);
   }
   
   // compile and return
@@ -1167,27 +1170,27 @@ queue_share_t::compile_cond_expr(const char *expr, size_t len)
   if (n == NULL) {
     return NULL;
   }
-  active_cond_expr_list.push_back(cond_expr_t(n, expr, len, 0, 0));
-  return &active_cond_expr_list.back();
+  e = new cond_expr_t(n, expr, len, 0, 0);
+  e->attach_front(active_cond_exprs);
+  return e;
 }
 
 void queue_share_t::release_cond_expr(cond_expr_t *e)
 {
-  if (e != &cond_expr_true && --e->ref_cnt == 0) {
-    for (cond_expr_list_t::iterator i = active_cond_expr_list.begin();
-	 i != active_cond_expr_list.end();
-	 ++i) {
-      if (&*i == e) {
-	inactive_cond_expr_list.push_front(*i);
-	active_cond_expr_list.erase(i);
-	break;
-      }
-    }
-    while (inactive_cond_expr_list.size() >= 100) {
-      inactive_cond_expr_list.back().free_data();
-      inactive_cond_expr_list.pop_back();
+  if (e == &cond_expr_true) {
+    return;
+  }
+  
+  lock();
+  if (--e->ref_cnt == 0) {
+    e->detach(active_cond_exprs);
+    e->attach_front(inactive_cond_exprs);
+    if (++inactive_cond_expr_cnt > 100) {
+      inactive_cond_exprs->prev()->free(&inactive_cond_exprs);
+      inactive_cond_expr_cnt--;
     }
   }
+  unlock();
 }
 
 static void close_append_list(queue_share_t::append_list_t *l, int err)
@@ -1297,6 +1300,27 @@ int queue_share_t::do_remove_rows(my_off_t *offsets, int cnt)
 	err = HA_ERR_CRASHED_ON_USAGE;
 	break;
       }
+#ifdef Q4M_USE_MMAP_WRITES
+      if (off + queue_row_t::header_size() <= map_len) {
+	queue_row_t::copy_flags(reinterpret_cast<queue_row_t*>(map + off),
+				&row);
+	static ptrdiff_t psz_mask;
+	if (psz_mask == 0) {
+	  lock();
+	  if (psz_mask == 0) {
+	    psz_mask = ~ static_cast<ptrdiff_t>(getpagesize() - 1);
+	  }
+	  unlock();
+	}
+	char* page = static_cast<char*>(NULL)
+	  + (reinterpret_cast<ptrdiff_t>(map + off) & psz_mask);
+	if (msync(page, map + off - page + queue_row_t::header_size(), MS_ASYNC)
+	    != 0) {
+	  log("msync failed\n");
+	  err = HA_ERR_CRASHED_ON_USAGE;
+	}
+      } else
+#endif
       if (sys_pwrite(fd, &row, queue_row_t::header_size(), off)
 	  != static_cast<ssize_t>(queue_row_t::header_size())) {
 	err = HA_ERR_CRASHED_ON_USAGE;
@@ -1473,8 +1497,14 @@ int queue_share_t::compact()
   char filename[FN_REFLEN], tmp_filename[FN_REFLEN];
   int tmp_fd;
   queue_file_header_t tmp_hdr;
-  queue_owned_row_list_t tmp_rows_owned;
   
+  /* reset owned_row_off_post_compact */
+  if (rows_owned != NULL) {
+    queue_connection_t *c = rows_owned;
+    do {
+      c->owned_row_off_post_compact = 0;
+    } while ((c = c->next_owned()) != rows_owned);
+  }
   /* open new file */
   fn_format(filename, table_name, "", Q4M,
 	    MY_REPLACE_EXT | MY_UNPACK_FILENAME);
@@ -1517,13 +1547,13 @@ int queue_share_t::compact()
 	if (new_begin == 0) {
 	  new_begin = writer.off;
 	}
-	for (queue_owned_row_list_t::const_iterator i = rows_owned.begin();
-	     i != rows_owned.end();
-	     ++i) {
-	  if (i->off == off) {
-	    tmp_rows_owned.push_back(queue_owned_row_t(i->owner, writer.off,
-						       i->row_id));
-	  }
+	if (rows_owned != NULL) {
+	  queue_connection_t *c = rows_owned;
+	  do {
+	    if (c->owned_row_off == off) {
+	      c->owned_row_off_post_compact = writer.off;
+	    }
+	  } while ((c = c->next_owned()) != rows_owned);
 	}
 	if (! writer.append_row_header(&row)
 	    || ! writer.copy_data(off + queue_row_t::header_size(),
@@ -1607,19 +1637,30 @@ int queue_share_t::compact()
   close(fd);
   fd = tmp_fd;
 #ifdef Q4M_USE_MMAP
-  munmap(map, map_len);
-  map_len =
-    min((tmp_hdr.end() + EXPAND_BY - 1) / EXPAND_BY * EXPAND_BY, MMAP_MAX);
-  map = static_cast<char*>(mmap(NULL, map_len, PROT_READ, MAP_SHARED, fd,
-				0));
-  if (map == NULL) {
+  if (mmap_table(min((tmp_hdr.end() + EXPAND_BY - 1) / EXPAND_BY * EXPAND_BY,
+		     MMAP_MAX))
+      != 0) {
     log("mmap failed: size=%lu\n", static_cast<unsigned long>(map_len));
   }
 #endif
   /* update internal info */
   _header = tmp_hdr;
-  rows_owned = tmp_rows_owned;
-  apply_cond_expr_list(cond_expr_t::reset_pos());
+  max_owned_row_off = 0;
+  if (rows_owned != NULL) {
+    queue_connection_t *c = rows_owned;
+    do {
+      if (c->owned_row_off_post_compact != 0) {
+	c->owned_row_off = c->owned_row_off_post_compact;
+	max_owned_row_off = max(max_owned_row_off, c->owned_row_off);
+	c = c->next_owned();
+      } else {
+	queue_connection_t *n = c->next_owned();
+	c->remove_from_owned_list(rows_owned);
+	c = n;
+      }
+    } while (c != rows_owned);
+  }
+  apply_cond_exprs(cond_expr_t::reset_pos());
   
   log("finished table compaction: %s\n", table_name);
   return 0;
@@ -1678,7 +1719,7 @@ int queue_connection_t::close(handlerton *hton, THD *thd)
     static_cast<queue_connection_t*>(thd_get_ha_data(current_thd, queue_hton));
   
   if (conn->share_owned != NULL) {
-    if (conn->share_owned->reset_owner(pthread_self()) != 0) {
+    if (conn->share_owned->reset_owner(conn) != 0) {
       conn->share_owned->wake_listeners();
     }
     conn->share_owned->release();
@@ -1693,20 +1734,17 @@ void queue_connection_t::erase_owned()
 {
   if (share_owned != NULL) {
     share_owned->lock_reader();
-    share_owned->lock();
-    my_off_t off = share_owned->get_owned_row(pthread_self(), NULL);
-    share_owned->unlock();
-    if (off != 0) {
-      /* note that when the server runs in the order: remove_row -> compact
-	 -> get_owned_row(,,true), the row may be removed by compact() */
-      share_owned->remove_rows(&off, 1);
-      share_owned->lock();
-      share_owned->get_owned_row(pthread_self(), NULL, true);
-      share_owned->unlock();
+    if (owned_row_off != 0) {
+      share_owned->remove_rows(&owned_row_off, 1);
     }
+    share_owned->lock();
+    share_owned->remove_owner(this);
+    share_owned->unlock();
     share_owned->unlock_reader();
     share_owned->release();
     share_owned = NULL;
+    owned_row_off = 0;
+    owned_row_id = 0;
   }
   owner_mode = false;
 }
@@ -1728,7 +1766,7 @@ ha_queue::~ha_queue()
 {
   delete bulk_delete_rows;
   bulk_delete_rows = NULL;
-  free_rows_buffer();
+  free_rows_buffer(true);
 }
 
 static const char *ha_queue_exts[] = {
@@ -1792,16 +1830,17 @@ int ha_queue::rnd_next(uchar *buf)
   assert(rows_size == 0);
   
   int err = HA_ERR_END_OF_FILE;
-  share->lock();
   
   queue_connection_t *conn;
   if ((conn = queue_connection_t::current()) != NULL && conn->owner_mode) {
-    if (pos == 0 && (pos = share->get_owned_row(pthread_self(), NULL)) != 0) {
+    if (pos == 0 && conn->share_owned == share
+	&& (pos = conn->owned_row_off) != 0) {
       // ok
     } else {
-      goto EXIT_UNLOCK;
+      goto EXIT;
     }
   } else {
+    share->lock();
     if (pos == 0) {
       if ((pos = share->header()->begin()) == share->header()->end()) {
 	goto EXIT_UNLOCK;
@@ -1823,9 +1862,8 @@ int ha_queue::rnd_next(uchar *buf)
 	goto EXIT_UNLOCK;
       }
     }
+    share->unlock();
   }
-  
-  share->unlock();
   
   { /* read data to row buffer */
     queue_row_t hdr;
@@ -2078,11 +2116,15 @@ int ha_queue::prepare_rows_buffer(size_t sz)
   return 0;
 }
 
-void ha_queue::free_rows_buffer()
+void ha_queue::free_rows_buffer(bool force)
 {
+  if (! force && rows_size < FREE_ROWS_BUFFER_SIZE) {
+    return;
+  }
   if (rows != NULL) {
     my_free(rows, MYF(0));
     rows = NULL;
+    rows_size = 0;
   }
 }
 
@@ -2327,14 +2369,10 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
   conn->erase_owned();
   
   /* setup */
-  if (my_multi_malloc(MY_ZEROFILL, &shares, num_shares * sizeof(queue_share_t*),
-		      &cond_exprs,
-		      num_shares * sizeof(queue_share_t::cond_expr_t*), NullS)
-      == NULL) {
-    log("out of memory\n");
-    *error = 1;
-    return 0;
-  }
+  shares = static_cast<queue_share_t**>(sql_alloc(num_shares * sizeof(queue_share_t*)));
+  memset(shares, 0, num_shares * sizeof(queue_share_t*));
+  cond_exprs = static_cast<queue_share_t::cond_expr_t**>(sql_alloc(num_shares * sizeof(queue_share_t::cond_expr_t*)));
+  memset(cond_exprs, 0, num_shares * sizeof(queue_share_t::cond_expr_t*));
   
   /* setup, or immediately break if data found, note that locks for the tables
    * are not released until all the tables are scanned, in order NOT to return
@@ -2368,7 +2406,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
       *error = 1;
       break;
     }
-    if (shares[i]->assign_owner(pthread_self(), cond_exprs[i]) != 0) {
+    if (shares[i]->assign_owner(conn, cond_exprs[i]) != 0) {
       share_owned = i;
       break;
     }
@@ -2386,18 +2424,18 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
     for (int i = 0; i < num_shares; i++) {
       shares[i]->lock_reader();
       shares[i]->lock();
-      if (shares[i]->assign_owner(pthread_self(), cond_exprs[i]) != 0) {
+      if (shares[i]->assign_owner(conn, cond_exprs[i]) != 0) {
 	for (int j = 0; j <= i; j++) {
 	  shares[j]->unlock();
 	  shares[j]->unlock_reader();
 	}
-	share_owned = i;
 	break;
+	share_owned = i;
       }
     }
     /* if not yet found, wait for data */
     if (share_owned == -1) {
-      queue_share_t::listener_t listener(pthread_self());
+      queue_share_t::listener_t listener(conn);
       for (int i = 0; i < num_shares; i++) {
 	shares[i]->register_listener(&listener, cond_exprs[i]);
 	shares[i]->unlock();
@@ -2411,7 +2449,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
       pthread_cond_timedwait(&listener.cond, &listener_mutex, &ts);
 #endif
       for (int i = 0; i < num_shares; i++) {
-	if (listener.signalled_by == shares[i]) {
+	if (shares[i] == conn->share_owned) {
 	  share_owned = i;
 	} else {
 	  shares[i]->unregister_listener(&listener);
@@ -2422,20 +2460,16 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
   }
   /* always enter owner-mode, regardless whether or not we own a row */
   conn->owner_mode = true;
-  conn->share_owned = share_owned != -1 ? shares[share_owned] : NULL;
   
  EXIT:
   for (int i = 0; i < num_shares && cond_exprs[i] != NULL; i++) {
-    shares[i]->lock();
     shares[i]->release_cond_expr(cond_exprs[i]);
-    shares[i]->unlock();
   }
   for (int i = 0; i < num_shares && shares[i] != NULL; i++) {
     if (i != share_owned) {
       shares[i]->release();
     }
   }
-  my_free(shares, MYF(0));
   return share_owned;
 }
 
@@ -2526,7 +2560,7 @@ long long queue_abort(UDF_INIT *initid, UDF_ARGS *args __attribute__((unused)),
   
   if ((conn = queue_connection_t::current()) != NULL) {
     if (conn->share_owned != NULL) {
-      if (conn->share_owned->reset_owner(pthread_self()) != 0) {
+      if (conn->share_owned->reset_owner(conn) != 0) {
 	conn->share_owned->wake_listeners();
       }
       conn->share_owned->release();
@@ -2573,11 +2607,7 @@ long long queue_rowid(UDF_INIT *initid __attribute__((unused)), UDF_ARGS *args,
     *is_null = 1;
     return 0;
   }
-  share->lock();
-  my_off_t row_id;
-  share->get_owned_row(pthread_self(), &row_id);
-  share->unlock();
-  return static_cast<long long>(row_id);
+  return static_cast<long long>(conn->owned_row_id);
 }
 
 my_bool queue_set_srcid_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
