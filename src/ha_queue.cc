@@ -351,7 +351,11 @@ int queue_share_t::mmap_table(size_t new_size)
     map_len = 0;
   }
   if ((map = static_cast<char*>(mmap(NULL, new_size,
+#ifdef Q4M_USE_MMAP_WRITES
 				     PROT_READ | PROT_WRITE,
+#else
+				     PROT_READ
+#endif
 				     MAP_SHARED, fd, 0)))
       == NULL) {
     return -1;

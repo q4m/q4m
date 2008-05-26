@@ -115,7 +115,7 @@ AC_ARG_ENABLE(mmap_writes,
     [   --enable-mmap-writes    permit write through mmap (default:no)])
 if test "$enable_mmap_writes" = "yes"
 then
-    if test "$enable_mmap" != "yes"
+    if test "$enable_mmap" == "no"
     then
         echo "--enable-mmap-writes requires --enable-mmap to be set" >&2
         exit 1
