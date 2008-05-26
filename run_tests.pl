@@ -5,4 +5,4 @@ use warnings;
 
 use Test::Harness;
 
-runtests(<t/*.t>);
+runtests(@ARGV ? @ARGV : <t/*.t>);

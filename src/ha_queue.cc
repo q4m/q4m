@@ -736,6 +736,20 @@ bool queue_share_t::init_fixed_fields(TABLE *_table)
   return true;
 }
 
+/* intentionally defined as a non-inline function so that we can backtrace
+   if something nasty happens. */
+#ifdef SAFE_MUTEX
+void queue_share_t::lock()
+{
+  pthread_mutex_lock(&mutex);
+}
+
+void queue_share_t::unlock()
+{
+  pthread_mutex_unlock(&mutex);
+}
+#endif
+
 void queue_share_t::lock_reader(bool remap)
 {
 #ifdef Q4M_USE_MMAP
@@ -2433,8 +2447,8 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
 	  shares[j]->unlock();
 	  shares[j]->unlock_reader();
 	}
-	break;
 	share_owned = i;
+	break;
       }
     }
     /* if not yet found, wait for data */

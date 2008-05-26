@@ -85,8 +85,6 @@ int main(int argc, char **argv)
   }
   
   for (i = 0; i < loop; i++) {
-    /* insert one row */
-    insert_row(i + start_value, var_length);
     /* queue_wait */
     res = do_select("SELECT queue_wait('q4m_t')");
     if (mysql_num_rows(res) == 0 || strcmp(mysql_fetch_row(res)[0], "0") == 0) {
@@ -102,6 +100,8 @@ int main(int argc, char **argv)
     }
     printf("%s\n", mysql_fetch_row(res)[0]);
     mysql_free_result(res);
+    /* insert one row */
+    insert_row(i + start_value, var_length);
   }
   /* queue_end */
   res = do_select("SELECT queue_end()");

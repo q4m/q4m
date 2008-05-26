@@ -338,8 +338,13 @@ public:
   static queue_share_t *get_share(const char* table_name);
   void release();
   bool init_fixed_fields(TABLE *_table);
+#ifdef SAFE_MUTEX
+  void lock();
+  void unlock();
+#else
   void lock() { pthread_mutex_lock(&mutex); }
   void unlock() { pthread_mutex_unlock(&mutex); }
+#endif
   void lock_reader(bool remap = false);
   void unlock_reader(bool compact = true);
   void register_listener(listener_t *l, cond_expr_t *c) {
