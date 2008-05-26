@@ -871,8 +871,9 @@ void queue_share_t::wake_listeners(bool remap)
       if (found) {
 	queue_connection_t *conn = l->first->listener;
 	conn->share_owned = this;
-	conn->owned_row_off = off;
-	conn->owned_row_id = row_id;
+	conn->num_owned_rows = 1;
+	conn->owned_rows_off[0] = off;
+	conn->owned_rows_id[0] = row_id;
 	conn->add_to_owned_list(rows_owned);
 	max_owned_row_off = max(off, max_owned_row_off);
 	pthread_cond_signal(&l->first->cond);
@@ -912,22 +913,25 @@ struct queue_reset_owner_update_cond_expr {
   }
 };
 
-my_off_t queue_share_t::reset_owner(queue_connection_t *conn)
+bool queue_share_t::reset_owner(queue_connection_t *conn)
 {
-  my_off_t off = 0;
+  bool dirty = false;
   lock();
   
   // find the row to be released, and remove it from owner list
   if (conn->share_owned != NULL) {
     conn->remove_from_owned_list(rows_owned);
-    off = conn->owned_row_off;
-    if (setup_cond_eval(off) == 0) {
-      apply_cond_exprs(queue_reset_owner_update_cond_expr(this, off));
+    for (size_t i = 0; i < conn->num_owned_rows; i++) {
+      dirty = true;
+      my_off_t off = conn->owned_rows_off[i];
+      if (setup_cond_eval(off) == 0) {
+	apply_cond_exprs(queue_reset_owner_update_cond_expr(this, off));
+      }
     }
   }
   
   unlock();
-  return off;
+  return dirty;
 }
 
 int queue_share_t::write_rows(const void *rows, size_t rows_size)
@@ -1064,10 +1068,12 @@ queue_connection_t *queue_share_t::find_owner(my_off_t off)
   queue_connection_t *c = rows_owned;
   if (c != NULL) {
     do {
-      my_off_t owned_off = c->owned_row_off;
-      max_owned_row_off = max(max_owned_row_off, owned_off);
-      if (off == owned_off) {
-	return c;
+      for (size_t i = 0; i < c->num_owned_rows; i++) {
+	my_off_t owned_off = c->owned_rows_off[i];
+	max_owned_row_off = max(max_owned_row_off, owned_off);
+	if (off == owned_off) {
+	  return c;
+	}
       }
       c = c->next_owned();
     } while (c != rows_owned);
@@ -1075,16 +1081,19 @@ queue_connection_t *queue_share_t::find_owner(my_off_t off)
   return NULL;
 }
 
-my_off_t queue_share_t::assign_owner(queue_connection_t *conn,
-				     cond_expr_t *cond_expr)
+bool queue_share_t::assign_owner(queue_connection_t *conn,
+				     cond_expr_t *cond_expr,
+				     size_t max_rows)
 {
   my_off_t off = cond_expr->pos, row_id = cond_expr->row_id;
   if (off == 0) {
     off = _header.begin();
     row_id = _header.begin_row_id();
   } else if (next(&off, &row_id) != 0) {
-    return 0;
+    return false;
   }
+  
+  conn->num_owned_rows = 0;
   
   while (off != _header.end()) {
     cond_expr->pos = off;
@@ -1095,7 +1104,7 @@ my_off_t queue_share_t::assign_owner(queue_connection_t *conn,
       } else {
 	if (setup_cond_eval(off) != 0) {
 	  log("internal error, table corrupt?");
-	  return 0;
+	  break;
 	}
 	stat_cond_eval.incr();
 	if (cond_eval.evaluate(cond_expr->node)) {
@@ -1103,19 +1112,30 @@ my_off_t queue_share_t::assign_owner(queue_connection_t *conn,
 	}
       }
     }
+    goto NEXT;
+  FOUND:
+    {
+      conn->owned_rows_off[conn->num_owned_rows] = off;
+      conn->owned_rows_id[conn->num_owned_rows] = row_id;
+      conn->num_owned_rows++;
+      max_owned_row_off = max(max_owned_row_off, off);
+      if (--max_rows == 0) {
+	break;
+      }
+    }
+  NEXT:
     if (next(&off, &row_id) != 0) {
-      return 0;
+      break;
     }
   }
-  return 0;
   
- FOUND:
-  conn->share_owned = this;
-  conn->owned_row_off = off;
-  conn->owned_row_id = row_id;
-  conn->add_to_owned_list(rows_owned);
-  max_owned_row_off = max(max_owned_row_off, off);
-  return off;
+  if (conn->num_owned_rows != 0) {
+    conn->share_owned = this;
+    conn->add_to_owned_list(rows_owned);
+    return true;
+  } else {
+    return false;
+  }
 }
 
 int queue_share_t::setup_cond_eval(my_off_t pos)
@@ -1520,7 +1540,9 @@ int queue_share_t::compact()
   if (rows_owned != NULL) {
     queue_connection_t *c = rows_owned;
     do {
-      c->owned_row_off_post_compact = 0;
+      for (size_t i = 0; i < c->num_owned_rows; i++) {
+	c->owned_rows_off_post_compact[i] = 0;
+      }
     } while ((c = c->next_owned()) != rows_owned);
   }
   /* open new file */
@@ -1568,8 +1590,10 @@ int queue_share_t::compact()
 	if (rows_owned != NULL) {
 	  queue_connection_t *c = rows_owned;
 	  do {
-	    if (c->owned_row_off == off) {
-	      c->owned_row_off_post_compact = writer.off;
+	    for (size_t i = 0; i < c->num_owned_rows; i++) {
+	      if (c->owned_rows_off[i] == off) {
+		c->owned_rows_off_post_compact[i] = writer.off;
+	      }
 	    }
 	  } while ((c = c->next_owned()) != rows_owned);
 	}
@@ -1667,16 +1691,19 @@ int queue_share_t::compact()
   if (rows_owned != NULL) {
     queue_connection_t *c = rows_owned;
     do {
-      if (c->owned_row_off_post_compact != 0) {
-	c->owned_row_off = c->owned_row_off_post_compact;
-	max_owned_row_off = max(max_owned_row_off, c->owned_row_off);
-	c = c->next_owned();
-      } else {
-	queue_connection_t *n = c->next_owned();
-	c->remove_from_owned_list(rows_owned);
-	c = n;
+      bool has_owned_rows = false;
+      for (size_t i = 0; i < c->num_owned_rows; i++) {
+	if (c->owned_rows_off_post_compact[i] != 0) {
+	  has_owned_rows = true;
+	  c->owned_rows_off[i] = c->owned_rows_off_post_compact[i];
+	  max_owned_row_off = max(max_owned_row_off, c->owned_rows_off[i]);
+	}
       }
-    } while (c != rows_owned);
+      if (! has_owned_rows) {
+	/* remove from list upon call to erase_owned */
+	c->num_owned_rows = 0;
+      }
+    } while ((c = c->next_owned()) != rows_owned);
   }
   apply_cond_exprs(cond_expr_t::reset_pos());
   
@@ -1737,7 +1764,7 @@ int queue_connection_t::close(handlerton *hton, THD *thd)
     static_cast<queue_connection_t*>(thd_get_ha_data(current_thd, queue_hton));
   
   if (conn->share_owned != NULL) {
-    if (conn->share_owned->reset_owner(conn) != 0) {
+    if (conn->share_owned->reset_owner(conn)) {
       conn->share_owned->wake_listeners();
     }
     conn->share_owned->release();
@@ -1752,19 +1779,30 @@ void queue_connection_t::erase_owned()
 {
   if (share_owned != NULL) {
     share_owned->lock_reader();
-    if (owned_row_off != 0) {
-      share_owned->remove_rows(&owned_row_off, 1);
+    if (num_owned_rows != 0) {
+      share_owned->remove_rows(owned_rows_off, num_owned_rows);
+      share_owned->lock();
+      share_owned->remove_owner(this);
+      share_owned->unlock();
+      num_owned_rows = 0;
     }
-    share_owned->lock();
-    share_owned->remove_owner(this);
-    share_owned->unlock();
     share_owned->unlock_reader();
     share_owned->release();
     share_owned = NULL;
-    owned_row_off = 0;
-    owned_row_id = 0;
   }
   owner_mode = false;
+}
+
+inline my_off_t get_true_pos(queue_share_t *share, my_off_t pos)
+{
+  queue_connection_t *conn;
+  
+  if ((conn = queue_connection_t::current()) == NULL || ! conn->owner_mode) {
+    return pos;
+  }
+  assert(conn->share_owned == share);
+  assert(1 <= pos && pos <= conn->num_owned_rows);
+  return conn->owned_rows_off[pos - 1];
 }
 
 ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
@@ -1845,15 +1883,13 @@ int ha_queue::rnd_end()
 
 int ha_queue::rnd_next(uchar *buf)
 {
-  assert(rows_size == 0);
-  
+  my_off_t true_pos;
   int err = HA_ERR_END_OF_FILE;
   
   queue_connection_t *conn;
   if ((conn = queue_connection_t::current()) != NULL && conn->owner_mode) {
-    if (pos == 0 && conn->share_owned == share
-	&& (pos = conn->owned_row_off) != 0) {
-      // ok
+    if (conn->share_owned == share && pos < conn->num_owned_rows) {
+      true_pos = conn->owned_rows_off[pos++];
     } else {
       goto EXIT;
     }
@@ -1881,11 +1917,12 @@ int ha_queue::rnd_next(uchar *buf)
       }
     }
     share->unlock();
+    true_pos = pos;
   }
   
   { /* read data to row buffer */
     queue_row_t hdr;
-    if (share->read(&hdr, pos, queue_row_t::header_size())
+    if (share->read(&hdr, true_pos, queue_row_t::header_size())
 	!= static_cast<ssize_t>(queue_row_t::header_size())) {
       err = HA_ERR_CRASHED_ON_USAGE;
       goto EXIT;
@@ -1900,7 +1937,7 @@ int ha_queue::rnd_next(uchar *buf)
       err = HA_ERR_OUT_OF_MEM;
       goto EXIT;
     }
-    if (share->read(rows, pos, queue_row_t::header_size() + hdr.size())
+    if (share->read(rows, true_pos, queue_row_t::header_size() + hdr.size())
 	!= static_cast<ssize_t>(queue_row_t::header_size() + hdr.size())) {
       err = HA_ERR_CRASHED_ON_USAGE;
       goto EXIT;
@@ -1931,15 +1968,18 @@ int ha_queue::rnd_pos(uchar *buf, uchar *_pos)
   /* we should return the row even if it had the deleted flag set during the
    * execution by other threads
    */
+  
+  my_off_t true_pos = get_true_pos(share, pos);
   queue_row_t hdr;
-  if (share->read(&hdr, pos, queue_row_t::header_size())
+  if (share->read(&hdr, true_pos, queue_row_t::header_size())
       != static_cast<ssize_t>(queue_row_t::header_size())) {
     return HA_ERR_CRASHED_ON_USAGE;
   }
   if (prepare_rows_buffer(queue_row_t::header_size() + hdr.size()) != 0) {
     return HA_ERR_OUT_OF_MEM;
   }
-  if (share->read(rows, pos, hdr.size()) != static_cast<ssize_t>(hdr.size())) {
+  if (share->read(rows, true_pos, hdr.size())
+      != static_cast<ssize_t>(hdr.size())) {
     return HA_ERR_CRASHED_ON_USAGE;
   }
   
@@ -2094,13 +2134,14 @@ int ha_queue::update_row(const uchar *old_data __attribute__((unused)),
 
 int ha_queue::delete_row(const uchar *buf __attribute__((unused)))
 {
+  my_off_t true_pos = get_true_pos(share, pos);
   int err = 0;
   
   if (bulk_delete_rows != NULL) {
-    bulk_delete_rows->push_back(pos);
+    bulk_delete_rows->push_back(true_pos);
   } else {
     share->lock_reader();
-    err = share->remove_rows(&pos, 1);
+    err = share->remove_rows(&true_pos, 1);
     share->unlock_reader();
   }
   
@@ -2424,7 +2465,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
       *error = 1;
       break;
     }
-    if (shares[i]->assign_owner(conn, cond_exprs[i]) != 0) {
+    if (shares[i]->assign_owner(conn, cond_exprs[i], 1)) {
       share_owned = i;
       break;
     }
@@ -2442,7 +2483,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
     for (int i = 0; i < num_shares; i++) {
       shares[i]->lock_reader();
       shares[i]->lock();
-      if (shares[i]->assign_owner(conn, cond_exprs[i]) != 0) {
+      if (shares[i]->assign_owner(conn, cond_exprs[i], 1)) {
 	for (int j = 0; j <= i; j++) {
 	  shares[j]->unlock();
 	  shares[j]->unlock_reader();
@@ -2625,7 +2666,7 @@ long long queue_rowid(UDF_INIT *initid __attribute__((unused)), UDF_ARGS *args,
     *is_null = 1;
     return 0;
   }
-  return static_cast<long long>(conn->owned_row_id);
+  return static_cast<long long>(conn->owned_rows_id[0]);
 }
 
 my_bool queue_set_srcid_init(UDF_INIT *initid, UDF_ARGS *args, char *message)

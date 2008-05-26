@@ -25,6 +25,7 @@
 #define QUEUE_ERR_RECORD_EXISTS (1)
 
 #define QUEUE_MAX_SOURCES (64)
+#define QUEUE_MAX_OWNED_ROWS (100)
 
 class queue_share_t;
 
@@ -357,7 +358,7 @@ public:
   THR_LOCK *get_store_lock() { return &store_lock; }
   const queue_file_header_t *header() const { return &_header; }
   queue_fixed_field_t * const *get_fixed_fields() const { return fixed_fields; }
-  my_off_t reset_owner(queue_connection_t *conn);
+  bool reset_owner(queue_connection_t *conn);
   int write_rows(const void *rows, size_t rows_size);
   /* functions below requires lock */
   ssize_t read(void *data, my_off_t off, ssize_t size);
@@ -379,7 +380,8 @@ public:
   int remove_rows(my_off_t *offsets, int cnt);
   void remove_owner(queue_connection_t *conn);
   queue_connection_t *find_owner(my_off_t off);
-  my_off_t assign_owner(queue_connection_t *conn, cond_expr_t *cond_expr);
+  bool assign_owner(queue_connection_t *conn, cond_expr_t *cond_expr,
+		    size_t max_rows);
   int setup_cond_eval(my_off_t pos);
   cond_expr_t* compile_cond_expr(const char *expr, size_t len);
   void release_cond_expr(cond_expr_t *e);
@@ -411,9 +413,10 @@ struct queue_connection_t : private dllist<queue_connection_t> {
   friend class dllist<queue_connection_t>;
   bool owner_mode;
   queue_share_t *share_owned;
-  my_off_t owned_row_off;
-  my_off_t owned_row_id;
-  my_off_t owned_row_off_post_compact;
+  my_off_t owned_rows_off[QUEUE_MAX_OWNED_ROWS];
+  my_off_t owned_rows_id[QUEUE_MAX_OWNED_ROWS];
+  my_off_t owned_rows_off_post_compact[QUEUE_MAX_OWNED_ROWS];
+  size_t num_owned_rows;
   queue_source_t source;
   bool reset_source;
   void erase_owned();
@@ -422,10 +425,13 @@ struct queue_connection_t : private dllist<queue_connection_t> {
   static int close(handlerton *hton, THD *thd);
 private:
   queue_connection_t()
-    : dllist<queue_connection_t>(), owner_mode(false), share_owned(NULL),
-      owned_row_off(0), owned_row_id(0), owned_row_off_post_compact(0),
-      source(0, 0), reset_source(false) {}
-  ~queue_connection_t() {}
+  : dllist<queue_connection_t>(), owner_mode(false), share_owned(NULL),
+    num_owned_rows(0), source(0, 0), reset_source(false) {
+    std::fill(owned_rows_off, owned_rows_off + QUEUE_MAX_OWNED_ROWS, 0);
+    std::fill(owned_rows_id, owned_rows_id + QUEUE_MAX_OWNED_ROWS, 0);
+    std::fill(owned_rows_off_post_compact,
+	      owned_rows_off_post_compact + QUEUE_MAX_OWNED_ROWS, 0);
+  }
 public:
   void add_to_owned_list(queue_connection_t *&head) {
     attach_back(head);
