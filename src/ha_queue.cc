@@ -1420,7 +1420,6 @@ void queue_share_t::writer_do_remove(remove_list_t* l)
   stat_writer_remove.incr();
   remove_list_t::iterator i;
   
-  lock();
   for (remove_list_t::iterator i = l->begin(); i != l->end(); ++i) {
     remove_t* r = *i;
 #ifdef Q4M_USE_MT_PWRITE
@@ -1429,7 +1428,6 @@ void queue_share_t::writer_do_remove(remove_list_t* l)
     r->err = do_remove_rows(r->offsets, r->cnt);
 #endif
   }
-  unlock();
 }
 #endif
 
