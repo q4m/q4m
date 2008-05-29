@@ -67,15 +67,13 @@ for (my $i = 0; $i < $NUM_CHILDREN; $i++) {
         $dbh = dbi_connect();
         for (my $j = 0; $j < $loop; $j++) {
             insert_row($loop * $i + $j);
-            while (1) {
-                my @w = $dbh->selectrow_array("select queue_wait('test.q4m_t')")
-                    or die $dbh->errstr;
-                last if $w[0];
-                print STDERR "queue_wait timeout\n";
-            }
-            my $a = $dbh->selectall_arrayref("select * from q4m_t")
-                or die $dbh->errstr;
-            print "$a->[0]->[0]\n";
+            my $rows;
+            do {
+                $rows = $dbh->selectall_arrayref(
+                    "select * from q4m_t where queue_wait('q4m_t')",
+                ) or die $dbh->errstr;
+            } while (@$rows == 0);
+            print "$rows->[0]->[0]\n";
         }
         $dbh->do("select queue_end()");
         exit 0;

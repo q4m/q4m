@@ -451,6 +451,7 @@ class ha_queue: public handler
   size_t rows_size, rows_reserved;
   size_t bulk_insert_rows; /* should be -1 unless bulk_insertion */
   std::vector<my_off_t> *bulk_delete_rows;
+  bool defer_reader_lock;
   
  public:
   ha_queue(handlerton *hton, TABLE_SHARE *table_arg);

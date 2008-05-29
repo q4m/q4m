@@ -1806,7 +1806,8 @@ ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
    rows_size(0),
    rows_reserved(0),
    bulk_insert_rows(-1),
-   bulk_delete_rows(NULL)
+   bulk_delete_rows(NULL),
+   defer_reader_lock(false)
 {
   assert(ref_length == sizeof(my_off_t));
 }
@@ -1851,10 +1852,13 @@ int ha_queue::external_lock(THD *thd, int lock_type)
   switch (lock_type) {
   case F_RDLCK:
   case F_WRLCK:
-    share->lock_reader();
+    defer_reader_lock = true;
     break;
   case F_UNLCK:
-    share->unlock_reader();
+    if (! defer_reader_lock) {
+      share->unlock_reader();
+    }
+    defer_reader_lock = false;
     free_rows_buffer();
     break;
   default:
@@ -1879,6 +1883,11 @@ int ha_queue::rnd_next(uchar *buf)
   assert(rows_size == 0);
   
   int err = HA_ERR_END_OF_FILE;
+  
+  if (defer_reader_lock) {
+    share->lock_reader();
+    defer_reader_lock = false;
+  }
   
   queue_connection_t *conn;
   if ((conn = queue_connection_t::current()) != NULL && conn->owner_mode) {

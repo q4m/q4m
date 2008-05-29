@@ -65,21 +65,13 @@ int main(int argc, char **argv)
       break;
     }
   }
-  for (i = 0; i < loop; i++) {
-    /* queue_wait */
-    res = do_select("SELECT queue_wait('q4m_t')");
-    if (mysql_num_rows(res) == 0 || strcmp(mysql_fetch_row(res)[0], "0") == 0) {
-      fprintf(stderr, "queue_wait timeout\n");
-      exit(3);
-    }
-    mysql_free_result(res);
+  for (i = 0; i < loop;) {
     /* read data and print */
-    res = do_select("SELECT * FROM q4m_t");
-    if (mysql_num_rows(res) == 0) {
-      fprintf(stderr, "unexpected response from Q4M (no owned rows)\n");
-      exit(3);
+    res = do_select("SELECT * FROM q4m_t WHERE queue_wait('q4m_t')");
+    if (mysql_num_rows(res) != 0) {
+      printf("%s\n", mysql_fetch_row(res)[0]);
+      i++;
     }
-    printf("%s\n", mysql_fetch_row(res)[0]);
     mysql_free_result(res);
   }
   /* queue_end */
