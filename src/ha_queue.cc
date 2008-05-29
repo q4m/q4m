@@ -164,6 +164,17 @@ static void sync_file(int fd)
   stat_sys_sync.incr();
 }
 
+int timedwait_cond(pthread_cond_t *cond, pthread_mutex_t *mutex, int timeout)
+{
+#ifdef Q4M_USE_RELATIVE_TIMEDWAIT
+  timespec ts = { timeout, 0 };
+  return pthread_cond_timedwait_relative_np(cond, mutex, &ts);
+#else
+  timespec ts = { time(NULL) + timeout, 0 };
+  return pthread_cond_timedwait(cond, mutex, &ts);
+#endif
+}
+
 my_off_t queue_row_t::validate_checksum(int fd, my_off_t off)
 {
   my_off_t off_end;
@@ -346,6 +357,8 @@ void queue_share_t::fixup_header()
 #ifdef Q4M_USE_MMAP
 int queue_share_t::mmap_table(size_t new_size)
 {
+  pthread_mutex_lock(&mmap_mutex);
+  
   if (map != NULL) {
     munmap(map, map_len);
     map_len = 0;
@@ -358,9 +371,12 @@ int queue_share_t::mmap_table(size_t new_size)
 #endif
 				     MAP_SHARED, fd, 0)))
       == NULL) {
+    pthread_mutex_unlock(&mmap_mutex);
     return -1;
   }
   map_len = new_size;
+  
+  pthread_mutex_unlock(&mmap_mutex);
   return 0;
 }
 #endif
@@ -456,7 +472,21 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   strmov(share->table_name, table_name);
   share->table_name_length = table_name_length;
   pthread_mutex_init(&share->mutex, MY_MUTEX_INIT_FAST);
-  pthread_rwlock_init(&share->rwlock, NULL);
+  pthread_mutex_init(&share->compact_mutex, MY_MUTEX_INIT_FAST);
+#ifdef Q4M_USE_MMAP
+  pthread_mutex_init(&share->mmap_mutex, MY_MUTEX_INIT_FAST);
+#endif
+  {
+    pthread_rwlockattr_t attr;
+    pthread_rwlockattr_init(&attr);
+    // switch to writer-preferred lock on linux
+#ifdef PTHREAD_RWLOCK_WRITER_NONRECURSIVE_INITIALIZER_NP
+    pthread_rwlockattr_setkind_np(&attr,
+				  PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
+    pthread_rwlock_init(&share->rwlock, &attr);
+    pthread_rwlockattr_destroy(&attr);
+  }
   thr_lock_init(&share->store_lock);
   share->rows_owned = NULL;
   share->max_owned_row_off = 0;
@@ -465,8 +495,6 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   pthread_cond_init(&share->_from_writer_conds[0], NULL);
   pthread_cond_init(&share->_from_writer_conds[1], NULL);
   share->from_writer_cond = &share->_from_writer_conds[0];
-  pthread_cond_init(&share->wake_listener_cond, NULL);
-  share->do_wake_listener = false;
   share->writer_exit = false;
   share->append_list = new append_list_t();
 #if defined(Q4M_USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
@@ -537,13 +565,8 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   }
 #endif
   /* start threads */
-  if (pthread_create(&share->wake_listener_thread, NULL, _wake_listener_start,
-		     share)
-      != 0) {
-    goto ERR_AFTER_MMAP;
-  }
   if (pthread_create(&share->writer_thread, NULL, _writer_start, share) != 0) {
-    goto ERR_AFTER_WAKE_LISTENER_START;
+    goto ERR_AFTER_MMAP;
   }
   /* add to open_tables */
   if (my_hash_insert(&queue_open_tables, reinterpret_cast<uchar*>(share))) {
@@ -559,9 +582,6 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
  ERR_AFTER_WRITER_START:
   pthread_cond_signal(&share->to_writer_cond);
   pthread_join(share->writer_thread, NULL);
-  ERR_AFTER_WAKE_LISTENER_START:
-  pthread_cond_signal(&share->wake_listener_cond);
-  pthread_join(share->wake_listener_thread, NULL);
  ERR_AFTER_MMAP:
 #ifdef Q4M_USE_MMAP
   munmap(share->map, share->map_len);
@@ -576,13 +596,16 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   delete share->remove_list;
 #endif
   delete share->append_list;
-  pthread_cond_destroy(&share->wake_listener_cond);
   pthread_cond_destroy(&share->_from_writer_conds[0]);
   pthread_cond_destroy(&share->_from_writer_conds[1]);
   pthread_cond_destroy(&share->to_writer_cond);
   share->listener_list.~list();
   thr_lock_delete(&share->store_lock);
   pthread_rwlock_destroy(&share->rwlock);
+#ifdef Q4M_USE_MMAP
+  pthread_mutex_destroy(&share->mmap_mutex);
+#endif
+  pthread_mutex_destroy(&share->compact_mutex);
   pthread_mutex_destroy(&share->mutex);
   my_free(reinterpret_cast<uchar*>(share), MYF(0));
  ERR_RETURN:
@@ -606,10 +629,6 @@ void queue_share_t::release()
     if (pthread_join(writer_thread, NULL) != 0) {
       kill_proc("failed to join writer thread\n");
     }
-    pthread_cond_signal(&wake_listener_cond);
-    if (pthread_join(wake_listener_thread, NULL) != 0) {
-      kill_proc("failed to join wake_listener thread");
-    }
 #ifdef Q4M_USE_MMAP
     munmap(map, map_len);
 #endif
@@ -629,13 +648,16 @@ void queue_share_t::release()
     delete remove_list;
 #endif
     delete append_list;
-    pthread_cond_destroy(&wake_listener_cond);
     pthread_cond_destroy(&_from_writer_conds[0]);
     pthread_cond_destroy(&_from_writer_conds[1]);
     pthread_cond_destroy(&to_writer_cond);
     listener_list.~list();
     thr_lock_delete(&store_lock);
     pthread_rwlock_destroy(&rwlock);
+#ifdef Q4M_USE_MMAP
+    pthread_mutex_destroy(&mmap_mutex);
+#endif
+    pthread_mutex_destroy(&compact_mutex);
     pthread_mutex_destroy(&mutex);
     my_free(reinterpret_cast<uchar*>(this), MYF(0));
   }
@@ -748,49 +770,37 @@ void queue_share_t::unlock()
 {
   pthread_mutex_unlock(&mutex);
 }
-#endif
 
-void queue_share_t::lock_reader(bool remap)
+void queue_share_t::lock_reader()
 {
-#ifdef Q4M_USE_MMAP
-  if (map_len < min(_header.end(), MMAP_MAX)) {
-    pthread_rwlock_wrlock(&rwlock);
-    if (map_len < min(_header.end(), MMAP_MAX)) {
-      if (mmap_table(min((_header.end() + EXPAND_BY - 1) / EXPAND_BY
-			 * EXPAND_BY,
-			 MMAP_MAX))
-	  != 0) {
-	log("mmap failed: size=%lu\n", static_cast<unsigned long>(map_len));
-      }
-    }
-    pthread_rwlock_unlock(&rwlock);
-  }
-#endif
-  
   pthread_rwlock_rdlock(&rwlock);
 }
+#endif
 
-void queue_share_t::unlock_reader(bool compact)
+void queue_share_t::unlock_reader()
 {
   pthread_rwlock_unlock(&rwlock);
-  
+
   // trigger compactation
-  if (compact && DO_COMPACT(_header.end() - sizeof(_header), bytes_removed)) {
-    pthread_rwlock_wrlock(&rwlock);
-    if (do_compact_cond == NULL
-        && DO_COMPACT(_header.end() - sizeof(_header), bytes_removed)) {
-      pthread_cond_t c;
-      pthread_cond_init(&c, NULL);
+  if (pthread_mutex_trylock(&compact_mutex) == 0) {
+    if (DO_COMPACT(_header.end() - sizeof(_header), bytes_removed)) {
+      pthread_rwlock_wrlock(&rwlock);
       lock();
-      do_compact_cond = &c;
-      pthread_cond_signal(&to_writer_cond);
-      while (do_compact_cond != NULL) {
-        pthread_cond_wait(&c, &mutex);
+      if (do_compact_cond == NULL
+	  && DO_COMPACT(_header.end() - sizeof(_header), bytes_removed)) {
+	pthread_cond_t c;
+	pthread_cond_init(&c, NULL);
+	do_compact_cond = &c;
+	pthread_cond_signal(&to_writer_cond);
+	while (do_compact_cond != NULL) {
+	  pthread_cond_wait(&c, &mutex);
+	}
+	pthread_cond_destroy(&c);
       }
       unlock();
-      pthread_cond_destroy(&c);
+      pthread_rwlock_unlock(&rwlock);
     }
-    pthread_rwlock_unlock(&rwlock);
+    pthread_mutex_unlock(&compact_mutex);
   }
 }
 
@@ -806,14 +816,35 @@ void queue_share_t::unregister_listener(listener_t *l)
   }
 }
 
-void queue_share_t::wake_listeners(bool remap)
+bool queue_share_t::wake_listeners(bool from_writer)
 {
   bool use_cond_expr = false;
   my_off_t off = (my_off_t)-1, row_id = 0;
   
   /* note: lock order should always be: listener_mutex -> rwlock -> mutex */
   pthread_mutex_lock(&listener_mutex);
-  lock_reader(remap);
+  
+  /* acquire rwlock */
+  if (pthread_rwlock_tryrdlock(&rwlock) != 0) {
+    pthread_mutex_unlock(&listener_mutex);
+    return false;
+  }
+  
+#ifdef Q4M_USE_MMAP
+  /* remap if called from writer */
+  if (from_writer && map_len < min(_header.end(), MMAP_MAX)) {
+    lock();
+    if (map_len < min(_header.end(), MMAP_MAX)) {
+      if (mmap_table(min((_header.end() + EXPAND_BY - 1) / EXPAND_BY
+			 * EXPAND_BY,
+			 MMAP_MAX))
+	  != 0) {
+	log("mmap failed: size=%lu\n", static_cast<unsigned long>(map_len));
+      }
+    }
+    unlock();
+  }
+#endif
   
   // remove listeners with signals received
   listener_list_t::iterator l = listener_list.begin();
@@ -892,8 +923,9 @@ void queue_share_t::wake_listeners(bool remap)
   unlock();
   
  UNLOCK_G_RETURN:
-  unlock_reader();
+  pthread_rwlock_unlock(&rwlock);
   pthread_mutex_unlock(&listener_mutex);
+  return true;
 }
 
 struct queue_reset_owner_update_cond_expr {
@@ -964,12 +996,51 @@ int queue_share_t::write_rows(const void *rows, size_t rows_size)
 ssize_t queue_share_t::read(void *data, my_off_t off, ssize_t size)
 {
 #ifdef Q4M_USE_MMAP
+  pthread_mutex_lock(&mmap_mutex);
   if (off + size <= map_len) {
     memcpy(data, map + off, size);
+    pthread_mutex_unlock(&mmap_mutex);
     return size;
   }
+  pthread_mutex_unlock(&mmap_mutex);
 #endif
   return sys_pread(fd, data, size, off);
+}
+
+int queue_share_t::overwrite_byte(char byte, my_off_t off)
+{
+  int err = 0;
+  
+#ifdef Q4M_USE_MMAP_WRITES
+  pthread_mutex_lock(&mmap_mutex);
+  
+  if (off < map_len) {
+    map[off] = byte;
+    static ptrdiff_t psz_mask;
+    if (psz_mask == 0) {
+      lock();
+      if (psz_mask == 0) {
+	psz_mask = ~ static_cast<ptrdiff_t>(getpagesize() - 1);
+      }
+      unlock();
+    }
+    char* page = static_cast<char*>(NULL)
+      + (reinterpret_cast<ptrdiff_t>(map + off) & psz_mask);
+    if (msync(page, map + off - page + queue_row_t::header_size(), MS_ASYNC)
+	!= 0) {
+      log("msync failed\n");
+      err = HA_ERR_CRASHED_ON_USAGE;
+    }
+    pthread_mutex_unlock(&mmap_mutex);
+    return err;
+  }
+  
+  pthread_mutex_unlock(&mmap_mutex);
+#endif
+  if (sys_pwrite(fd, &byte, 1, off) != 1) {
+    err = HA_ERR_CRASHED_ON_USAGE;
+  }
+  return err;
 }
 
 int queue_share_t::next(my_off_t *_off, my_off_t *row_id)
@@ -1237,6 +1308,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
     queue_row_t::create_checksum(&iov.front() + 1, iov.size() - 1);
   total_len += iov[0].iov_len =
     static_cast<queue_row_t*>(iov[0].iov_base)->next(0);
+  // log("writev: %llu bytes (%d rows)\n", total_len, (int)(iov.size() - 1));
   /* expand if necessary */
   if ((_header.end() - 1) / EXPAND_BY
       != (_header.end() + total_len) / EXPAND_BY) {
@@ -1318,31 +1390,9 @@ int queue_share_t::do_remove_rows(my_off_t *offsets, int cnt)
 	err = HA_ERR_CRASHED_ON_USAGE;
 	break;
       }
-#ifdef Q4M_USE_MMAP_WRITES
-      if (off + queue_row_t::header_size() <= map_len) {
-	queue_row_t::copy_flags(reinterpret_cast<queue_row_t*>(map + off),
-				&row);
-	static ptrdiff_t psz_mask;
-	if (psz_mask == 0) {
-	  lock();
-	  if (psz_mask == 0) {
-	    psz_mask = ~ static_cast<ptrdiff_t>(getpagesize() - 1);
-	  }
-	  unlock();
-	}
-	char* page = static_cast<char*>(NULL)
-	  + (reinterpret_cast<ptrdiff_t>(map + off) & psz_mask);
-	if (msync(page, map + off - page + queue_row_t::header_size(), MS_ASYNC)
-	    != 0) {
-	  log("msync failed\n");
-	  err = HA_ERR_CRASHED_ON_USAGE;
-	}
-      } else
-#endif
-      if (sys_pwrite(fd, &row, queue_row_t::header_size(), off)
-	  != static_cast<ssize_t>(queue_row_t::header_size())) {
-	err = HA_ERR_CRASHED_ON_USAGE;
-      }
+      err =
+	overwrite_byte(reinterpret_cast<char*>(&row)[queue_row_t::type_offset],
+		       off + queue_row_t::type_offset);
       pthread_mutex_lock(&mutex);
       bytes_removed += queue_row_t::header_size() + row.size();
       stat_rows_removed.incr();
@@ -1385,29 +1435,35 @@ void queue_share_t::writer_do_remove(remove_list_t* l)
 
 void *queue_share_t::writer_start()
 {
+  bool do_wake_listeners = false;
+  
   pthread_mutex_lock(&mutex);
   
   while (1) {
     /* wait for signal if we do not have any pending writes */
-    while (1) {
+    do {
       if (do_compact_cond != NULL) {
         bytes_removed = 0;
         compact();
-        pthread_cond_signal(do_compact_cond);
-        do_compact_cond = NULL;
-      } else if (append_list->size() != 0
+	pthread_cond_signal(do_compact_cond);
+	do_compact_cond = NULL;
+      }
+      if (append_list->size() != 0
 #if defined(Q4M_USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
 #else
-		 || remove_list->size() != 0
+	  || remove_list->size() != 0
 #endif
-		 ) {
+	  ) {
 	break;
       } else if (writer_exit) {
 	goto EXIT;
+      }
+      if (do_wake_listeners) {
+	timedwait_cond(&to_writer_cond, &mutex, 1);
       } else {
 	pthread_cond_wait(&to_writer_cond, &mutex);
       }
-    }
+    } while (! do_wake_listeners);
     /* detach operation lists */
 #if defined(Q4M_USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
 #else
@@ -1440,13 +1496,16 @@ void *queue_share_t::writer_start()
       }
       close_append_list(al, err);
       pthread_cond_broadcast(notify_cond);
+      do_wake_listeners = true;
      } else {
       sync_file(fd);
       pthread_cond_broadcast(notify_cond);
     }
+    /* reset wake_listeners flag if successfully woke listeners */
+    if (do_wake_listeners && wake_listeners(true)) {
+      do_wake_listeners = false;
+    }
     pthread_mutex_lock(&mutex);
-    do_wake_listener = true;
-    pthread_cond_signal(&wake_listener_cond);
   }
   
  EXIT:
@@ -1688,32 +1747,6 @@ int queue_share_t::compact()
   unlink(tmp_filename);
  ERR_RETURN:
   return -1;
-}
-
-void *queue_share_t::wake_listener_start()
-{
-  lock();
-  
-  while (1) {
-    /* signal loop */
-    while (1) {
-      if (do_wake_listener) {
-	do_wake_listener = false;
-	break;
-      } else if (writer_exit) {
-	goto EXIT;
-      }
-      pthread_cond_wait(&wake_listener_cond, &mutex);
-    }
-    /* unlock mutex and wake listeners */
-    unlock();
-    wake_listeners(true);
-    lock();
-  }
-  
- EXIT:
-  unlock();
-  return NULL;
 }
 
 size_t queue_connection_t::cnt = 0;
@@ -2459,13 +2492,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
 	shares[i]->unlock();
 	shares[i]->unlock_reader();
       }
-#ifdef Q4M_USE_RELATIVE_TIMEDWAIT
-      timespec ts = { timeout, 0 };
-      pthread_cond_timedwait_relative_np(&listener.cond, &listener_mutex, &ts);
-#else
-      timespec ts = { time(NULL) + timeout, 0 };
-      pthread_cond_timedwait(&listener.cond, &listener_mutex, &ts);
-#endif
+      timedwait_cond(&listener.cond, &listener_mutex, timeout);
       for (int i = 0; i < num_shares; i++) {
 	if (shares[i] == conn->share_owned) {
 	  share_owned = i;

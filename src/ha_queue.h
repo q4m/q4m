@@ -37,6 +37,7 @@ class queue_row_t {
   uchar _bytes[1];
 public:
   enum {
+    type_offset = 3, // location of type info
     type_mask                 = 0xe0000000,
     type_row                  = 0x00000000,
     type_row_received         = 0x20000000,
@@ -92,9 +93,6 @@ public:
 			      uint32_t adler);
   // my_free should be used on deallocation
   static queue_row_t *create_checksum(const iovec* iov, int iovcnt);
-  static void copy_flags(queue_row_t *dst, const queue_row_t *src) {
-    dst->_size[3] = src->_size[3];
-  }
 private:
   queue_row_t(const queue_row_t&);
   queue_row_t& operator=(const queue_row_t&);
@@ -235,7 +233,6 @@ public:
 #endif
   };
   typedef std::vector<remove_t*> remove_list_t;
-  pthread_cond_t *do_compact_cond;
   
   struct cond_expr_t : public dllist<cond_expr_t> {
     queue_cond_t::node_t *node;
@@ -284,9 +281,16 @@ private:
   char *table_name;
   uint table_name_length;
   
-  /* lock order: rwlock -> mutex
+  /* mutex:         used for many purposes
+     mmap_mutex:    used for blocking remapping
+     rwlock:        used to block compaction
+     compact_mutex: used to serialize threads trying to obtain wrlock(rwlock)
+     lock order is compact_mutex -> rwlock -> mutex -> mmap_mutex
    */
-  pthread_mutex_t mutex;
+  pthread_mutex_t mutex, compact_mutex;
+#ifdef Q4M_USE_MMAP
+  pthread_mutex_t mmap_mutex;
+#endif
   pthread_rwlock_t rwlock;
   
   THR_LOCK store_lock;
@@ -294,6 +298,7 @@ private:
   int fd;
   queue_file_header_t _header;
 #ifdef Q4M_USE_MMAP
+  /* non-atomic access to these values should be serialized using mmap_mutex */
   char *map;
   size_t map_len;
 #endif
@@ -303,17 +308,17 @@ private:
   
   listener_list_t listener_list; /* access serialized using listener_mutex */
   
-  pthread_t writer_thread, wake_listener_thread;
+  pthread_t writer_thread;
   pthread_cond_t to_writer_cond;
   pthread_cond_t *from_writer_cond;
   pthread_cond_t _from_writer_conds[2];
-  pthread_cond_t wake_listener_cond;
-  bool do_wake_listener, writer_exit;
+  bool writer_exit;
   append_list_t *append_list;
 #if defined(Q4M_USE_MT_PWRITE) && defined(FDATASYNC_SKIP)
 #else
   remove_list_t *remove_list;
 #endif
+  pthread_cond_t *do_compact_cond;
   
   queue_cond_t cond_eval;
   cond_expr_t *active_cond_exprs;
@@ -341,17 +346,18 @@ public:
 #ifdef SAFE_MUTEX
   void lock();
   void unlock();
+  void lock_reader();
 #else
   void lock() { pthread_mutex_lock(&mutex); }
   void unlock() { pthread_mutex_unlock(&mutex); }
+  void lock_reader() { pthread_rwlock_rdlock(&rwlock); }
 #endif
-  void lock_reader(bool remap = false);
-  void unlock_reader(bool compact = true);
+  void unlock_reader();
   void register_listener(listener_t *l, cond_expr_t *c) {
     listener_list.push_back(std::make_pair(l, c));
   }
   void unregister_listener(listener_t *l);
-  void wake_listeners(bool remap = false);
+  bool wake_listeners(bool from_writer = false);
   
   const char *get_table_name() const { return table_name; }
   THR_LOCK *get_store_lock() { return &store_lock; }
@@ -361,6 +367,7 @@ public:
   int write_rows(const void *rows, size_t rows_size);
   /* functions below requires lock */
   ssize_t read(void *data, my_off_t off, ssize_t size);
+  int overwrite_byte(char byte, my_off_t off);
   int next(my_off_t *off, my_off_t* row_id);
   template <typename Func> void apply_cond_exprs(const Func& f) {
     cond_expr_t *e;
@@ -395,10 +402,6 @@ private:
     return static_cast<queue_share_t*>(self)->writer_start();
   }
   int compact();
-  void *wake_listener_start();
-  static void *_wake_listener_start(void *self) {
-    return static_cast<queue_share_t*>(self)->wake_listener_start();
-  }
   queue_share_t();
   ~queue_share_t();
   queue_share_t(const queue_share_t&);
