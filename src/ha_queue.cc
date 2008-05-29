@@ -159,7 +159,7 @@ static void sync_file(int fd)
       fdatasync(fd) != 0
 #endif
       ) {
-    kill_proc("failed to sync disk\n");
+    kill_proc("failed to sync disk (errno:%d)\n", errno);
   }
   stat_sys_sync.incr();
 }
