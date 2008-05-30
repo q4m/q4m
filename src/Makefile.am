@@ -1,6 +1,6 @@
 INCLUDES=			$(MYSQL_INC)
 lib_LTLIBRARIES=		libqueue_engine.la
-noinst_HEADER=			ha_queue.h queue_cond.h
+noinst_HEADER=			ha_queue.h queue_cond.h dllist.h
 noinst_LIBRARIES=		libqueue_cond.a
 EXTRA_DIST=			adler32.c $(noinst_HEADER)
 

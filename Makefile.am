@@ -1,6 +1,6 @@
-SUBDIRS=	src
+SUBDIRS=	src t
 SUPPORT_BIN=	support-files/q4m-forward
-EXTRA_DIST=	run_tests.pl config/ac_mysql.m4 t/*.t support-files/install.sql support-files/install-exec-hook.txt $(SUPPORT_BIN)
+EXTRA_DIST=	run_tests.pl config/ac_mysql.m4 support-files/install.sql support-files/install-exec-hook.txt $(SUPPORT_BIN)
 DOC_ROOT=	@DOC_ROOT@
 
 BINARY_ARCH=	@BINARY_ARCH@
