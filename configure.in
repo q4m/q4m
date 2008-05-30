@@ -28,7 +28,7 @@ then
 fi
 
 # change libdir to prefix/lib/mysql unless otherwise specified
-MYSQL_LIBDIR="${exec_prefix}/lib"
+MYSQL_LIBDIR="${prefix}/lib"
 if test "$libdir" = '${exec_prefix}/lib'
 then
   if test -d "${prefix}/lib/mysql/plugin"

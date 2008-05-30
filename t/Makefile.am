@@ -1,8 +1,8 @@
 EXTRA_DIST=	*.t
-bin_PROGRAMS=	05-multireader-read 05-multirw-core 05-multiwait-core
+noinst_PROGRAMS=	05-multireader-read 05-multirw-core 05-multiwait-core
 
 INCLUDES=	$(MYSQL_INC)
-LDFLAGS=	-L$(MYSQL_LIBDIR)
+AM_LDFLAGS=	-L$(MYSQL_LIBDIR)
 LDADD=		-lmysqlclient
 
 05_multireader_read_SOURCES=	05-multireader-read.c
