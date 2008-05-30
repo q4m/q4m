@@ -503,7 +503,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   share->append_list = new append_list_t();
 #if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
 #else
-  share->remove_list = new remove_list_t();
+  share->remove_list = NULL;
 #endif
   share->do_compact_cond = NULL;
   new (&share->cond_eval) queue_cond_t();
@@ -595,10 +595,6 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
  ERR_ON_FILEOPEN:
   share->cond_expr_true.free(NULL);
   share->cond_eval.~queue_cond_t();
-#if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
-#else
-  delete share->remove_list;
-#endif
   delete share->append_list;
   pthread_cond_destroy(&share->_from_writer_conds[0]);
   pthread_cond_destroy(&share->_from_writer_conds[1]);
@@ -647,10 +643,6 @@ void queue_share_t::release()
       inactive_cond_exprs->free(&inactive_cond_exprs);
     }
     cond_eval.~queue_cond_t();
-#if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
-#else
-    delete remove_list;
-#endif
     delete append_list;
     pthread_cond_destroy(&_from_writer_conds[0]);
     pthread_cond_destroy(&_from_writer_conds[1]);
@@ -1115,7 +1107,7 @@ int queue_share_t::remove_rows(my_off_t *offsets, int cnt)
   remove_t r;
 # endif
   pthread_mutex_lock(&mutex);
-  remove_list->push_back(&r);
+  r.attach_back(remove_list);
   pthread_cond_t *c = from_writer_cond;
   pthread_cond_signal(&to_writer_cond);
   do {
@@ -1420,19 +1412,18 @@ int queue_share_t::do_remove_rows(my_off_t *offsets, int cnt)
 
 #if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
 #else
-void queue_share_t::writer_do_remove(remove_list_t* l)
+void queue_share_t::writer_do_remove(remove_t* l)
 {
   stat_writer_remove.incr();
-  remove_list_t::iterator i;
   
-  for (remove_list_t::iterator i = l->begin(); i != l->end(); ++i) {
-    remove_t* r = *i;
+  remove_t *r = l;
+  do {
 #if Q4M_DELETE_METHOD == Q4M_DELETE_SERIAL_PWRITE
     r->err = do_remove_rows(r->offsets, r->cnt);
 #else
     r->err = 0;
 #endif
-  }
+  } while ((r = r->detach(l)) != NULL);
 }
 #endif
 
@@ -1454,7 +1445,7 @@ void *queue_share_t::writer_start()
       if (append_list->size() != 0
 #if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
 #else
-	  || remove_list->size() != 0
+	  || remove_list != NULL
 #endif
 	  ) {
 	break;
@@ -1470,10 +1461,10 @@ void *queue_share_t::writer_start()
     /* detach operation lists */
 #if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
 #else
-    remove_list_t *rl = NULL;
-    if (remove_list->size() != 0) {
+    remove_t *rl = NULL;
+    if (remove_list != NULL) {
       rl = remove_list;
-      remove_list = new remove_list_t();
+      remove_list = NULL;
     }
 #endif
     append_list_t *al = NULL;
@@ -1489,7 +1480,6 @@ void *queue_share_t::writer_start()
 #else
     if (rl != NULL) {
       writer_do_remove(rl);
-      delete rl;
     }
 #endif
     if (al != NULL) {

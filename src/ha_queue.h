@@ -224,7 +224,7 @@ public:
   
 #if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
 #else
-  struct remove_t {
+  struct remove_t : public dllist<remove_t> {
     int err; /* -1 if not completed, otherwise HA_ERR_XXX or 0 */
 # if Q4M_DELETE_METHOD == Q4M_DELETE_SERIAL_PWRITE
     my_off_t *offsets;
@@ -234,7 +234,6 @@ public:
     remove_t() : err(-1) {}
 # endif
   };
-  typedef std::vector<remove_t*> remove_list_t;
 #endif
   
   struct cond_expr_t : public dllist<cond_expr_t> {
@@ -319,7 +318,7 @@ private:
   append_list_t *append_list;
 #if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
 #else
-  remove_list_t *remove_list;
+  remove_t *remove_list;
 #endif
   pthread_cond_t *do_compact_cond;
   
@@ -398,7 +397,7 @@ private:
   int do_remove_rows(my_off_t *offsets, int cnt);
 #if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
 #else
-  void writer_do_remove(remove_list_t *l);
+  void writer_do_remove(remove_t *l);
 #endif
   void *writer_start();
   static void *_writer_start(void* self) {
