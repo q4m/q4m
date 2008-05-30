@@ -2426,10 +2426,57 @@ mysql_declare_plugin(queue)
 }
 mysql_declare_plugin_end;
 
+class share_lock_t : private dllist<share_lock_t> {
+  friend class dllist<share_lock_t>;
+  queue_share_t *share;
+  size_t cnt;
+  share_lock_t(queue_share_t *s, size_t c) : share(s), cnt(c) {}
+  ~share_lock_t() {}
+public:
+  static bool lock(share_lock_t *&locks, queue_share_t *share,
+		   share_lock_t *&locks_buf) {
+    share_lock_t *l = locks;
+    if (l != NULL) {
+      do {
+	if (l->share == share) {
+	  goto FOUND;
+	}
+      } while ((l = l->next()) != locks);
+    }
+    l = locks_buf++;
+    new (l) share_lock_t(share, 0);
+    l->attach_front(locks);
+  FOUND:
+    if (l->cnt++ == 0) {
+      if (! share->lock_reader(true)) {
+	--l->cnt;
+	return false;
+      }
+      share->lock();
+    }
+    return true;
+  }
+  static void unlock(share_lock_t *&locks, queue_share_t *share) {
+    assert(locks != NULL);
+    share_lock_t *l = locks;
+    do {
+      if (l->share == share) {
+	if (--l->cnt == 0) {
+	  l->share->unlock();
+	  l->share->unlock_reader(true);
+	}
+	break;
+      }
+    } while ((l = l->next()) != locks);
+  }
+};
+  
 static int _queue_wait_core(char **share_names, int num_shares, int timeout,
 			    char *error)
 {
   queue_share_t **shares;
+  share_lock_t *locks = NULL;
+  share_lock_t *locks_buf;
   queue_share_t::cond_expr_t **cond_exprs;
   int share_owned = -1;
   queue_connection_t *conn = queue_connection_t::current(true);
@@ -2441,6 +2488,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
   /* setup */
   shares = static_cast<queue_share_t**>(sql_alloc(num_shares * sizeof(queue_share_t*)));
   memset(shares, 0, num_shares * sizeof(queue_share_t*));
+  locks_buf = static_cast<share_lock_t*>(sql_alloc(num_shares * sizeof(share_lock_t)));
   cond_exprs = static_cast<queue_share_t::cond_expr_t**>(sql_alloc(num_shares * sizeof(queue_share_t::cond_expr_t*)));
   memset(cond_exprs, 0, num_shares * sizeof(queue_share_t::cond_expr_t*));
   
@@ -2465,14 +2513,13 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
       *error = 1;
       break;
     }
-    if (! shares[i]->lock_reader(true)) {
+    if (! share_lock_t::lock(locks, shares[i], locks_buf)) {
       log("detected misuse of queue_wait(), returning error\n");
       shares[i]->release();
       shares[i] = NULL;
       *error = 1;
       break;
     }
-    shares[i]->lock();
     if ((cond_exprs[i] =
 	 *last != '\0'
 	 ? shares[i]->compile_cond_expr(last + 1, strlen(last + 1))
@@ -2488,8 +2535,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
     }
   }
   for (int i = 0; i < num_shares && shares[i] != NULL; i++) {
-    shares[i]->unlock();
-    shares[i]->unlock_reader(true);
+    share_lock_t::unlock(locks, shares[i]);
   }
   if (*error != 0) {
     goto EXIT;
@@ -2498,12 +2544,10 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
     /* not yet found, lock global mutex and check once more */
     pthread_mutex_lock(&listener_mutex);
     for (int i = 0; i < num_shares; i++) {
-      shares[i]->lock_reader(true);
-      shares[i]->lock();
+      share_lock_t::lock(locks, shares[i], locks_buf);
       if (shares[i]->assign_owner(conn, cond_exprs[i]) != 0) {
 	for (int j = 0; j <= i; j++) {
-	  shares[j]->unlock();
-	  shares[j]->unlock_reader(true);
+	  share_lock_t::unlock(locks, shares[j]);
 	}
 	share_owned = i;
 	break;
@@ -2514,8 +2558,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
       queue_share_t::listener_t listener(conn);
       for (int i = 0; i < num_shares; i++) {
 	shares[i]->register_listener(&listener, cond_exprs[i]);
-	shares[i]->unlock();
-	shares[i]->unlock_reader(true);
+	share_lock_t::unlock(locks, shares[i]);
       }
       timedwait_cond(&listener.cond, &listener_mutex, timeout);
       for (int i = 0; i < num_shares; i++) {
