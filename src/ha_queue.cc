@@ -766,17 +766,34 @@ void queue_share_t::unlock()
 {
   pthread_mutex_unlock(&mutex);
 }
-
-void queue_share_t::lock_reader()
-{
-  pthread_rwlock_rdlock(&rwlock);
-}
 #endif
 
-void queue_share_t::unlock_reader()
+bool queue_share_t::lock_reader(bool from_queue_wait)
+{
+  queue_connection_t *conn = queue_connection_t::current(true);
+  
+  if (from_queue_wait) {
+    if (conn->reader_lock_cnt != 0) {
+      return false;
+    }
+  } else {
+    conn->reader_lock_cnt++;
+  }
+  
+  pthread_rwlock_rdlock(&rwlock);
+  return true;
+}
+
+void queue_share_t::unlock_reader(bool from_queue_wait)
 {
   pthread_rwlock_unlock(&rwlock);
-
+  
+  if (! from_queue_wait) {
+    queue_connection_t *conn = queue_connection_t::current();
+    assert(conn != NULL);
+    --conn->reader_lock_cnt;
+  }
+  
   // trigger compactation
   if (pthread_mutex_trylock(&compact_mutex) == 0) {
     if (DO_COMPACT(_header.end() - sizeof(_header), bytes_removed)) {
@@ -2448,7 +2465,13 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
       *error = 1;
       break;
     }
-    shares[i]->lock_reader();
+    if (! shares[i]->lock_reader(true)) {
+      log("detected misuse of queue_wait(), returning error\n");
+      shares[i]->release();
+      shares[i] = NULL;
+      *error = 1;
+      break;
+    }
     shares[i]->lock();
     if ((cond_exprs[i] =
 	 *last != '\0'
@@ -2466,7 +2489,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
   }
   for (int i = 0; i < num_shares && shares[i] != NULL; i++) {
     shares[i]->unlock();
-    shares[i]->unlock_reader();
+    shares[i]->unlock_reader(true);
   }
   if (*error != 0) {
     goto EXIT;
@@ -2475,12 +2498,12 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
     /* not yet found, lock global mutex and check once more */
     pthread_mutex_lock(&listener_mutex);
     for (int i = 0; i < num_shares; i++) {
-      shares[i]->lock_reader();
+      shares[i]->lock_reader(true);
       shares[i]->lock();
       if (shares[i]->assign_owner(conn, cond_exprs[i]) != 0) {
 	for (int j = 0; j <= i; j++) {
 	  shares[j]->unlock();
-	  shares[j]->unlock_reader();
+	  shares[j]->unlock_reader(true);
 	}
 	share_owned = i;
 	break;
@@ -2492,7 +2515,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
       for (int i = 0; i < num_shares; i++) {
 	shares[i]->register_listener(&listener, cond_exprs[i]);
 	shares[i]->unlock();
-	shares[i]->unlock_reader();
+	shares[i]->unlock_reader(true);
       }
       timedwait_cond(&listener.cond, &listener_mutex, timeout);
       for (int i = 0; i < num_shares; i++) {

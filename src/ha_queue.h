@@ -348,13 +348,12 @@ public:
 #ifdef SAFE_MUTEX
   void lock();
   void unlock();
-  void lock_reader();
 #else
   void lock() { pthread_mutex_lock(&mutex); }
   void unlock() { pthread_mutex_unlock(&mutex); }
-  void lock_reader() { pthread_rwlock_rdlock(&rwlock); }
 #endif
-  void unlock_reader();
+  bool lock_reader(bool from_queue_wait = false);
+  void unlock_reader(bool from_queue_wait = false);
   void register_listener(listener_t *l, cond_expr_t *c) {
     listener_list.push_back(std::make_pair(l, c));
   }
@@ -414,6 +413,7 @@ private:
 
 struct queue_connection_t : private dllist<queue_connection_t> {
   friend class dllist<queue_connection_t>;
+  size_t reader_lock_cnt;
   bool owner_mode;
   queue_share_t *share_owned;
   my_off_t owned_row_off;
@@ -427,9 +427,9 @@ struct queue_connection_t : private dllist<queue_connection_t> {
   static int close(handlerton *hton, THD *thd);
 private:
   queue_connection_t()
-    : dllist<queue_connection_t>(), owner_mode(false), share_owned(NULL),
-      owned_row_off(0), owned_row_id(0), owned_row_off_post_compact(0),
-      source(0, 0), reset_source(false) {}
+  : dllist<queue_connection_t>(), reader_lock_cnt(0), owner_mode(false),
+    share_owned(NULL), owned_row_off(0), owned_row_id(0),
+    owned_row_off_post_compact(0), source(0, 0), reset_source(false) {}
   ~queue_connection_t() {}
 public:
   void add_to_owned_list(queue_connection_t *&head) {
