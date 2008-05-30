@@ -75,10 +75,10 @@ fi
     [ with_debug=no ])
 
 AC_ARG_WITH(sync,
-    [   --with-sync=yes         commit to disk at checkpoints (default)
-   --with-sync=no          do not commit explicitly to disk
-   --with-sync=fsync       use fsync instead of fdatasync
-   --with-sync=fcntl       use fcntl(F_FULLFSYNC) instead of fdatasync ],
+    [   --with-sync=yes        commit to disk at checkpoints (default)
+   --with-sync=no         do not commit explicitly to disk
+   --with-sync=fsync      use fsync instead of fdatasync
+   --with-sync=fcntl      use fcntl(F_FULLFSYNC) instead of fdatasync ],
     [  with_sync=$withval ],
     [ with_sync=yes ])
 if test "$with_sync" = "yes"
@@ -111,16 +111,33 @@ then
     AC_DEFINE([Q4M_USE_MMAP],1,[use mmap for reading data])
 fi
 
-AC_ARG_ENABLE(mmap_writes,
-    [   --enable-mmap-writes    permit write through mmap (default:no)])
-if test "$enable_mmap_writes" = "yes"
+AC_ARG_WITH(delete,
+    [   --with-delete=pwrite   use pwrite for row deletions (default)
+   --with-delete=msync    use msync
+   --with-delete=mt-pwrite
+                          use pwrite from multiple threads (experimental) ],
+    [ with_delete_method=$withval ],
+    [ with_delete_method=pwrite ])
+if test "$with_delete_method" = "pwrite"
 then
-    if test "$enable_mmap" == "no"
+    AC_DEFINE([Q4M_DELETE_METHOD],[Q4M_DELETE_SERIAL_PWRITE],
+        [use pwrite for row deletions])
+elif test "$with_delete_method" = "mt-pwrite"
+then
+    AC_DEFINE([Q4M_DELETE_METHOD],[Q4M_DELETE_MT_PWRITE],
+        [use multi-threaded pwrite for row deletions])
+elif test "$with_delete_method" = "msync"
+then
+    if test "$enable_mmap" = "no"
     then
-        echo "--enable-mmap-writes requires --enable-mmap to be set" >&2
+        echo "cannot use --with-delete=msync without --enable-mmap" >&2
         exit 1
     fi
-    AC_DEFINE([Q4M_USE_MMAP_WRITES],1,[write through mmap])
+    AC_DEFINE([Q4M_DELETE_METHOD],[Q4M_DELETE_MSYNC],
+        [use msync for row deletions])
+else
+    echo "unknown delete method: $with_delete_method" >&2
+    exit 1
 fi
 
 if test "$OSNAME" = "darwin" ; then
