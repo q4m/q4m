@@ -97,7 +97,7 @@ $dbh = dbi_connect();
 
 my $start = time;
 
-insert_row(0) for 1..($NUM_MESSAGES/4);
+insert_row(0) for 1..int($NUM_CHILDREN/4);
 
 # wait until all subscribers stop
 for (my $i = 0; $i < $NUM_CHILDREN; $i++) {
@@ -109,7 +109,7 @@ my $elapsed = time - $start;
 
 my @recvs;
 
-is($dbh->selectrow_array('select count(*) from q4m_t'), $NUM_MESSAGES/4, 'should have certain number of rows left in table');
+is($dbh->selectrow_array('select count(*) from q4m_t'), int($NUM_CHILDREN/4), 'should have certain number of rows left in table');
 push @recvs, map {
     $_->[0]
 } @{$dbh->selectall_arrayref('select v from q4m_t')};
