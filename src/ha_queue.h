@@ -112,7 +112,8 @@ private:
   char _begin[8];
   char _begin_row_id[8];
   char _last_received_offsets[QUEUE_MAX_SOURCES][8];
-  unsigned _padding[1024 - (4 + 4 + 8 + 8 + 8 + QUEUE_MAX_SOURCES * 8)];
+  char _row_count[8];
+  unsigned _padding[1024 - (4 + 4 + 8 + 8 + 8 + QUEUE_MAX_SOURCES * 8 + 8)];
 public:
   queue_file_header_t();
   unsigned magic() const { return uint4korr(_magic); }
@@ -132,6 +133,8 @@ public:
   void set_last_received_offset(unsigned i, my_off_t o) {
     int8store(_last_received_offsets[i], o);
   }
+  my_off_t row_count() const { return uint8korr(_row_count); }
+  void set_row_count(my_off_t c) { int8store(_row_count, c); }
   void write(int fd);
 };
 
@@ -210,11 +213,11 @@ class queue_share_t {
 public:
   struct append_t {
     const void *rows;
-    size_t rows_size;
+    size_t rows_size, row_count;
     const queue_source_t *source;
     int err; /* -1 if not completed, otherwise HA_ERR_XXX or 0 */
-    append_t(const void *r, size_t rs, const queue_source_t *s)
-    : rows(r), rows_size(rs), source(s), err(-1) {
+    append_t(const void *r, size_t rs, size_t rc, const queue_source_t *s)
+    : rows(r), rows_size(rs), row_count(rc), source(s), err(-1) {
     }
   private:
     append_t(const append_t&);
@@ -365,7 +368,7 @@ public:
   const queue_file_header_t *header() const { return &_header; }
   queue_fixed_field_t * const *get_fixed_fields() const { return fixed_fields; }
   my_off_t reset_owner(queue_connection_t *conn);
-  int write_rows(const void *rows, size_t rows_size);
+  int write_rows(const void *rows, size_t rows_size, size_t row_count);
   /* functions below requires lock */
   ssize_t read(void *data, my_off_t off, ssize_t size);
   int overwrite_byte(char byte, my_off_t off);
@@ -416,7 +419,7 @@ struct queue_connection_t : private dllist<queue_connection_t> {
   size_t reader_lock_cnt;
   bool owner_mode;
   queue_share_t *share_owned;
-  my_off_t owned_row_off;
+  my_off_t owned_row_off; /* might become 0 if owned row was removed by a DELETE statement and compaction occurred */
   my_off_t owned_row_id;
   my_off_t owned_row_off_post_compact;
   queue_source_t source;
@@ -468,8 +471,9 @@ class ha_queue: public handler
   const char **bas_ext() const;
   ulonglong table_flags() const {
     return HA_NO_TRANSACTIONS | HA_REC_NOT_IN_SEQ | HA_CAN_GEOMETRY
-      | HA_CAN_BIT_FIELD | HA_BINLOG_ROW_CAPABLE | HA_BINLOG_STMT_CAPABLE
-      | HA_FILE_BASED | HA_NO_AUTO_INCREMENT;
+      | HA_STATS_RECORDS_IS_EXACT | HA_CAN_BIT_FIELD | HA_BINLOG_ROW_CAPABLE
+      | HA_BINLOG_STMT_CAPABLE | HA_FILE_BASED | HA_NO_AUTO_INCREMENT
+      | HA_HAS_RECORDS;
   }
 
   ulong index_flags(uint, uint, bool) const {
@@ -486,6 +490,7 @@ class ha_queue: public handler
   void position(const uchar *record);
   
   int info(uint);
+  ha_rows records();
   int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info);
 
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
