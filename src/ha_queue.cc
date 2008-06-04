@@ -284,6 +284,30 @@ uchar* queue_share_t::get_share_key(queue_share_t *share, size_t *length,
   return reinterpret_cast<uchar*>(share->table_name);
 }
 
+void queue_share_t::recalc_row_count()
+{
+  my_off_t off = _header.begin(), row_count = 0;
+  
+  while (off != _header.end()) {
+    queue_row_t row;
+    if (read(&row, off, queue_row_t::header_size())
+	!= static_cast<ssize_t>(queue_row_t::header_size())) {
+      kill_proc("I/O error: %s\n", table_name);
+    }
+    switch (row.type()) {
+    case queue_row_t::type_row:
+    case queue_row_t::type_row_received:
+      row_count++;
+      break;
+    default:
+      break;
+    }
+    off = row.next(off);
+  }
+  
+  _header.set_row_count(row_count);
+}
+
 void queue_share_t::fixup_header()
 {
   /* update end */
@@ -354,24 +378,7 @@ void queue_share_t::fixup_header()
  BEGIN_FOUND:
   _header.set_begin(off, row_id);
   /* update row_count */
-  my_off_t row_count = 0;
-  while (off < _header.end()) {
-    queue_row_t row;
-    if (read(&row, off, queue_row_t::header_size())
-	!= static_cast<ssize_t>(queue_row_t::header_size())) {
-      kill_proc("I/O erro: %s\n", table_name);
-    }
-    switch (row.type()) {
-    case queue_row_t::type_row:
-    case queue_row_t::type_row_received:
-      row_count++;
-      break;
-    default:
-      break;
-    }
-    off = row.next(off);
-  }
-  _header.set_row_count(row_count);
+  recalc_row_count();
   /* save */
   _header.set_attr(_header.attr() & ~queue_file_header_t::attr_is_dirty);
   _header.write(fd);
@@ -551,9 +558,11 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   default:
     goto ERR_AFTER_FILEOPEN;
   }
-  /* sanity check */
+  /* sanity check (or update row count if necessary) */
   if ((share->_header.attr() & queue_file_header_t::attr_is_dirty) != 0) {
     share->fixup_header();
+  } else if (share->_header.row_count() == 0) {
+    share->recalc_row_count();
   }
   /* set dirty flag */
   share->_header.set_attr(share->_header.attr()

@@ -339,6 +339,7 @@ private:
   size_t fixed_buf_size;
   
 public:
+  void recalc_row_count();
   void fixup_header();
 #ifdef Q4M_USE_MMAP
   int mmap_table(size_t new_size);
