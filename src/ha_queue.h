@@ -472,8 +472,9 @@ class ha_queue: public handler
   const char **bas_ext() const;
   ulonglong table_flags() const {
     return HA_NO_TRANSACTIONS | HA_REC_NOT_IN_SEQ | HA_CAN_GEOMETRY
-      | HA_STATS_RECORDS_IS_EXACT | HA_CAN_BIT_FIELD | HA_BINLOG_ROW_CAPABLE
-      | HA_BINLOG_STMT_CAPABLE | HA_FILE_BASED | HA_NO_AUTO_INCREMENT
+      | HA_STATS_RECORDS_IS_EXACT | HA_CAN_BIT_FIELD
+      /* | HA_BINLOG_ROW_CAPABLE | HA_BINLOG_STMT_CAPABLE */ 
+      | HA_FILE_BASED | HA_NO_AUTO_INCREMENT
       | HA_HAS_RECORDS;
   }
 
