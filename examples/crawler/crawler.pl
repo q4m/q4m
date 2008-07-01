@@ -13,7 +13,7 @@ use Parallel::Prefork;
 # setup
 my $dbi = 'dbi:mysql:test;user=root;mysql_enable_utf8=1';
 my $reqs_per_child = 100;
-my $retry_interval = 5;
+my $retry_interval = 5 * 60; # 5 minutes
 my $max_retries = 5;
 my $num_workers = 10;
 my $benchmark_mode = undef;
@@ -43,7 +43,7 @@ my $pm = Parallel::Prefork->new({
 
 # start first $max_retries processes for rescheduling failed requests
 my @resched_pids;
-for (my $i = 1; $i < $max_retries; $i++) {
+for (my $i = 1; $i <= $max_retries; $i++) {
     my $pid = fork;
     die 'fork error' unless defined $pid;
     unless ($pid) {
@@ -80,10 +80,11 @@ sub run {
     # loop while we have uris in queue
     my $loop_cnt = 0;
     while ($loop_cnt < $reqs_per_child) {
-        # load a url to fetch
-        my ($id, $fail_cnt) =
-            SELECT ROW id,fail_cnt FROM crawler_queue
-                WHERE queue_wait('crawler_queue');
+        # load a url to fetch: we cannot use WHERE queue_wait... since the
+	# insertion to crawler_queue is done by trigger, and triggers require
+	# table locks :-(
+	SELECT ROW queue_wait('crawler_queue');;
+        my ($id, $fail_cnt) = SELECT ROW id,fail_cnt FROM crawler_queue;
             or next;
         my ($url) = SELECT ROW url FROM url WHERE id=$id;
             or next;
@@ -107,7 +108,7 @@ sub run {
 # move entry in resheduler_queue to queue
 sub run_rescheduler {
     my ($fail_cnt) = @_;
-    my $interval = $retry_interval * 2 ** $fail_cnt;
+    my $interval = $retry_interval * 2 ** ($fail_cnt - 1);
     
     while (1) {
         my ($id, $fail_cnt, $at) =
