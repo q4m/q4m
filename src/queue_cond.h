@@ -6,25 +6,38 @@ class queue_cond_expr_t;
 class queue_cond_t {
 public:  
   
-  struct value_t {
+  class value_t {
+  public:
     enum {
       null_t,
-      int_t
-    } type;
+      int_t,
+      float_t
+    };
+  protected:
+    int t;
     long long l;
+    double f;
+  public:
+    int type() const { return t; }
+    long long to_i() const { return l; }
+    double to_f() const { return f; }
     bool is_true() const {
-      switch (type) {
+      switch (t) {
       case int_t:
 	return l != 0;
+      case float_t:
+	return f != 0;
       default:
 	break;
       }
       return false;
     }
     bool is_false() const {
-      switch (type) {
+      switch (t) {
       case int_t:
 	return l == 0;
+      case float_t:
+	return f == 0;
       default:
 	break;
       }
@@ -32,17 +45,32 @@ public:
     }
     static value_t null_value() { return value_t(); }
     static value_t int_value(long long l) { return value_t(l); }
+    static value_t float_value(double f) { return value_t(f); }
     static int compare(const value_t &x, const value_t &y) {
-      if (x.l < y.l) {
-	return -1;
-      } else if (x.l > y.l) {
-	return 1;
+      if (x.t == null_t) {
+	return y.t == null_t ? 0 : 1;
+      } else if (y.t == null_t) {
+	return x.t == null_t ? 0 : -1;
+      } else if (x.t == int_t && y.t == int_t) {
+	if (x.l < y.l) {
+	  return -1;
+	} else if (x.l > y.l) {
+	  return 1;
+	}
+	return 0;
+      } else {
+	if (x.f < y.f) {
+	  return -1;
+	} else if (x.f > y.f) {
+	  return 1;
+	}
+	return 0;
       }
-      return 0;
     }
   private:
-    explicit value_t() : type(null_t) {}
-    explicit value_t(long long _l) : type(int_t), l(_l) {}
+    explicit value_t() : t(null_t) {}
+    explicit value_t(long long _l) : t(int_t), l(_l), f(_l) {}
+    explicit value_t(double _f) : t(float_t), l(_f), f(_f) {}
   };
   
   struct node_t {
@@ -97,7 +125,7 @@ public:
   template<class T> struct unary_op : public pop_op<1> {
     virtual value_t get_value(const queue_cond_t *ctx) const {
       value_t vx = nodes[0]->get_value(ctx);
-      if (vx.type == value_t::null_t) {
+      if (vx.type() == value_t::null_t) {
 	return value_t::null_value();
       }
       return static_cast<const T*>(this)->uop(vx);
@@ -105,17 +133,22 @@ public:
   };
   struct neg_op : public unary_op<neg_op> {
     value_t uop(const value_t &x) const {
-      return value_t::int_value(-x.l);
+      if (x.type() == value_t::int_t) {
+	return value_t::int_value(-x.to_i());
+      } else {
+	return value_t::float_value(-x.to_f());
+      }
     }
   };
   struct not_op : public unary_op<not_op> {
     value_t uop(const value_t &x) const {
-      return value_t::int_value(! x.l);
+      return value_t::int_value(x.type() == value_t::int_t
+				? ! x.to_i() : ! x.to_f());
     }
   };
   struct bitinv_op : public unary_op<bitinv_op> {
     value_t uop(const value_t &x) const {
-      return value_t::int_value(~ x.l);
+      return value_t::int_value(~ x.to_i());
     }
   };
   struct istrue_op : public pop_op<1> {
@@ -140,13 +173,13 @@ public:
   };
   struct isnull_op : public pop_op<1> {
     virtual value_t get_value(const queue_cond_t *ctx) const {
-      return value_t::int_value(nodes[0]->get_value(ctx).type
+      return value_t::int_value(nodes[0]->get_value(ctx).type()
 				== value_t::null_t);
     }
   };
   struct isnotnull_op : public pop_op<1> {
     virtual value_t get_value(const queue_cond_t *ctx) const {
-      return value_t::int_value(nodes[0]->get_value(ctx).type
+      return value_t::int_value(nodes[0]->get_value(ctx).type()
 				!= value_t::null_t);
     }
   };
@@ -154,7 +187,7 @@ public:
     virtual value_t get_value(const queue_cond_t *ctx) const {
       value_t vx = nodes[0]->get_value(ctx);
       value_t vy = nodes[1]->get_value(ctx);
-      if (vx.type == value_t::null_t || vy.type == value_t::null_t) {
+      if (vx.type() == value_t::null_t || vy.type() == value_t::null_t) {
 	return value_t::null_value();
       }
       return static_cast<const T*>(this)->bop(vx, vy);
@@ -183,31 +216,29 @@ public:
   struct ge_op : public cmp_op<ge_op> {
     static bool cmp2b(int r) { return r >= 0; }
   };
-  struct add_op : public binary_op<add_op> {
-    value_t bop(const value_t &x, const value_t &y) const {
-      return value_t::int_value(x.l + y.l);
-    }
-  };
-  struct sub_op : public binary_op<sub_op> {
-    value_t bop(const value_t &x, const value_t &y) const {
-      return value_t::int_value(x.l - y.l);
-    }
-  };
-  struct mul_op : public binary_op<mul_op> {
-    value_t bop(const value_t &x, const value_t &y) const {
-      return value_t::int_value(x.l * y.l);
-    }
-  };
+#define BOP(klass, op)							\
+  struct klass : public binary_op<klass> {				\
+    value_t bop(const value_t &x, const value_t &y) const {		\
+      if (x.type() == value_t::int_t && y.type() == value_t::int_t) {	\
+	return value_t::int_value(x.to_i() op y.to_i());		\
+      } else {								\
+	return value_t::float_value(x.to_f() op y.to_f());		\
+      }									\
+    }									\
+  }
+  BOP(add_op, +);
+  BOP(sub_op, -);
+  BOP(mul_op, *);
   struct intdiv_op : public binary_op<intdiv_op> {
     value_t bop(const value_t &x, const value_t &y) const {
-      return value_t::int_value(x.l / y.l);
+      if (y.to_i() == 0) {
+	return value_t::null_value;
+      }
+      return value_t::int_value(x.to_i() / y.to_i());
     }
   };
-  struct mod_op : public binary_op<mod_op> {
-    value_t bop(const value_t &x, const value_t &y) const {
-      return value_t::int_value(x.l % y.l);
-    }
-  };
+  BOP(mod_op, %);
+#undef BOP
   struct bitor_op : public binary_op<bitor_op> {
     value_t bop(const value_t &x, const value_t &y) const {
       return value_t::int_value(x.l | y.l);
@@ -242,7 +273,7 @@ public:
       value_t vy = nodes[1]->get_value(ctx);
       if (vy.is_true()) {
 	return value_t::int_value(1);
-      } else if (vx.type == value_t::null_t || vy.type == value_t::null_t) {
+      } else if (vx.type() == value_t::null_t || vy.type() == value_t::null_t) {
 	return value_t::null_value();
       }
       return value_t::int_value(0);
@@ -252,7 +283,7 @@ public:
     virtual value_t get_value(const queue_cond_t *ctx) const {
       value_t vx = nodes[0]->get_value(ctx);
       value_t vy = nodes[1]->get_value(ctx);
-      if (vx.type == value_t::null_t && vy.type == value_t::null_t) {
+      if (vx.type() == value_t::null_t && vy.type() == value_t::null_t) {
 	return value_t::null_value();
       }
       return value_t::int_value(vx.is_true() && vy.is_true());
@@ -265,7 +296,11 @@ public:
   };
   struct pow_func : public binary_op<pow_func> {
     value_t bop(const value_t &x, const value_t &y) const {
-      return value_t::int_value(static_cast<long long>(powl(x.l, y.l)));
+      if (x.type() == value_t::int_t && y.type() == value_t::int_t) {
+	return value_t::int_value(static_cast<long long>(pow(x.l, y.l)));
+      } else {
+	return value_t::float_value(pow(x.f, y.f));
+      }
     }
   };
 
