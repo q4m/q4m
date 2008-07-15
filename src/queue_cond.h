@@ -200,11 +200,17 @@ public:
   };
   struct intdiv_op : public binary_op<intdiv_op> {
     value_t bop(const value_t &x, const value_t &y) const {
+      if (y.l == 0) {
+	return value_t::null_value();
+      }
       return value_t::int_value(x.l / y.l);
     }
   };
   struct mod_op : public binary_op<mod_op> {
     value_t bop(const value_t &x, const value_t &y) const {
+      if (y.l == 0) {
+	return value_t::null_value();
+      }
       return value_t::int_value(x.l % y.l);
     }
   };
