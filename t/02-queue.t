@@ -10,13 +10,19 @@ BEGIN {
     $TEST_ROWS = $ENV{TEST_ROWS} || 1024;
 };
 
-use Test::More tests => $TEST_ROWS * 3 + 4;
+use Test::More tests => $TEST_ROWS * 3 + 5;
 
 my $dbh = DBI->connect(
     $ENV{DBI} || 'dbi:mysql:database=test;host=localhost',
     $ENV{DBI_USER} || 'root',
     $ENV{DBI_PASSWORD} || '',
 ) or die 'connection failed:';
+
+# queue_wait should return null for non-existent table
+is_deeply(
+    $dbh->selectall_arrayref('select queue_wait("nonexistent_table",1)'),
+    [ [ undef ] ],
+);
 
 ok($dbh->do('drop table if exists q4m_t'));
 ok($dbh->do('create table q4m_t (v int not null) engine=queue'));
