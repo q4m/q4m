@@ -2370,7 +2370,7 @@ static queue_share_t* get_share_check(const char* db_table_name)
   
   build_table_filename(path, FN_REFLEN - 1, db, tbl, "", 0);
   queue_share_t *share = queue_share_t::get_share(path);
-  if (! share->init_fixed_fields(NULL)) {
+  if (share != NULL && ! share->init_fixed_fields(NULL)) {
     log("failed to initialize fixed field info.\n");
     share->release();
     share = NULL;
