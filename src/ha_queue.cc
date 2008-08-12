@@ -2524,7 +2524,7 @@ mysql_declare_plugin(queue)
   PLUGIN_LICENSE_GPL,
   init_plugin,
   deinit_plugin,
-  0x0001,
+  Q4M_VERSION_HEX,
   NULL,                       /* status variables                */
   NULL,                       /* system variables                */
   NULL                        /* config options                  */
