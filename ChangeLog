@@ -1,3 +1,22 @@
+0.8 - Tue Aug 13 00:00:00 JST 2008
+	- fix race condition bug that leads to memory corruption on multi-table queue_wait
+	- fix errors when calling queue_wait with multiple arguments specifying a single table (with different conditions)
+	- protect divide-by-zero crash on conditional subscription
+	- fix crash when queue_wait was called with a nonexistent (or non-Q4M) table as its argument
+	
+0.7 - Tue Jul 01 00:00:00 JST 2008
+	- faster (cached) SELECT COUNT(*)
+	- dropped (incorrect) binlog capability flags
+	- add sample implementation of a web spider
+	
+0.6 - Mon Jun 02 00:00:00 JST 2008
+	- performance improvements
+	- add optimized test codes
+	- detect misuse of queue_wait
+
+0.5.1 - Tue May 20 00:00:00 JST 2008
+	- fixed potential bugs that might block table compaction or return an empty result set when data exists
+	
 0.5 - Sat May 03 18:21:00 JST 2008
 	- fix compile error with mysql 5.1.24-rc
 	- improve examples
