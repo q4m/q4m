@@ -72,7 +72,7 @@ is_deeply(
     $dbh->selectall_arrayref(
         q{select queue_wait('q4m_t:prio=0','q4m_t:prio=1',10)},
     ),
-    [ [ 1 ] ],
+    [ [ 2 ] ],
 );
 is_deeply(
     $dbh->selectall_arrayref(

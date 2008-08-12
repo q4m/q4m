@@ -858,7 +858,7 @@ void queue_share_t::unregister_listener(listener_t *l)
   for (listener_list_t::iterator i = listener_list.begin();
        i != listener_list.end();
        ++i) {
-    if (i->first == l) {
+    if (i->l == l) {
       listener_list.erase(i);
       break;
     }
@@ -898,15 +898,15 @@ bool queue_share_t::wake_listeners(bool from_writer)
   // remove listeners with signals received
   listener_list_t::iterator l = listener_list.begin();
   while (l != listener_list.end()) {
-    if (l->first->listener->share_owned != NULL) {
+    if (l->l->listener->share_owned != NULL) {
       l = listener_list.erase(l);
     } else {
-      if (l->second != &cond_expr_true) {
+      if (l->cond != &cond_expr_true) {
 	use_cond_expr = true;
       }
-      if (l->second->pos < off) {
-	off = l->second->pos;
-	row_id = l->second->row_id;
+      if (l->cond->pos < off) {
+	off = l->cond->pos;
+	row_id = l->cond->row_id;
       }
       ++l;
     }
@@ -927,7 +927,7 @@ bool queue_share_t::wake_listeners(bool from_writer)
   if (off != _header.end()) {
     l = listener_list.begin();
     while (l != listener_list.end()) {
-      if (l->first->listener->share_owned != NULL) {
+      if (l->l->listener->share_owned != NULL) {
 	l = listener_list.erase(l);
 	continue;
       }
@@ -939,7 +939,7 @@ bool queue_share_t::wake_listeners(bool from_writer)
 	  goto UNLOCK_ALL_RETURN;
 	}
       }
-      if (check_cond_and_wake(off, row_id, l->first, l->second) != 0) {
+      if (check_cond_and_wake(off, row_id, &*l) != 0) {
 	l = listener_list.erase(l);
       } else {
 	++l;
@@ -1311,34 +1311,35 @@ void queue_share_t::release_cond_expr(cond_expr_t *e)
 }
 
 my_off_t queue_share_t::check_cond_and_wake(my_off_t off, my_off_t row_id,
-					    listener_t *l, cond_expr_t  *cond)
+					    listener_cond_t *l)
 {
   while (off != _header.end()) {
     if (find_owner(off) == 0) {
       /* check if the row matches given condition */
       bool found = false;
-      if (cond == &cond_expr_true) {
+      if (l->cond == &cond_expr_true) {
 	found = true;
-      } else if (cond->pos < off) {
-	cond->pos = off;
+      } else if (l->cond->pos < off) {
+	l->cond->pos = off;
 	stat_cond_eval.incr();
 	if (setup_cond_eval(off) != 0) {
 	  log("internal error, table corrupt? (off:%llu)\n", off);
 	  break;
 	}
-	if (cond_eval.evaluate(cond->node)) {
+	if (cond_eval.evaluate(l->cond->node)) {
 	  found = true;
 	}
       }
       // log("cond: %s, offset: %llu, %s\n", cond->expr, off, found ? "found" : "not found");
       if (found) {
-	queue_connection_t *conn = l->listener;
+	queue_connection_t *conn = l->l->listener;
 	conn->share_owned = this;
 	conn->owned_row_off = off;
 	conn->owned_row_id = row_id;
 	conn->add_to_owned_list(rows_owned);
 	max_owned_row_off = max(off, max_owned_row_off);
-	pthread_cond_signal(&l->cond);
+	l->l->queue_wait_index = l->queue_wait_index;
+	pthread_cond_signal(&l->l->cond);
 	return off;
       }
     }
@@ -2661,14 +2662,14 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
     if (share_owned == -1) {
       queue_share_t::listener_t listener(conn);
       for (int i = 0; i < num_shares; i++) {
-	shares[i]->register_listener(&listener, cond_exprs[i]);
+	shares[i]->register_listener(&listener, cond_exprs[i], i);
 	share_lock_t::unlock(locks, shares[i]);
       }
       timedwait_cond(&listener.cond, &listener_mutex, timeout);
+      share_owned = listener.queue_wait_index;
+      assert(share_owned == -1 || shares[share_owned] == conn->share_owned);
       for (int i = 0; i < num_shares; i++) {
-	if (shares[i] == conn->share_owned) {
-	  share_owned = i;
-	} else {
+	if (i != share_owned) {
 	  shares[i]->unregister_listener(&listener);
 	}
       }

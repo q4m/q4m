@@ -273,14 +273,22 @@ public:
   struct listener_t {
     pthread_cond_t cond;
     queue_connection_t *listener;
-    listener_t(queue_connection_t *t) : listener(t) {
+    int queue_wait_index;
+    listener_t(queue_connection_t *t) : listener(t), queue_wait_index(-1) {
       pthread_cond_init(&cond, NULL);
     }
     ~listener_t() {
       pthread_cond_destroy(&cond);
     }
   };
-  typedef std::list<std::pair<listener_t*, cond_expr_t*> > listener_list_t;
+  struct listener_cond_t {
+    listener_t *l;
+    cond_expr_t *cond;
+    int queue_wait_index;
+    listener_cond_t(listener_t *_l, cond_expr_t *c, int qwi)
+    : l(_l), cond(c), queue_wait_index(qwi) {}
+  };
+  typedef std::list<listener_cond_t> listener_list_t;
   
 private:
   uint ref_cnt;
@@ -360,8 +368,8 @@ public:
 #endif
   bool lock_reader(bool from_queue_wait = false);
   void unlock_reader(bool from_queue_wait = false);
-  void register_listener(listener_t *l, cond_expr_t *c) {
-    listener_list.push_back(std::make_pair(l, c));
+  void register_listener(listener_t *l, cond_expr_t *c, int queue_wait_index) {
+    listener_list.push_back(listener_cond_t(l, c, queue_wait_index));
   }
   void unregister_listener(listener_t *l);
   bool wake_listeners(bool from_writer = false);
@@ -398,8 +406,8 @@ public:
   cond_expr_t* compile_cond_expr(const char *expr, size_t len);
   void release_cond_expr(cond_expr_t *e);
 private:
-  my_off_t check_cond_and_wake(my_off_t off, my_off_t row_id, listener_t *l,
-			       cond_expr_t *cond);
+  my_off_t check_cond_and_wake(my_off_t off, my_off_t row_id,
+			       listener_cond_t *l);
   int writer_do_append(append_list_t *l);
   int do_remove_rows(my_off_t *offsets, int cnt);
 #if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
