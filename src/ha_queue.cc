@@ -485,7 +485,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   /* return the one, if found (after incrementing refcount) */
   if ((share = reinterpret_cast<queue_share_t*>(hash_search(&queue_open_tables, reinterpret_cast<const uchar*>(table_name), table_name_length)))
       != NULL) {
-    ++share->use_count;
+    ++share->ref_cnt;
     pthread_mutex_unlock(&open_mutex);
     return share;
   }
@@ -498,7 +498,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   }
   
   /* init members that would always succeed in doing so */
-  share->use_count = 1;
+  share->ref_cnt = 1;
   share->table_name = tmp_name;
   strmov(share->table_name, table_name);
   share->table_name_length = table_name_length;
@@ -642,11 +642,18 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   return NULL;
   }
 
+void queue_share_t::detach()
+{
+  pthread_mutex_lock(&open_mutex);
+  hash_delete(&queue_open_tables, reinterpret_cast<uchar*>(this));
+  pthread_mutex_unlock(&open_mutex);
+}
+
 void queue_share_t::release()
 {
   pthread_mutex_lock(&open_mutex);
   
-  if (--use_count == 0) {
+  if (--ref_cnt == 0) {
     delete [] fixed_buf;
     for (size_t i = 0; i < fields; i++) {
       delete fixed_fields[i];
@@ -2246,6 +2253,14 @@ int ha_queue::delete_row(const uchar *buf __attribute__((unused)))
   }
   
   return err;
+}
+
+int ha_queue::delete_table(const char *name)
+{
+  if (share != NULL || (share = queue_share_t::get_share(name)) != NULL) {
+    share->detach();
+  }
+  return handler::delete_table(name);
 }
 
 int ha_queue::prepare_rows_buffer(size_t sz)

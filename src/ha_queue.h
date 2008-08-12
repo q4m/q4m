@@ -283,7 +283,7 @@ public:
   typedef std::list<std::pair<listener_t*, cond_expr_t*> > listener_list_t;
   
 private:
-  uint use_count;
+  uint ref_cnt;
   char *table_name;
   uint table_name_length;
   
@@ -348,6 +348,7 @@ public:
   static uchar *get_share_key(queue_share_t *share, size_t *length,
 			      my_bool not_used);
   static queue_share_t *get_share(const char* table_name);
+  void detach();
   void release();
   bool init_fixed_fields(TABLE *_table);
 #ifdef SAFE_MUTEX
@@ -512,7 +513,8 @@ class ha_queue: public handler
   int write_row(uchar *buf);
   int update_row(const uchar *old_data, uchar *new_data);
   int delete_row(const uchar *buf);
- private:
+private:
+  int delete_table(const char *name);
   int prepare_rows_buffer(size_t sz);
   void free_rows_buffer(bool force = false);
   void unpack_row(uchar *buf);
