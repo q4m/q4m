@@ -248,10 +248,11 @@ public:
     my_off_t row_id;
     cond_expr_t(queue_cond_t::node_t *n, const char *e, size_t el, my_off_t p,
 		my_off_t i)
-    : dllist<cond_expr_t>(), node(n), expr(new char [el]), expr_len(el),
+    : dllist<cond_expr_t>(), node(n), expr(new char [el + 1]), expr_len(el),
       ref_cnt(1), pos(p), row_id(i)
     {
       std::copy(e, e + el, expr);
+      expr[el] = '\0';
     }
     void free(cond_expr_t **list) {
       if (list != NULL) {
@@ -396,6 +397,8 @@ public:
   cond_expr_t* compile_cond_expr(const char *expr, size_t len);
   void release_cond_expr(cond_expr_t *e);
 private:
+  my_off_t check_cond_and_wake(my_off_t off, my_off_t row_id, listener_t *l,
+			       cond_expr_t *cond);
   int writer_do_append(append_list_t *l);
   int do_remove_rows(my_off_t *offsets, int cnt);
 #if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
@@ -437,6 +440,7 @@ private:
   ~queue_connection_t() {}
 public:
   void add_to_owned_list(queue_connection_t *&head) {
+    assert(! is_attached());
     attach_back(head);
   }
   queue_connection_t *remove_from_owned_list(queue_connection_t *&head) {

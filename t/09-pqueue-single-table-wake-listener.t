@@ -46,7 +46,7 @@ is_deeply(
 
 is_deeply(
     $dbh->selectall_arrayref(
-        q{select queue_wait('q4m_t:prio=0','q4m_t:prio=1',1)},
+        q{select queue_wait('q4m_t:prio=0','q4m_t:prio=1',10)},
     ),
     [ [ 1 ] ],
 );
@@ -58,7 +58,7 @@ is_deeply(
 );
 is_deeply(
     $dbh->selectall_arrayref(
-        q{select queue_wait('q4m_t:prio=0','q4m_t:prio=1',1)},
+        q{select queue_wait('q4m_t:prio=0','q4m_t:prio=1',10)},
     ),
     [ [ 2 ] ],
 );
@@ -70,7 +70,7 @@ is_deeply(
 );
 is_deeply(
     $dbh->selectall_arrayref(
-        q{select queue_wait('q4m_t:prio=0','q4m_t:prio=1',1)},
+        q{select queue_wait('q4m_t:prio=0','q4m_t:prio=1',10)},
     ),
     [ [ 1 ] ],
 );
@@ -85,7 +85,7 @@ is_deeply(
     $dbh->selectall_arrayref(
         q{select queue_end()},
     ),
-    [ 1 ],
+    [ [ 1 ] ],
 );
 
 is_deeply(

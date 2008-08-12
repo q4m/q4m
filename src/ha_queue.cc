@@ -908,7 +908,7 @@ bool queue_share_t::wake_listeners(bool from_writer)
     goto UNLOCK_G_RETURN;
   }
   
-  // per-row test
+  // per-listener test
   lock();
   if (off == 0) {
     off = _header.begin();
@@ -917,48 +917,26 @@ bool queue_share_t::wake_listeners(bool from_writer)
     log("internal error, table corrupt?\n");
     goto UNLOCK_ALL_RETURN;
   }
-  while (off != _header.end()) {
-    while (find_owner(off) != 0) {
-      if (next(&off, &row_id) != 0) {
-	log("internal error, table corrupt? (off:%llu)\n", off);
-	goto UNLOCK_ALL_RETURN;
-      } else if (off == _header.end()) {
-	goto UNLOCK_ALL_RETURN;
+  if (off != _header.end()) {
+    l = listener_list.begin();
+    while (l != listener_list.end()) {
+      if (l->first->listener->share_owned != NULL) {
+	l = listener_list.erase(l);
+	continue;
       }
-    }
-    if (use_cond_expr && setup_cond_eval(off) != 0) {
-      log("internal error, table corrupt?\n");
-      goto UNLOCK_ALL_RETURN;
-    }
-    for (l = listener_list.begin(); l != listener_list.end(); ++l) {
-      bool found = false;
-      if (l->second == &cond_expr_true) {
-	found = true;
-      } else if (l->second->pos < off) {
-	l->second->pos = off;
-	stat_cond_eval.incr();
-	if (cond_eval.evaluate(l->second->node)) {
-	  found = true;
-	}
-      }
-      if (found) {
-	queue_connection_t *conn = l->first->listener;
-	conn->share_owned = this;
-	conn->owned_row_off = off;
-	conn->owned_row_id = row_id;
-	conn->add_to_owned_list(rows_owned);
-	max_owned_row_off = max(off, max_owned_row_off);
-	pthread_cond_signal(&l->first->cond);
-	listener_list.erase(l);
-	if (listener_list.size() == 0) {
+      while (find_owner(off) != 0) {
+	if (next(&off, &row_id) != 0) {
+	  log("internal error, table corrupt? (off:%llu)\n", off);
+	  goto UNLOCK_ALL_RETURN;
+	} else if (off == _header.end()) {
 	  goto UNLOCK_ALL_RETURN;
 	}
-	break;
       }
-    }
-    if (next(&off, &row_id) != 0) {
-      log("internal error, table corrupt? (off:%llu)\n", off);
-      goto UNLOCK_ALL_RETURN;
+      if (check_cond_and_wake(off, row_id, l->first, l->second) != 0) {
+	l = listener_list.erase(l);
+      } else {
+	++l;
+      }
     }
   }
  UNLOCK_ALL_RETURN:
@@ -1323,6 +1301,47 @@ void queue_share_t::release_cond_expr(cond_expr_t *e)
     }
   }
   unlock();
+}
+
+my_off_t queue_share_t::check_cond_and_wake(my_off_t off, my_off_t row_id,
+					    listener_t *l, cond_expr_t  *cond)
+{
+  while (off != _header.end()) {
+    if (find_owner(off) == 0) {
+      /* check if the row matches given condition */
+      bool found = false;
+      if (cond == &cond_expr_true) {
+	found = true;
+      } else if (cond->pos < off) {
+	cond->pos = off;
+	stat_cond_eval.incr();
+	if (setup_cond_eval(off) != 0) {
+	  log("internal error, table corrupt? (off:%llu)\n", off);
+	  break;
+	}
+	if (cond_eval.evaluate(cond->node)) {
+	  found = true;
+	}
+      }
+      // log("cond: %s, offset: %llu, %s\n", cond->expr, off, found ? "found" : "not found");
+      if (found) {
+	queue_connection_t *conn = l->listener;
+	conn->share_owned = this;
+	conn->owned_row_off = off;
+	conn->owned_row_id = row_id;
+	conn->add_to_owned_list(rows_owned);
+	max_owned_row_off = max(off, max_owned_row_off);
+	pthread_cond_signal(&l->cond);
+	return off;
+      }
+    }
+    if (next(&off, &row_id) != 0) {
+      log("internal error, table corrupt? (off:%llu)\n", off);
+      break;
+    }
+  }
+  
+  return 0;
 }
 
 static void close_append_list(queue_share_t::append_list_t *l, int err)
