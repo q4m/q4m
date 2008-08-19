@@ -546,6 +546,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   if ((share->fd = open(filename, O_RDWR, 0)) == -1) {
     goto ERR_ON_FILEOPEN;
   }
+  // log("open:fd=%d:file=%s\n", share->fd, filename);
   /* load header */
   if (sys_pread(share->fd, &share->_header, sizeof(share->_header), 0)
       != sizeof(share->_header)) {
@@ -1887,6 +1888,7 @@ ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
 
 ha_queue::~ha_queue()
 {
+  assert(share == NULL);
   delete bulk_delete_rows;
   bulk_delete_rows = NULL;
   free_rows_buffer(true);
@@ -1915,7 +1917,9 @@ int ha_queue::open(const char *name, int mode, uint test_if_locked)
 
 int ha_queue::close()
 {
+  assert(share != NULL);
   share->release();
+  share = NULL;
   
   return 0;
 }
@@ -2260,6 +2264,8 @@ int ha_queue::delete_table(const char *name)
 {
   if (share != NULL || (share = queue_share_t::get_share(name)) != NULL) {
     share->detach();
+    share->release();
+    share = NULL;
   }
   return handler::delete_table(name);
 }
