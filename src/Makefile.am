@@ -9,7 +9,7 @@ libqueue_cond_a_CFLAGS=		$(AM_CFLAGS) -fPIC
 libqueue_cond_a_CXXFLAGS=	$(AM_CFLAGS) -fPIC
 
 libqueue_engine_la_SOURCES=	ha_queue.cc
-libqueue_engine_la_LIBADD=	queue_cond.o
+libqueue_engine_la_LIBADD=	queue_cond.lo
 libqueue_engine_la_LDFLAGS=	-module
 libqueue_engine_la_CFLAGS=	$(AM_CFLAGS) -DMYSQL_DYNAMIC_PLUGIN
 libqueue_engine_la_CXXFLAGS=	$(AM_CFLAGS) -DMYSQL_DYNAMIC_PLUGIN -fno-rtti -fno-exceptions
