@@ -1,3 +1,6 @@
+0.8.2 - Fri Aug 29 18:45:00 JST 2008
+	- fix SIGFPE of linux binaries on INSTALL PLUGIN (incompatibility of linker hash table)
+	
 0.8.1 - Fri Aug 29 14:30:00 JST 2008
 	- fix file descriptor leak on DROP TABLE (regression in 0.8)
 	- adjustment to fix build error under certain environments
