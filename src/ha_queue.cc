@@ -154,7 +154,7 @@ static void sync_file(int fd)
 {
   if (
 #ifdef FDATASYNC_USE_FCNTL
-      fcntl(fd, F_FULLFSYNC, 0) != -1
+      fcntl(fd, F_FULLFSYNC, 0) == -1
 #elif defined(FDATASYNC_USE_FSYNC)
       fsync(fd) != 0
 #elif defined(FDATASYNC_SKIP)
