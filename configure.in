@@ -67,6 +67,10 @@ then
     CFLAGS="$CFLAGS -fpic"
     CXXFLAGS="$CXXFLAGS -fpic"
 fi
+if test "$OSNAME" = "linux"
+then
+    LDFLAGS="-Wl,--hash-style=both"
+fi
 
 AC_ARG_WITH(debug,
     [   --with-debug            enable debugging, should match the configuration
