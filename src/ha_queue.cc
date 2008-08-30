@@ -662,8 +662,10 @@ void queue_share_t::release()
     }
     delete [] fixed_fields;
     hash_delete(&queue_open_tables, reinterpret_cast<uchar*>(this));
+    pthread_mutex_lock(&mutex);
     writer_exit = true;
     pthread_cond_signal(&to_writer_cond);
+    pthread_mutex_unlock(&mutex);
     if (pthread_join(writer_thread, NULL) != 0) {
       kill_proc("failed to join writer thread\n");
     }
