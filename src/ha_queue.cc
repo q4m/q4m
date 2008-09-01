@@ -1882,7 +1882,7 @@ ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
    rows(NULL),
    rows_size(0),
    rows_reserved(0),
-   bulk_insert_rows(-1),
+   bulk_insert_rows(static_cast<size_t>(-1)),
    bulk_delete_rows(NULL),
    defer_reader_lock(false)
 {
@@ -2181,7 +2181,7 @@ int ha_queue::end_bulk_insert()
     rows_size = 0;
   }
   free_rows_buffer();
-  bulk_insert_rows = -1;
+  bulk_insert_rows = static_cast<size_t>(-1);
   
   return ret;
 }
