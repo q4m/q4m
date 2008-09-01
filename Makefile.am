@@ -5,7 +5,7 @@ EXTRA_DIST=	run_tests.pl config/ac_mysql.m4 support-files/install.sql support-fi
 DOC_ROOT=	@DOC_ROOT@
 
 BINARY_ARCH=	@BINARY_ARCH@
-bindistdir=	$(PACKAGE)-$(VERSION)-$(BINARY_ARCH)
+bindistdir=	@BINARY_DIST_DIR@
 
 remove_bindistdir = \
   { test ! -d $(bindistdir) \
