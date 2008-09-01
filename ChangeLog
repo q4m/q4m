@@ -1,3 +1,7 @@
+0.8.3 - Mon Sep 01 23:30:00 JST 2008
+	- fix race condition error that might cause deadlock on shutdown
+	- fix compile errors on freebsd
+	
 0.8.2 - Fri Aug 29 18:45:00 JST 2008
 	- fix SIGFPE of linux binaries on INSTALL PLUGIN (incompatibility of linker hash table)
 	
