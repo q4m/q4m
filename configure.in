@@ -96,6 +96,8 @@ if test "$with_sync" = "yes"
 then
     if test "$OSNAME" = "darwin" ; then
         with_sync="fcntl"
+    elif test "$OSNAME" = "freebsd" ; then
+	with_sync="fsync"
     else
         with_sync="fdatasync"
     fi
@@ -184,5 +186,6 @@ AC_SUBST(BINARY_DIST_DIR)
 AC_C_CONST
 AC_TYPE_SIZE_T
 AC_CHECK_FUNCS([lseek64])
+AC_CHECK_FUNC(powl, [], [AC_DEFINE([powl],[pow],[use pow instead of powl])])
 AC_CHECK_HEADERS(limits.h syslimits.h)
 AC_OUTPUT(Makefile src/Makefile t/Makefile)
