@@ -6,10 +6,10 @@ AM_LDFLAGS=	-L$(MYSQL_LIBDIR)
 LDADD=		-lmysqlclient
 
 05_multireader_read_SOURCES=	05-multireader-read.c
-05_multireader_read_CFLAGS=	$($AM_CFLAGS)
+05_multireader_read_CFLAGS=	$(AM_CFLAGS)
 
 05_multirw_core_SOURCES=	05-multirw-core.c
-05_multirw_core_CFLAGS=		$($AM_CFLAGS)
+05_multirw_core_CFLAGS=		$(AM_CFLAGS)
 
 05_multiwait_core_SOURCES=	05-multiwait-core.c
-05_multiwait_core_CFLAGS=	$($AM_CFLAGS)
+05_multiwait_core_CFLAGS=	$(AM_CFLAGS)
