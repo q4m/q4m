@@ -29,7 +29,7 @@ my $dbh = DBI->connect(
 ok($dbh->do('drop table if exists q4m_t'));
 ok($dbh->do('create table q4m_t (s mediumtext) engine=queue'));
 
-my $row = '0123456789abcdef' x 64 x 1024; # 1MB
+my $row = '0123456789abcdef' x 64 x 4096; # 4MB
 
 for (my $i = 0; $i < $TEST_ROWS; $i++) {
     ok($dbh->do("insert into q4m_t (s) values ('$row')"));

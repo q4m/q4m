@@ -50,6 +50,9 @@ extern "C" {
 #  define pread  pread64
 #  define pwrite pwrite64
 #endif
+#ifndef O_LARGEFILE
+#  define O_LARGEFILE 0
+#endif
 
 #include "ha_queue.h"
 #include "adler32.c"
@@ -544,7 +547,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   /* open file */
   fn_format(filename, share->table_name, "", Q4M,
 	    MY_REPLACE_EXT | MY_UNPACK_FILENAME);
-  if ((share->fd = open(filename, O_RDWR, 0)) == -1) {
+  if ((share->fd = open(filename, O_RDWR | O_LARGEFILE, 0)) == -1) {
     goto ERR_ON_FILEOPEN;
   }
   // log("open:fd=%d:file=%s\n", share->fd, filename);
@@ -1660,7 +1663,8 @@ int queue_share_t::compact()
 	    MY_REPLACE_EXT | MY_UNPACK_FILENAME);
   fn_format(tmp_filename, table_name, "", Q4T,
 	    MY_REPLACE_EXT | MY_UNPACK_FILENAME);
-  if ((tmp_fd = open(tmp_filename, O_CREAT | O_TRUNC | O_RDWR, 0660))
+  if ((tmp_fd = open(tmp_filename, O_CREAT | O_TRUNC | O_RDWR | O_LARGEFILE,
+		     0660))
       == -1) {
     log("failed to create temporary file: %s\n", tmp_filename);
     goto ERR_RETURN;
@@ -2135,7 +2139,7 @@ int ha_queue::create(const char *name, TABLE *table_arg,
   int fd;
   
   fn_format(filename, name, "", Q4M, MY_REPLACE_EXT | MY_UNPACK_FILENAME);
-  if ((fd = ::open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0660))
+  if ((fd = ::open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE, 0660))
       == -1) {
     return HA_ERR_GENERIC; // ????
   }
