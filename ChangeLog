@@ -1,3 +1,6 @@
+0.8.4 - Mon Feb 02 16:50:00 JST 2009
+	- O_LARGEFILE support (fix crash when handling >2GB table on linux/i386)
+
 0.8.3 - Mon Sep 01 23:30:00 JST 2008
 	- fix race condition error that might cause deadlock on shutdown
 	- fix compile errors on freebsd
