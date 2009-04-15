@@ -1,15 +1,10 @@
 Q4M - a Message Queue for MySQL
 
-Jan 14 2008
+Apr 15 2009
 Kazuho Oku at Cybozu Labs, Inc.
-
 
 Q4M is a message queue that works as a pluggable storage engine of MySQL
 5.1.
-
-Since its development is still in early stage, BE CAREFUL USING THE
-SOFTWARE IN PRODUCTION ENVIRONMENT.
-
 
 * LICENSE and COPYRIGHT
 
@@ -17,6 +12,7 @@ Please refer to each file.  The engine was built from the Skeleton engine
 and the copyright of the build scripts mostly belong to their authors.
 Copyright of the source code of the queue engine belongs to Cybozu Labs,
 Inc., and is licensed under GPLv2.
-
+Copyright of Boost C++ Library belongs to their authors and is licensed
+under Boost Software License.
 
 For more information see doc/index.html.
