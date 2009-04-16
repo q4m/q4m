@@ -3,8 +3,8 @@ dnl For Queue for MySQL - a mysql pluggable storage engine
 AC_INIT(src/ha_queue.cc)
 AC_CONFIG_AUX_DIR(config)
 AM_CONFIG_HEADER(src/queue_config.h)
-AM_INIT_AUTOMAKE("q4m", 0.8.4)
-AC_PREFIX_PROGRAM(mysql)
+AM_INIT_AUTOMAKE("q4m", 0.8.5)
+AC_PREFIX_PROGRAM(mysqld_safe)
 
 AC_PROG_CC
 AM_PROG_CC_C_O
