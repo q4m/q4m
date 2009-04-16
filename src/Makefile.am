@@ -13,3 +13,9 @@ libqueue_engine_la_LIBADD=	queue_cond.lo
 libqueue_engine_la_LDFLAGS=	-module
 libqueue_engine_la_CFLAGS=	$(AM_CFLAGS) -DMYSQL_DYNAMIC_PLUGIN
 libqueue_engine_la_CXXFLAGS=	$(AM_CFLAGS) -DMYSQL_DYNAMIC_PLUGIN -fno-rtti -fno-exceptions
+
+dist-hook: dist-boost
+
+dist-boost:
+	$(AMTAR) cf - --exclude=.svn boost | (cd $(distdir) && tar xf -)
+
