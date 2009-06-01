@@ -309,13 +309,15 @@ void queue_share_t::recalc_row_count()
     off = row.next(off);
   }
   
+  log("setting row count to %llu (was %llu)\n", row_count, _header.row_count());
   _header.set_row_count(row_count);
 }
 
 void queue_share_t::fixup_header()
 {
+  log("%s.Q4M was not closed properly... checking consistency.\n", table_name);
   /* update end */
-  my_off_t off = _header.end();
+  my_off_t off = _header.end(), old_off = off;
   while (1) {
     queue_row_t row;
     if (read(&row, off, queue_row_t::header_size())
@@ -330,6 +332,7 @@ void queue_share_t::fixup_header()
     }
     _header.set_end(off);
   }
+  log("setting end offset to %llu (was %llu).\n", off, old_off);
   /* update last_received_offsets */
   off = _header.begin();
   while (off < _header.end()) {
@@ -380,6 +383,8 @@ void queue_share_t::fixup_header()
     off = row.next(off);
   }
  BEGIN_FOUND:
+  log("setting begin offset to %llu (rowid=%llu), was %llu (%llu)\n",
+      off, row_id, _header.begin(), _header.begin_row_id());
   _header.set_begin(off, row_id);
   /* update row_count */
   recalc_row_count();
@@ -387,6 +392,7 @@ void queue_share_t::fixup_header()
   _header.set_attr(_header.attr() & ~queue_file_header_t::attr_is_dirty);
   _header.write(fd);
   sync_file(fd);
+  log("finished consistency checking.\n");
 }
 
 #ifdef Q4M_USE_MMAP
