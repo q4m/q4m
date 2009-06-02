@@ -309,7 +309,8 @@ void queue_share_t::recalc_row_count()
     off = row.next(off);
   }
   
-  log("setting row count to %llu (was %llu)\n", row_count, _header.row_count());
+  log("setting row count of %s.Q4M to %llu (was %llu)\n", table_name, row_count,
+      _header.row_count());
   _header.set_row_count(row_count);
 }
 
