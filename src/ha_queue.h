@@ -258,7 +258,7 @@ public:
       if (list != NULL) {
 	detach(*list);
       }
-      delete expr;
+      delete [] expr;
       expr = NULL;
       delete node;
       node = NULL;
