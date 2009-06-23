@@ -1088,6 +1088,8 @@ int queue_share_t::next(my_off_t *_off, my_off_t *row_id)
 {
   my_off_t off = *_off;
   
+  assert(off <= _header.end());
+  
   if (off == _header.end()) {
     return 0;
   }
@@ -1313,6 +1315,7 @@ void queue_share_t::release_cond_expr(cond_expr_t *e)
   }
   
   lock();
+  assert(e->ref_cnt != 0);
   if (--e->ref_cnt == 0) {
     e->detach(active_cond_exprs);
     e->attach_front(inactive_cond_exprs);
@@ -2586,6 +2589,7 @@ public:
     share_lock_t *l = locks;
     do {
       if (l->share == share) {
+	assert(l->cnt > 0);
 	if (--l->cnt == 0) {
 	  l->share->unlock();
 	  l->share->unlock_reader(true);
