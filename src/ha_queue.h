@@ -18,6 +18,8 @@
 #ifndef HA_QUEUE_H
 #define HA_QUEUE_H
 
+#include "cac/cac_mutex.h"
+#include "cac/cac_rwlock.h"
 #include "dllist.h"
 #include "queue_cond.h"
 
@@ -211,6 +213,7 @@ struct queue_connection_t;
 class queue_share_t {
   
 public:
+  
   struct append_t {
     const void *rows;
     size_t rows_size, row_count;
@@ -263,11 +266,6 @@ public:
       delete node;
       node = NULL;
     }
-    struct reset_pos {
-      void operator()(cond_expr_t& e) const {
-	e.pos = 0;
-      }
-    };
   };
   
   struct listener_t {
@@ -290,6 +288,69 @@ public:
   };
   typedef std::list<listener_cond_t> listener_list_t;
   
+  struct info_t {
+    queue_file_header_t _header;
+    queue_connection_t *rows_owned;
+    my_off_t max_owned_row_off;
+    pthread_cond_t to_writer_cond;
+    pthread_cond_t *from_writer_cond;
+    pthread_cond_t _from_writer_conds[2];
+    append_list_t *append_list;
+#if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
+#else
+    remove_t *remove_list;
+#endif
+    pthread_cond_t *do_compact_cond;
+    
+    queue_cond_t cond_eval;
+    cond_expr_t *active_cond_exprs;
+    cond_expr_t *inactive_cond_exprs;
+    size_t inactive_cond_expr_cnt;
+    bool writer_exit;
+    
+    size_t null_bytes;
+    size_t fields;
+    uchar *fixed_buf;
+    size_t fixed_buf_size;
+    
+    info_t() : _header(), rows_owned(NULL), max_owned_row_off(0),
+	       append_list(new append_list_t()),
+#if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
+#else
+ remove_list(NULL),
+#endif
+	       do_compact_cond(NULL), cond_eval(), active_cond_exprs(NULL),
+	       inactive_cond_exprs(NULL), inactive_cond_expr_cnt(0),
+	       writer_exit(false), null_bytes(0), fields(0), fixed_buf(NULL),
+	       fixed_buf_size(0)
+    {
+      pthread_cond_init(&to_writer_cond, NULL);
+      pthread_cond_init(&_from_writer_conds[0], NULL);
+      pthread_cond_init(&_from_writer_conds[1], NULL);
+      from_writer_cond = &_from_writer_conds[0];
+    }
+    ~info_t() {
+      delete [] fixed_buf;
+      while (inactive_cond_exprs != NULL) {
+	inactive_cond_exprs->free(&inactive_cond_exprs);
+      }
+      pthread_cond_destroy(&_from_writer_conds[0]);
+      pthread_cond_destroy(&_from_writer_conds[1]);
+      pthread_cond_destroy(&to_writer_cond);
+#if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
+#else
+      assert(remove_list == NULL);
+#endif
+      delete append_list;
+    }
+  };
+  
+  struct cond_expr_reset_pos_t {
+    void operator()(struct info_t *info, cond_expr_t& e) const {
+      e.pos = 0;
+    }
+  };
+  
 private:
   uint ref_cnt;
   char *table_name;
@@ -301,55 +362,38 @@ private:
      compact_mutex: used to serialize threads trying to obtain wrlock(rwlock)
      lock order is compact_mutex -> rwlock -> mutex -> mmap_mutex
    */
-  pthread_mutex_t mutex, compact_mutex;
-#ifdef Q4M_USE_MMAP
-  pthread_mutex_t mmap_mutex;
-#endif
+  pthread_mutex_t compact_mutex;
   pthread_rwlock_t rwlock;
   
   THR_LOCK store_lock;
   
-  int fd;
-  queue_file_header_t _header;
 #ifdef Q4M_USE_MMAP
-  /* non-atomic access to these values should be serialized using mmap_mutex */
-  char *map;
-  size_t map_len;
+  struct mmap_info_t {
+    char *ptr;
+    size_t len;
+    mmap_info_t() : ptr(NULL), len(0) {}
+  };
+  cac_rwlock_t<mmap_info_t> map;
 #endif
   
-  queue_connection_t *rows_owned;
-  my_off_t max_owned_row_off;
+  int fd;
+public:
+  cac_mutex_t<info_t> info;
+private:
+  cond_expr_t cond_expr_true;
   
   listener_list_t listener_list; /* access serialized using listener_mutex */
   
   pthread_t writer_thread;
-  pthread_cond_t to_writer_cond;
-  pthread_cond_t *from_writer_cond;
-  pthread_cond_t _from_writer_conds[2];
-  bool writer_exit;
-  append_list_t *append_list;
-#if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
-#else
-  remove_t *remove_list;
-#endif
-  pthread_cond_t *do_compact_cond;
   
-  queue_cond_t cond_eval;
-  cond_expr_t *active_cond_exprs;
-  cond_expr_t *inactive_cond_exprs;
-  size_t inactive_cond_expr_cnt;
-  cond_expr_t cond_expr_true;
   my_off_t bytes_removed;
+  
   /* following fields are for V2 type table only */
   queue_fixed_field_t **fixed_fields;
-  size_t null_bytes;
-  size_t fields;
-  uchar *fixed_buf;
-  size_t fixed_buf_size;
   
 public:
-  void recalc_row_count();
-  void fixup_header();
+  void recalc_row_count(info_t *info);
+  void fixup_header(info_t *info);
 #ifdef Q4M_USE_MMAP
   int mmap_table(size_t new_size);
 #endif
@@ -358,14 +402,8 @@ public:
   static queue_share_t *get_share(const char* table_name);
   void detach();
   void release();
-  bool init_fixed_fields(TABLE *_table);
-#ifdef SAFE_MUTEX
-  void lock();
-  void unlock();
-#else
-  void lock() { pthread_mutex_lock(&mutex); }
-  void unlock() { pthread_mutex_unlock(&mutex); }
-#endif
+  bool init_fixed_fields();
+  void init_fixed_fields(info_t *info, TABLE *_table);
   bool lock_reader(bool from_queue_wait = false);
   void unlock_reader(bool from_queue_wait = false);
   void register_listener(listener_t *l, cond_expr_t *c, int queue_wait_index) {
@@ -376,37 +414,39 @@ public:
   
   const char *get_table_name() const { return table_name; }
   THR_LOCK *get_store_lock() { return &store_lock; }
-  const queue_file_header_t *header() const { return &_header; }
-  queue_fixed_field_t * const *get_fixed_fields() const { return fixed_fields; }
+  queue_fixed_field_t * const *get_fixed_fields() const {
+    return fixed_fields;
+  }
   my_off_t reset_owner(queue_connection_t *conn);
   int write_rows(const void *rows, size_t rows_size, size_t row_count);
   /* functions below requires lock */
   ssize_t read(void *data, my_off_t off, ssize_t size);
   int overwrite_byte(char byte, my_off_t off);
   int next(my_off_t *off, my_off_t* row_id);
-  template <typename Func> void apply_cond_exprs(const Func& f) {
+  template <typename Func> void apply_cond_exprs(info_t* info, const Func& f) {
     cond_expr_t *e;
-    if ((e = active_cond_exprs) != NULL) {
+    if ((e = info->active_cond_exprs) != NULL) {
       do {
-	f(*e);
-      } while ((e = e->next()) != active_cond_exprs);
+	f(info, *e);
+      } while ((e = e->next()) != info->active_cond_exprs);
     }
-    if ((e = inactive_cond_exprs) != NULL) {
+    if ((e = info->inactive_cond_exprs) != NULL) {
       do {
-	f(*e);
-      } while ((e = e->next()) != inactive_cond_exprs);
+	f(info, *e);
+      } while ((e = e->next()) != info->inactive_cond_exprs);
     }
-    f(cond_expr_true);
+    f(info, cond_expr_true);
   }
   int remove_rows(my_off_t *offsets, int cnt);
   void remove_owner(queue_connection_t *conn);
-  queue_connection_t *find_owner(my_off_t off);
-  my_off_t assign_owner(queue_connection_t *conn, cond_expr_t *cond_expr);
-  int setup_cond_eval(my_off_t pos);
-  cond_expr_t* compile_cond_expr(const char *expr, size_t len);
+  queue_connection_t *find_owner(info_t *info, my_off_t off);
+  my_off_t assign_owner(info_t *info, queue_connection_t *conn,
+			cond_expr_t *cond_expr);
+  int setup_cond_eval(info_t *info, my_off_t pos);
+  cond_expr_t* compile_cond_expr(info_t *info, const char *expr, size_t len);
   void release_cond_expr(cond_expr_t *e);
 private:
-  my_off_t check_cond_and_wake(my_off_t off, my_off_t row_id,
+  my_off_t check_cond_and_wake(info_t *info, my_off_t off, my_off_t row_id,
 			       listener_cond_t *l);
   int writer_do_append(append_list_t *l);
   int do_remove_rows(my_off_t *offsets, int cnt);
@@ -418,13 +458,11 @@ private:
   static void *_writer_start(void* self) {
     return static_cast<queue_share_t*>(self)->writer_start();
   }
-  int compact();
+  int compact(info_t *info);
   queue_share_t();
   ~queue_share_t();
   queue_share_t(const queue_share_t&);
   queue_share_t& operator=(const queue_share_t&);
-
-  friend struct queue_reset_owner_update_cond_expr;
 };
 
 struct queue_connection_t : private dllist<queue_connection_t> {
