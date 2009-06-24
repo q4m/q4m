@@ -28,8 +28,6 @@
 #ifndef cac_mutex_h
 #define cac_mutex_h
 
-#include <pthread.h>
-
 template <typename T> class cac_mutex_t {
 public:
   
@@ -43,8 +41,9 @@ public:
     ~lockref() {
       pthread_mutex_unlock(&m_->mutex_);
     }
-    T& operator*() { return m_->t_; }
-    T* operator->() { return &operator*(); }
+    operator T*() { return &m_->t_; }
+    T& operator*() { return *operator T*(); }
+    T* operator->() { return operator T*(); }
   private:
     lockref(const lockref&);
     lockref& operator=(const lockref&);
@@ -63,6 +62,7 @@ public:
   }
   const T* unsafe_ref() const { return &t_; }
   T* unsafe_ref() { return &t_; }
+  pthread_mutex_t* mutex() { return &mutex_; }
 private:
   cac_mutex_t(const cac_mutex_t&);
   cac_mutex_t& operator=(const cac_mutex_t&);

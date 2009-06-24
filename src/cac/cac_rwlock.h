@@ -28,8 +28,6 @@
 #ifndef cac_rwlock_h
 #define cac_rwlock_h
 
-#include <pthread.h>
-
 template <typename T> class cac_rwlock_t {
 public:
   
@@ -43,8 +41,9 @@ public:
     ~readref() {
       pthread_rwlock_unlock(&m_->rwlock_);
     }
-    const T& operator*() { return m_->t_; }
-    const T* operator->() { return &m_->t_; }
+    operator const T*() { return &m_->t_; }
+    const T& operator*() { return *operator const T*(); }
+    const T* operator->() { return operator const T*(); }
   private:
     readref(const readref&);
     readref& operator=(const readref&);
@@ -58,11 +57,12 @@ public:
     writeref(cac_rwlock_t<T>& m) : readref(m, 0) {
       pthread_rwlock_wrlock(&m.rwlock_);
     }
-    T& operator*() {
+    operator T*() {
       // GCC 4.1 seems to require the use of "this->"
-      return this->m_->t_;
+      return &this->m_->t_;
     }
-    T* operator->() { return &operator*(); }
+    T& operator*() { return *operator T*(); }
+    T* operator->() { return operator T*(); }
   };
   
 protected:
@@ -79,6 +79,7 @@ public:
   }
   const T* unsafe_ref() const { return &t_; }
   T* unsafe_ref() { return &t_; }
+  pthread_rwlock_t* rwlock() { return &rwlock_; }
 private:
   cac_rwlock_t(const cac_rwlock_t&);
   cac_rwlock_t& operator=(const cac_rwlock_t&);
