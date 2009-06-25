@@ -81,6 +81,9 @@ using namespace std;
 
 static HASH queue_open_tables;
 static pthread_mutex_t open_mutex, listener_mutex;
+#if Q4M_DELETE_METHOD == Q4M_DELETE_MSYNC
+static ptrdiff_t psz_mask;
+#endif
 
 #ifdef Q4M_USE_RELATIVE_TIMEDWAIT
 # ifdef SAFE_MUTEX
@@ -489,6 +492,13 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   char filename[FN_REFLEN];
   
   pthread_mutex_lock(&open_mutex);
+  
+#if Q4M_DELETE_METHOD == Q4M_DELETE_MSYNC
+  if (psz_mask == 0) {
+    psz_mask = ~ static_cast<ptrdiff_t>(getpagesize() - 1);
+    log("pagemask set to: %lx\n", psz_mask);
+  }
+#endif
   
   table_name_length = strlen(table_name);
   
@@ -1020,11 +1030,8 @@ int queue_share_t::overwrite_byte(char byte, my_off_t off)
   {
     cac_rwlock_t<mmap_info_t>::readref map(this->map);
     if (off < map->len) {
+      assert(psz_mask != 0);
       map->ptr[off] = byte;
-      static ptrdiff_t psz_mask;
-      if (psz_mask == 0) {
-	psz_mask = ~ static_cast<ptrdiff_t>(getpagesize() - 1);
-      }
       char* page = static_cast<char*>(NULL)
 	+ (reinterpret_cast<ptrdiff_t>(map->ptr + off) & psz_mask);
       if (msync(page, map->ptr + off - page + queue_row_t::header_size(),
@@ -1537,8 +1544,8 @@ void *queue_share_t::writer_start()
       info->_from_writer_conds + (info->_from_writer_conds == notify_cond);
     /* do the task and send back the results */
     pthread_mutex_unlock(this->info.mutex());
-    {
-      int lock = 0; // hide the auto variable lock, since we unlock the lock now
+    { // hide ``info'' since we do not own the lock now
+      int info __attribute__((unused)) = 0;
 #if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
 #else
       if (rl != NULL) {
