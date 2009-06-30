@@ -14,8 +14,10 @@ libqueue_engine_la_LDFLAGS=	-module
 libqueue_engine_la_CFLAGS=	$(AM_CFLAGS) -DMYSQL_DYNAMIC_PLUGIN
 libqueue_engine_la_CXXFLAGS=	$(AM_CFLAGS) -DMYSQL_DYNAMIC_PLUGIN -fno-rtti -fno-exceptions
 
-dist-hook: dist-boost
+dist-hook: dist-boost dist-cac
 
 dist-boost:
-	$(AMTAR) cf - --exclude=.svn boost | (cd $(distdir) && tar xf -)
+	$(AMTAR) cf - --exclude=.svn boost | (cd $(distdir) && $(AMTAR) xf -)
 
+dist-cac:
+	$(AMTAR) cf - --exclude=.svn cac | (cd $(distdir) && $(AMTAR) xf -)
