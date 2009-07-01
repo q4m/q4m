@@ -12,6 +12,8 @@ public:
   }
   bool is_attached(size_t idx = 0) const { return _prev[idx] != NULL; }
   void attach_front(T *&head, size_t idx = 0) {
+    assert(_prev[idx] == NULL);
+    assert(_next[idx] == NULL);
     if (head == NULL) {
       head = _prev[idx] = _next[idx] = static_cast<T*>(this);
     } else {
@@ -22,6 +24,8 @@ public:
     }
   }
   void attach_back(T *&head, size_t idx = 0) {
+    assert(_prev[idx] == NULL);
+    assert(_next[idx] == NULL);
     if (head == NULL) {
       head = _prev[idx] = _next[idx] = static_cast<T*>(this);
     } else {
@@ -31,6 +35,8 @@ public:
     }
   }
   T* detach(T *&head, size_t idx = 0) {
+    assert(_prev[idx] != NULL);
+    assert(_next[idx] != NULL);
     T* n;
     if (head == this) {
       if (_prev[idx] == this) {

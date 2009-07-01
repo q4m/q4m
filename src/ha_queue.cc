@@ -2543,6 +2543,7 @@ public:
       } while ((l = l->next()) != locks);
     }
     l = locks_buf++;
+    new (l) dllist<share_lock_t>();
     l->share = share;
     l->cnt = 0;
     l->attach_front(locks);
