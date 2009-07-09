@@ -684,11 +684,11 @@ void queue_share_t::release()
       info->_header.write(fd);
       sync_file(fd);
       close(fd);
-      if (fixed_fields != NULL) {
+      if (fixed_fields_ != NULL) {
 	for (size_t i = 0; i < info->fields; i++) {
-	  delete fixed_fields[i];
+	  delete fixed_fields_[i];
 	}
-	delete [] fixed_fields;
+	delete [] fixed_fields_;
       }
     }
     info.~cac_mutex_t();
@@ -703,16 +703,20 @@ void queue_share_t::release()
 
 bool queue_share_t::init_fixed_fields()
 {
-  if (fixed_fields != NULL) {
+  if (fixed_fields_ != NULL) {
     return true;
   }
   
   // lock order: LOCK_open -> info_t
   pthread_mutex_lock(&LOCK_open);
+  if (fixed_fields_ != NULL) {
+    pthread_mutex_unlock(&LOCK_open);
+    return true;
+  }
   
   cac_mutex_t<info_t>::lockref info(this->info);
   TABLE table;
-  if (fixed_fields != NULL) {
+  if (fixed_fields_ != NULL) {
     pthread_mutex_unlock(&LOCK_open);
     return true;
   }
@@ -729,12 +733,13 @@ bool queue_share_t::init_fixed_fields()
 
 void queue_share_t::init_fixed_fields(info_t *info, TABLE *table)
 {
-  if (fixed_fields != NULL) {
+  if (fixed_fields_ != NULL) {
     return;
   }
   
   /* setup fixed_fields */
-  fixed_fields = new queue_fixed_field_t* [table->s->fields];
+  queue_fixed_field_t** fixed_fields
+    = new queue_fixed_field_t* [table->s->fields];
   if (info->_header.magic() == queue_file_header_t::MAGIC_V2) {
     Field **field;
     int field_index;
@@ -782,6 +787,7 @@ void queue_share_t::init_fixed_fields(info_t *info, TABLE *table)
     }
   }
   info->fixed_buf = new uchar [info->fixed_buf_size];
+  fixed_fields_ = fixed_fields;
 }
 
 bool queue_share_t::lock_reader(bool from_queue_wait)
@@ -1218,7 +1224,7 @@ int queue_share_t::setup_cond_eval(info_t *info, my_off_t pos)
   /* assign row data to evaluator */
   size_t col_index = 0, offset = info->null_bytes;
   for (size_t i = 0; i < info->fields; i++) {
-    queue_fixed_field_t *field = fixed_fields[i];
+    queue_fixed_field_t *field = fixed_fields_[i];
     if (field != NULL) {
       if (field->is_null(info->fixed_buf)) {
 	info->cond_eval.set_value(col_index++,

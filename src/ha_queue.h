@@ -389,7 +389,7 @@ private:
   my_off_t bytes_removed;
   
   /* following fields are for V2 type table only */
-  queue_fixed_field_t **fixed_fields;
+  queue_fixed_field_t **fixed_fields_;
   
 public:
   void recalc_row_count(info_t *info);
@@ -415,7 +415,7 @@ public:
   const char *get_table_name() const { return table_name; }
   THR_LOCK *get_store_lock() { return &store_lock; }
   queue_fixed_field_t * const *get_fixed_fields() const {
-    return fixed_fields;
+    return fixed_fields_;
   }
   my_off_t reset_owner(queue_connection_t *conn);
   int write_rows(const void *rows, size_t rows_size, size_t row_count);
