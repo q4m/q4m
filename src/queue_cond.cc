@@ -1,3 +1,4 @@
+#include <cstring>
 #include <stack>
 #include <boost/spirit/core.hpp>
 #include <boost/spirit/symbols.hpp>
