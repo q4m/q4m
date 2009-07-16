@@ -781,8 +781,10 @@ void queue_share_t::init_fixed_fields(info_t *info, TABLE *table)
   info->fixed_buf_size = info->null_bytes;
   for (size_t i = 0; i < info->fields; i++) {
     const queue_fixed_field_t *field = fixed_fields[i];
-    if (field != NULL && field->is_convertible()) {
-      info->cond_eval.add_column(field->name());
+    if (field != NULL) {
+      if (field->is_convertible()) {
+	info->cond_eval.add_column(field->name());
+      }
       info->fixed_buf_size += field->size();
     }
   }
@@ -1226,14 +1228,13 @@ int queue_share_t::setup_cond_eval(info_t *info, my_off_t pos)
   for (size_t i = 0; i < info->fields; i++) {
     queue_fixed_field_t *field = fixed_fields_[i];
     if (field != NULL) {
-      if (field->is_null(info->fixed_buf)) {
+      if (field->is_convertible()) {
 	info->cond_eval.set_value(col_index++,
-				  queue_cond_t::value_t::null_value());
-      } else {
-	if (field->is_convertible()) {
-	  info->cond_eval.set_value(col_index++,
-				    field->get_value(info->fixed_buf, offset));
-	}
+				  field->is_null(info->fixed_buf)
+				  ? queue_cond_t::value_t::null_value()
+				  : field->get_value(info->fixed_buf, offset));
+      }
+      if (! field->is_null(info->fixed_buf)) {
 	offset += field->size();
       }
     }
