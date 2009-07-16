@@ -1,3 +1,4 @@
+#include <cassert>
 #include <cstring>
 #include <stack>
 #include <boost/spirit/core.hpp>

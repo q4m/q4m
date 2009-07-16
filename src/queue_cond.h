@@ -65,8 +65,8 @@ public:
     virtual bool is_const() const { return true; }
   };
   struct column_node_t : public node_t {
-    int column_index;
-    column_node_t(int c) : column_index(c) {}
+    size_t column_index;
+    column_node_t(size_t c) : column_index(c) {}
     virtual value_t get_value(const queue_cond_t *ctx) const {
       return ctx->get_value(column_index);
     }
@@ -285,7 +285,8 @@ public:
   // setup functions
   node_t *compile_expression(const char *expr, size_t len);
   // per-row evaluation
-  void set_value(int column_index, const value_t& value) {
+  void set_value(size_t column_index, const value_t& value) {
+    assert(column_index < columns.size());
     columns[column_index].second = value;
   }
   bool evaluate(const node_t *expr) const {
@@ -296,7 +297,8 @@ public:
     return columns;
   }
   int find_column(const char *first, const char *last) const;
-  value_t get_value(int column_index) const {
+  value_t get_value(size_t column_index) const {
+    assert(column_index < columns.size());
     return columns[column_index].second;
   }
 };

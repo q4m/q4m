@@ -1239,6 +1239,7 @@ int queue_share_t::setup_cond_eval(info_t *info, my_off_t pos)
       }
     }
   }
+  assert(offset <= info->fixed_buf_size);
   return 0;
 }
 
