@@ -503,7 +503,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   table_name_length = strlen(table_name);
   
   /* return the one, if found (after incrementing refcount) */
-  if ((share = reinterpret_cast<queue_share_t*>(hash_search(&queue_open_tables, reinterpret_cast<const uchar*>(table_name), table_name_length)))
+  if ((share = reinterpret_cast<queue_share_t*>(my_hash_search(&queue_open_tables, reinterpret_cast<const uchar*>(table_name), table_name_length)))
       != NULL) {
     ++share->ref_cnt;
     pthread_mutex_unlock(&open_mutex);
@@ -649,7 +649,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
 void queue_share_t::detach()
 {
   pthread_mutex_lock(&open_mutex);
-  hash_delete(&queue_open_tables, reinterpret_cast<uchar*>(this));
+  my_hash_delete(&queue_open_tables, reinterpret_cast<uchar*>(this));
   pthread_mutex_unlock(&open_mutex);
 }
 
@@ -658,7 +658,7 @@ void queue_share_t::release()
   pthread_mutex_lock(&open_mutex);
   
   if (--ref_cnt == 0) {
-    hash_delete(&queue_open_tables, reinterpret_cast<uchar*>(this));
+    my_hash_delete(&queue_open_tables, reinterpret_cast<uchar*>(this));
     {
       cac_mutex_t<info_t>::lockref info(this->info);
       info->writer_exit = true;
@@ -2484,8 +2484,8 @@ static int init_plugin(void *p)
   pthread_mutex_init(&open_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&listener_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&stat_mutex, MY_MUTEX_INIT_FAST);
-  hash_init(&queue_open_tables, system_charset_info, 32, 0, 0,
-	    reinterpret_cast<hash_get_key>(queue_share_t::get_share_key), 0, 0);
+  my_hash_init(&queue_open_tables, system_charset_info, 32, 0, 0,
+	    reinterpret_cast<my_hash_get_key>(queue_share_t::get_share_key), 0, 0);
   queue_hton->state = SHOW_OPTION_YES;
   queue_hton->close_connection = queue_connection_t::close;
   queue_hton->create = create_handler;
@@ -2502,7 +2502,7 @@ static int deinit_plugin(void *p)
     return HA_ERR_GENERIC;
   }
   
-  hash_free(&queue_open_tables);
+  my_hash_free(&queue_open_tables);
   pthread_mutex_destroy(&stat_mutex);
   pthread_mutex_destroy(&listener_mutex);
   pthread_mutex_destroy(&open_mutex);
