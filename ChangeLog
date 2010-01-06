@@ -1,3 +1,6 @@
+0.9 - Wed Jan 05 15:45:00 JST 2010
+	- fix a deadlock issue while performing compaction
+
 0.8.9 - Mon Oct 26 19:15:00 JST 2009
 	- fix memory corruption when FLOAT or DOUBLE fields were used
 	- fix deadlock under some situations calling queue_wait with multiple tables
