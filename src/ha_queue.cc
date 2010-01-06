@@ -819,7 +819,7 @@ void queue_share_t::unlock_reader(bool from_queue_wait)
   }
   
   // trigger compactation
-  if (pthread_mutex_trylock(&compact_mutex) == 0) {
+  if (! from_queue_wait && pthread_mutex_trylock(&compact_mutex) == 0) {
     bool do_compact = false;
     {
       queue_file_header_t *header = &info.unsafe_ref()->_header;
