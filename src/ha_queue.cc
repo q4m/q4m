@@ -175,13 +175,46 @@ static void sync_file(int fd)
   stat_sys_sync.incr();
 }
 
-int timedwait_cond(pthread_cond_t *cond, pthread_mutex_t *mutex, int timeout)
+static void setup_timespec(timespec* ts, int msec)
+{
+  timeval tv;
+  gettimeofday(&tv, NULL);
+  ts->tv_sec = tv.tv_sec + msec / 1000;
+  ts->tv_nsec = (tv.tv_usec + msec % 1000 * 1000000) * 1000;
+  if (ts->tv_nsec >= 1000000000) {
+    ts->tv_sec += 1;
+    ts->tv_nsec -= 1000000000;
+  }
+}
+
+static int timedlock_mutex(pthread_mutex_t *mutex, int msec)
+{
+#if defined(HAVE_PTHREAD_MUTEX_TIMEDLOCK) && ! defined(SAFE_MUTEX)
+  timespec ts;
+  setup_timespec(&ts, msec);
+  return pthread_mutex_timedlock(
+#if defined(MY_PTHREAD_FASTMUTEX)
+				 &mutex->mutex,
+#else
+				 mutex,
+#endif
+				 &ts);
+#else
+  return pthread_mutex_trylock(mutex);
+#endif
+}
+
+static int timedwait_cond(pthread_cond_t *cond, pthread_mutex_t *mutex, int msec)
 {
 #ifdef Q4M_USE_RELATIVE_TIMEDWAIT
-  timespec ts = { timeout, 0 };
+  timespec ts = {
+    msec / 1000,
+    msec % 1000 * 1000000000
+  };
   return pthread_cond_timedwait_relative_np(cond, mutex, &ts);
 #else
-  timespec ts = { time(NULL) + timeout, 0 };
+  timespec ts;
+  setup_timespec(&ts, msec);
   return pthread_cond_timedwait(cond, mutex, &ts);
 #endif
 }
@@ -866,7 +899,9 @@ bool queue_share_t::wake_listeners(bool from_writer)
   my_off_t off = (my_off_t)-1, row_id = 0;
   
   /* note: lock order should always be: listener_mutex -> rwlock -> mutex */
-  pthread_mutex_lock(&listener_mutex);
+  if (timedlock_mutex(&listener_mutex, 10) != 0) {
+    return false;
+  }
   
   /* acquire rwlock */
   if (pthread_rwlock_tryrdlock(&rwlock) != 0) {
@@ -1528,7 +1563,7 @@ void *queue_share_t::writer_start()
 	return NULL;
       }
       if (do_wake_listeners) {
-	timedwait_cond(&info->to_writer_cond, this->info.mutex(), 1);
+	timedwait_cond(&info->to_writer_cond, this->info.mutex(), 50);
       } else {
 	pthread_cond_wait(&info->to_writer_cond, this->info.mutex());
       }
@@ -2674,7 +2709,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
 	shares[i]->register_listener(&listener, cond_exprs[i], i);
 	share_lock_t::unlock(locks, shares[i]);
       }
-      timedwait_cond(&listener.cond, &listener_mutex, timeout);
+      timedwait_cond(&listener.cond, &listener_mutex, timeout * 1000);
       share_owned = listener.queue_wait_index;
       assert(share_owned == -1 || shares[share_owned] == conn->share_owned);
       for (int i = 0; i < num_shares; i++) {

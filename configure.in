@@ -6,7 +6,7 @@ AM_CONFIG_HEADER(src/queue_config.h)
 AC_PREFIX_PROGRAM(mysqld_safe)
 
 # **** edit below two lines to update version ****
-AM_INIT_AUTOMAKE("q4m", 0.9)
+AM_INIT_AUTOMAKE("q4m", 0.9.1)
 AC_DEFINE([Q4M_VERSION_HEX],[0x0009],[hexadecimal version no])
 
 AC_PROG_CC
@@ -189,4 +189,5 @@ AC_TYPE_SIZE_T
 AC_CHECK_FUNCS([lseek64])
 AC_CHECK_FUNC(powl, [], [AC_DEFINE([powl],[pow],[use pow instead of powl])])
 AC_CHECK_HEADERS(limits.h syslimits.h)
+AC_SEARCH_LIBS([pthread_mutex_timedlock], [pthread], [AC_DEFINE([HAVE_PTHREAD_MUTEX_TIMEDLOCK],1,[use pthread_mutex_timedlock])])
 AC_OUTPUT(Makefile src/Makefile t/Makefile)
