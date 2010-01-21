@@ -69,7 +69,7 @@ using namespace std;
 #define COMPACT_THRESHOLD (16 * 1024 * 1024)
 #define EXPAND_BY (4 * 1024 * 1024)
 #if SIZEOF_INTP == 4
-# define MMAP_MAX (1024ULL * 1024 * 1024)
+# define MMAP_MAX (256ULL * 1024 * 1024)
 #else
 # define MMAP_MAX (64ULL * 1024 * 1024 * 1024 * 1024) // 64 terabytes
 #endif
@@ -350,7 +350,7 @@ void queue_share_t::recalc_row_count(info_t *info)
   info->_header.set_row_count(row_count);
 }
 
-void queue_share_t::fixup_header(info_t *info)
+bool queue_share_t::fixup_header(info_t *info)
 {
   log("%s.Q4M was not closed properly... checking consistency.\n", table_name);
   /* update end */
@@ -376,7 +376,8 @@ void queue_share_t::fixup_header(info_t *info)
     queue_row_t row;
     if (read(&row, off, queue_row_t::header_size())
 	!= static_cast<ssize_t>(queue_row_t::header_size())) {
-      kill_proc("I/O error: %s\n", table_name);
+      log("I/O error while reading table: %s, at %llu\n", table_name, off);
+      return false;
     }
     if (row.type() == queue_row_t::type_row_received
 	|| row.type() == queue_row_t::type_row_received_removed) {
@@ -385,10 +386,12 @@ void queue_share_t::fixup_header(info_t *info)
 	       off + queue_row_t::header_size() + row.size() - sizeof(source),
 	       sizeof(source))
 	  != sizeof(source)) {
-	kill_proc("corrupt table: %s\n", table_name);
+	log("corrupt table: %s\n", table_name);
+	return false;
       }
       if (source.sender() > QUEUE_MAX_SOURCES) {
-	kill_proc("corrupt table: %s\n", table_name);
+	log("corrupt table: %s\n", table_name);
+	return false;
       }
       info->_header.set_last_received_offset(source.sender(), source.offset());
     }
@@ -401,7 +404,8 @@ void queue_share_t::fixup_header(info_t *info)
     queue_row_t row;
     if (read(&row, off, queue_row_t::header_size())
 	!= static_cast<ssize_t>(queue_row_t::header_size())) {
-      kill_proc("I/O error: %s\n", table_name);
+      log("I/O error while reading table: %s, at %llu\n", table_name, off);
+      return false;
     }
     switch (row.type()) {
     case queue_row_t::type_row:
@@ -419,6 +423,10 @@ void queue_share_t::fixup_header(info_t *info)
     }
     off = row.next(off);
   }
+  if (info->_header.end() < off) {
+    log("corrupt table: %s\n", table_name);
+    return false;
+  }
  BEGIN_FOUND:
   log("setting begin offset to %llu (rowid=%llu), was %llu (%llu)\n",
       off, row_id, info->_header.begin(), info->_header.begin_row_id());
@@ -431,6 +439,7 @@ void queue_share_t::fixup_header(info_t *info)
   info->_header.write(fd);
   sync_file(fd);
   log("finished consistency checking.\n");
+  return true;
 }
 
 #ifdef Q4M_USE_MMAP
@@ -449,7 +458,8 @@ int queue_share_t::mmap_table(size_t new_size)
 					  PROT_READ,
 #endif
 					  MAP_SHARED, fd, 0)))
-      == NULL) {
+      == MAP_FAILED) {
+    log("mmap failed, will use file file I/O for table: %s\n", table_name);
     return -1;
   }
   map->len = new_size;
@@ -597,7 +607,9 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
     }
     /* sanity check (or update row count if necessary) */
     if ((info->_header.attr() & queue_file_header_t::attr_is_dirty) != 0) {
-      share->fixup_header(info);
+      if (! share->fixup_header(info)) {
+	goto ERR_AFTER_FILEOPEN;
+      }
     } else if (info->_header.row_count() == 0) {
       share->recalc_row_count(info);
     }
@@ -677,7 +689,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
  ERR_RETURN:
   pthread_mutex_unlock(&open_mutex);
   return NULL;
-  }
+}
 
 void queue_share_t::detach()
 {
@@ -1477,6 +1489,17 @@ int queue_share_t::do_remove_rows(my_off_t *offsets, int cnt)
   for (int i = 0; i < cnt && err == 0; i++) {
     queue_row_t row;
     my_off_t off = offsets[i];
+    {
+      cac_mutex_t<info_t>::lockref info(this->info);
+      if (off < info->_header.begin()) {
+	// remove requests may arrive from multiple threads
+	continue;
+      }
+      if (info->_header.end() <= off) {
+	log("offset out of bounds: %llu, should be [%llu,%llu)\n", off, info->_header.begin(), info->_header.end());
+	assert(0);
+      }
+    }
     if (read(&row, off, queue_row_t::header_size())
 	== static_cast<ssize_t>(queue_row_t::header_size())) {
       switch (row.type()) {
@@ -1513,6 +1536,7 @@ int queue_share_t::do_remove_rows(my_off_t *offsets, int cnt)
 	info->_header.set_row_count(info->_header.row_count() - 1);
       }
     } else {
+      log("got unexpected response while reading file\n");
       err = HA_ERR_CRASHED_ON_USAGE;
     }
   }
@@ -1942,7 +1966,7 @@ const char **ha_queue::bas_ext() const
 int ha_queue::open(const char *name, int mode, uint test_if_locked)
 {
   if ((share = queue_share_t::get_share(name)) == NULL) {
-    return 1;
+    return HA_ERR_CRASHED_ON_USAGE;
   }
   share->init_fixed_fields(cac_mutex_t<queue_share_t::info_t>::lockref(share->info), table);
   thr_lock_data_init(share->get_store_lock(), &lock, NULL);

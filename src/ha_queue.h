@@ -393,7 +393,7 @@ private:
   
 public:
   void recalc_row_count(info_t *info);
-  void fixup_header(info_t *info);
+  bool fixup_header(info_t *info);
 #ifdef Q4M_USE_MMAP
   int mmap_table(size_t new_size);
 #endif
