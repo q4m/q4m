@@ -1,3 +1,10 @@
+0.9.2 - Fri Jan 22 00:45:00 JST 2010
+	- fix bug that likely causes data corruption on mmap failure (only happens on 32bit systems)
+	- limit max. mmap size on 32bit systems to 256MB per table (was 1GB)
+	- fix segv when trying to open a corrupt table
+	- return error when failing to open a corrupt table
+	- more error checks when removing rows
+
 0.9.1 - Tue Jan 19 22:00:00 JST 2010
 	- preliminary release
 	- fix a deadlock involving more than three threads
