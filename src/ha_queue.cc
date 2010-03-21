@@ -209,7 +209,7 @@ static int timedwait_cond(pthread_cond_t *cond, pthread_mutex_t *mutex, int msec
 #ifdef Q4M_USE_RELATIVE_TIMEDWAIT
   timespec ts = {
     msec / 1000,
-    msec % 1000 * 1000000000
+    msec % 1000 * 1000000
   };
   return pthread_cond_timedwait_relative_np(cond, mutex, &ts);
 #else
