@@ -34,6 +34,10 @@ extern "C" {
 #undef VERSION
 #undef HAVE_DTRACE
 #undef _DTRACE_VERSION
+#undef PACKAGE_NAME
+#undef PACKAGE_STRING
+#undef PACKAGE_TARNAME
+#undef PACKAGE_VERSION
 #include <mysql/plugin.h>
 
 #define Q4M_DELETE_MSYNC 1
@@ -78,6 +82,13 @@ using namespace std;
   ((all) >= COMPACT_THRESHOLD && (free) * 4 >= (all) * 3)
 #define Q4M ".Q4M"
 #define Q4T ".Q4T"
+
+static int concurrent_compaction;
+static MYSQL_SYSVAR_INT(use_concurrent_compaction,
+			concurrent_compaction,
+			PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+			"set to 1 if concurrent compaction is on",
+			NULL, NULL, 0, 0, 1, 0);
 
 static HASH queue_open_tables;
 static pthread_mutex_t open_mutex, listener_mutex;
@@ -649,6 +660,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
   
 #endif
   /* start threads */
+  share->writer_do_wake_listeners = false;
   if (pthread_create(&share->writer_thread, NULL, _writer_start, share) != 0) {
     goto ERR_AFTER_MMAP;
   }
@@ -1021,10 +1033,16 @@ my_off_t queue_share_t::reset_owner(queue_connection_t *conn)
   
   // find the row to be released, and remove it from owner list
   if (conn->share_owned != NULL) {
+    if (concurrent_compaction) {
+      pthread_rwlock_rdlock(&rwlock);
+    }
     cac_mutex_t<info_t>::lockref info(this->info);
     conn->remove_from_owned_list(info->rows_owned);
     if ((off = conn->owned_row_off) != 0 && setup_cond_eval(info, off) == 0) {
       apply_cond_exprs(info, queue_reset_owner_update_cond_expr(this, off));
+    }
+    if (concurrent_compaction) {
+      pthread_rwlock_unlock(&rwlock);
     }
   }
   
@@ -1051,7 +1069,7 @@ int queue_share_t::write_rows(const void *rows, size_t rows_size,
     return QUEUE_ERR_RECORD_EXISTS;
   }
   info->append_list->push_back(&a);
-  pthread_cond_t *c = info->from_writer_cond;
+  pthread_cond_t *c = info->append_response_cond;
   pthread_cond_signal(&info->to_writer_cond);
   do {
     pthread_cond_wait(c, this->info.mutex());
@@ -1179,7 +1197,7 @@ int queue_share_t::remove_rows(my_off_t *offsets, int cnt)
   cac_mutex_t<info_t>::lockref info(this->info);
   
   r.attach_back(info->remove_list);
-  pthread_cond_t *c = info->from_writer_cond;
+  pthread_cond_t *c = info->remove_response_cond;
   pthread_cond_signal(&info->to_writer_cond);
   do {
     pthread_cond_wait(c, this->info.mutex());
@@ -1563,8 +1581,6 @@ void queue_share_t::writer_do_remove(remove_t* l)
 
 void *queue_share_t::writer_start()
 {
-  bool do_wake_listeners = false;
-  
   cac_mutex_t<info_t>::lockref info(this->info);
   
   while (1) {
@@ -1586,29 +1602,34 @@ void *queue_share_t::writer_start()
       } else if (info->writer_exit) {
 	return NULL;
       }
-      if (do_wake_listeners) {
+      if (writer_do_wake_listeners) {
 	timedwait_cond(&info->to_writer_cond, this->info.mutex(), 50);
       } else {
 	pthread_cond_wait(&info->to_writer_cond, this->info.mutex());
       }
-    } while (! do_wake_listeners);
+    } while (! writer_do_wake_listeners);
     /* detach operation lists */
 #if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
 #else
     remove_t *rl = NULL;
+    pthread_cond_t *remove_response_cond = NULL;
     if (info->remove_list != NULL) {
       rl = info->remove_list;
       info->remove_list = NULL;
+      remove_response_cond = info->remove_response_cond;
+      info->remove_response_cond = info->_remove_response_conds
+	+ (info->_remove_response_conds == remove_response_cond);
     }
 #endif
     append_list_t *al = NULL;
+    pthread_cond_t *append_response_cond = NULL;
     if (info->append_list->size() != 0) {
       al = info->append_list;
       info->append_list = new append_list_t();
+      append_response_cond = info->append_response_cond;
+      info->append_response_cond = info->_append_response_conds
+	+ (info->_append_response_conds == append_response_cond);
     }
-    pthread_cond_t *notify_cond = info->from_writer_cond;
-    info->from_writer_cond =
-      info->_from_writer_conds + (info->_from_writer_conds == notify_cond);
     /* do the task and send back the results */
     pthread_mutex_unlock(this->info.mutex());
     { // hide ``info'' since we do not own the lock now
@@ -1625,15 +1646,17 @@ void *queue_share_t::writer_start()
 	  sync_file(fd);
 	}
 	close_append_list(al, err);
-	pthread_cond_broadcast(notify_cond);
-	do_wake_listeners = true;
+	pthread_cond_broadcast(append_response_cond);
+	writer_do_wake_listeners = true;
       } else {
 	sync_file(fd);
-	pthread_cond_broadcast(notify_cond);
+      }
+      if (remove_response_cond != NULL) {
+	pthread_cond_broadcast(remove_response_cond);
       }
       /* reset wake_listeners flag if successfully woke listeners */
-      if (do_wake_listeners && wake_listeners(true)) {
-	do_wake_listeners = false;
+      if (writer_do_wake_listeners && wake_listeners(true)) {
+	writer_do_wake_listeners = false;
       }
     }
     pthread_mutex_lock(this->info.mutex());
@@ -1694,6 +1717,136 @@ struct queue_compact_writer {
   }
 };
 
+my_off_t queue_share_t::compact_do_copy(queue_compact_writer &writer, info_t* info, my_off_t *row_count)
+{
+  my_off_t off = info->_header.begin(), end_off = info->_header.end(),
+    new_begin = 0, last_compact_check_off = 0;
+  *row_count = 0;
+  size_t rows_removed = 0;
+  
+  if (concurrent_compaction) {
+    pthread_mutex_unlock(this->info.mutex());
+  }
+  
+  while (off != end_off) {
+    queue_row_t row;
+    if (read(&row, off, queue_row_t::header_size())
+	!= static_cast<ssize_t>(queue_row_t::header_size())) {
+      log("file corrupt\n");
+      goto ERROR;
+    }
+    switch (row.type()) {
+    case queue_row_t::type_row:
+    case queue_row_t::type_row_received:
+      if (rows_removed != 0) {
+	if (! writer.append_rows_removed(rows_removed)) {
+	  log("I/O error\n");
+	  goto ERROR;
+	}
+	rows_removed = 0;
+      }
+      if (new_begin == 0) {
+	new_begin = writer.off;
+      }
+      if (concurrent_compaction) {
+	pthread_mutex_lock(this->info.mutex());
+      }
+      if (info->rows_owned != NULL) {
+	queue_connection_t *c = info->rows_owned;
+	do {
+	  if (c->owned_row_off == off) {
+	    c->owned_row_off_post_compact = writer.off;
+	  }
+	} while ((c = c->next_owned()) != info->rows_owned);
+      }
+      if (concurrent_compaction) {
+	pthread_mutex_unlock(this->info.mutex());
+      }
+      if (! writer.append_row_header(&row)
+	  || ! writer.copy_data(off + queue_row_t::header_size(),
+				row.size())) {
+	log("I/O error\n");
+	goto ERROR;
+      }
+      ++*row_count;
+      break;
+    case queue_row_t::type_row_removed:
+    case queue_row_t::type_row_received_removed:
+      rows_removed++;
+      break;
+    case queue_row_t::type_num_rows_removed:
+      for (rows_removed += row.size();
+	   rows_removed >= queue_row_t::max_size;
+	   rows_removed -= queue_row_t::max_size) {
+	if (! writer.append_rows_removed(queue_row_t::max_size)) {
+	  log("I/O error\n");
+	  goto ERROR;
+	}
+      }
+      break;
+    case queue_row_t::type_checksum:
+      break;
+    default:
+      log("file corrupt\n");
+      goto ERROR;
+    }
+    off = row.next(off);
+    
+    if (concurrent_compaction
+	&& last_compact_check_off + 10485760 < writer.off) {
+      last_compact_check_off = writer.off;
+      pthread_mutex_lock(this->info.mutex());
+      append_list_t *al = NULL;
+      pthread_cond_t *notify_cond = NULL;
+      if (! info->append_list->empty()) {
+	al = info->append_list;
+	info->append_list = new append_list_t();
+	notify_cond = info->append_response_cond;
+	info->append_response_cond = info->_append_response_conds
+	  + (info->_append_response_conds == notify_cond);
+      }
+      pthread_mutex_unlock(this->info.mutex());
+      if (al != NULL) {
+	int err = 0;
+	if ((err = writer_do_append(al)) != 0) {
+	  sync_file(fd);
+	}
+	close_append_list(al, err);
+	pthread_cond_broadcast(notify_cond);
+	writer_do_wake_listeners = true;
+	if (err != 0) {
+	  goto ERROR;
+	}
+	sync_file(writer.fd);
+	log("accepted commits during compaction, changing end from %llu to %llu\n",
+	    end_off, info->_header.end());
+	end_off = info->_header.end();
+      }
+      if (writer_do_wake_listeners && wake_listeners(true)) {
+	writer_do_wake_listeners = false;
+      }
+    }
+  }
+  
+  if (rows_removed != 0 && ! writer.append_rows_removed(rows_removed)) {
+    log("I/O error\n");
+    goto ERROR;
+  }
+  writer.flush();
+  
+  if (concurrent_compaction) {
+    pthread_mutex_lock(this->info.mutex());
+    assert(end_off == info->_header.end());
+  }
+  
+  return new_begin;
+ ERROR:
+  if (concurrent_compaction) {
+    pthread_mutex_lock(this->info.mutex());
+  }
+  return -1;
+}
+
 int queue_share_t::compact(info_t *info)
 {
   log("starting table compaction: %s\n", table_name);
@@ -1723,78 +1876,15 @@ int queue_share_t::compact(info_t *info)
   { 
     queue_compact_writer writer(this, tmp_fd,
 				sizeof(tmp_hdr) + queue_row_t::checksum_size());
-    my_off_t off, new_begin = 0;
-    size_t rows_removed;
+    my_off_t new_begin, row_count;
     /* write content to new file */
     if (lseek(tmp_fd, sizeof(tmp_hdr) + queue_row_t::checksum_size(), SEEK_SET)
 	== -1) {
       goto ERR_OPEN;
     }
-    off = info->_header.begin();
-    rows_removed = 0;
-    while (off != info->_header.end()) {
-      queue_row_t row;
-      if (read(&row, off, queue_row_t::header_size())
-	  != static_cast<ssize_t>(queue_row_t::header_size())) {
-	log("file corrupt\n");
-	goto ERR_OPEN;
-      }
-      switch (row.type()) {
-      case queue_row_t::type_row:
-      case queue_row_t::type_row_received:
-	if (rows_removed != 0) {
-	  if (! writer.append_rows_removed(rows_removed)) {
-	    log("I/O error\n");
-	    goto ERR_OPEN;
-	  }
-	  rows_removed = 0;
-	}
-	if (new_begin == 0) {
-	  new_begin = writer.off;
-	}
-	if (info->rows_owned != NULL) {
-	  queue_connection_t *c = info->rows_owned;
-	  do {
-	    if (c->owned_row_off == off) {
-	      c->owned_row_off_post_compact = writer.off;
-	    }
-	  } while ((c = c->next_owned()) != info->rows_owned);
-	}
-	if (! writer.append_row_header(&row)
-	    || ! writer.copy_data(off + queue_row_t::header_size(),
-				  row.size())) {
-	  log("I/O error\n");
-	  goto ERR_OPEN;
-	}
-	tmp_hdr.set_row_count(tmp_hdr.row_count() + 1);
-	break;
-      case queue_row_t::type_row_removed:
-      case queue_row_t::type_row_received_removed:
-	rows_removed++;
-	break;
-      case queue_row_t::type_num_rows_removed:
-	for (rows_removed += row.size();
-	     rows_removed >= queue_row_t::max_size;
-	     rows_removed -= queue_row_t::max_size) {
-	  if (! writer.append_rows_removed(queue_row_t::max_size)) {
-	    log("I/O error\n");
-	      goto ERR_OPEN;
-	  }
-	}
-	break;
-      case queue_row_t::type_checksum:
-	break;
-      default:
-	log("file corrupt\n");
-	goto ERR_OPEN;
-      }
-      off = row.next(off);
-    }
-    if (rows_removed != 0 && ! writer.append_rows_removed(rows_removed)) {
-      log("I/O error\n");
+    if ((new_begin = compact_do_copy(writer, info, &row_count)) == (my_off_t)-1) {
       goto ERR_OPEN;
     }
-    writer.flush();
     /* adjust write position if file is empty */
     if (writer.off
 	== sizeof(queue_file_header_t) + queue_row_t::checksum_size()) {
@@ -1806,6 +1896,7 @@ int queue_share_t::compact(info_t *info)
     tmp_hdr.set_begin(max(sizeof(queue_file_header_t), new_begin),
 		      info->_header.begin_row_id());
     tmp_hdr.set_end(writer.off);
+    tmp_hdr.set_row_count(row_count);
     for (int i = 0; i < QUEUE_MAX_SOURCES; i++) {
       tmp_hdr.set_last_received_offset(i,
 				       info->_header.last_received_offset(i));
@@ -2574,6 +2665,11 @@ struct st_mysql_storage_engine queue_storage_engine = {
   MYSQL_HANDLERTON_INTERFACE_VERSION
 };
 
+static struct st_mysql_sys_var *queue_plugin_vars[] = {
+  MYSQL_SYSVAR(use_concurrent_compaction),
+  NULL
+};
+
 mysql_declare_plugin(queue)
 {
   MYSQL_STORAGE_ENGINE_PLUGIN,
@@ -2586,7 +2682,7 @@ mysql_declare_plugin(queue)
   deinit_plugin,
   Q4M_VERSION_HEX,
   NULL,                       /* status variables                */
-  NULL,                       /* system variables                */
+  queue_plugin_vars,
   NULL                        /* config options                  */
 }
 mysql_declare_plugin_end;

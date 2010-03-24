@@ -209,6 +209,7 @@ public:
 };
 
 struct queue_connection_t;
+struct queue_compact_writer;
 
 class queue_share_t {
   
@@ -293,12 +294,14 @@ public:
     queue_connection_t *rows_owned;
     my_off_t max_owned_row_off;
     pthread_cond_t to_writer_cond;
-    pthread_cond_t *from_writer_cond;
-    pthread_cond_t _from_writer_conds[2];
     append_list_t *append_list;
+    pthread_cond_t *append_response_cond;
+    pthread_cond_t _append_response_conds[2];
 #if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
 #else
     remove_t *remove_list;
+    pthread_cond_t *remove_response_cond;
+    pthread_cond_t _remove_response_conds[2];
 #endif
     pthread_cond_t *do_compact_cond;
     
@@ -325,20 +328,28 @@ public:
 	       fixed_buf_size(0)
     {
       pthread_cond_init(&to_writer_cond, NULL);
-      pthread_cond_init(&_from_writer_conds[0], NULL);
-      pthread_cond_init(&_from_writer_conds[1], NULL);
-      from_writer_cond = &_from_writer_conds[0];
+      pthread_cond_init(_append_response_conds, NULL);
+      pthread_cond_init(_append_response_conds + 1, NULL);
+      append_response_cond = _append_response_conds;
+#if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
+#else
+      pthread_cond_init(_remove_response_conds, NULL);
+      pthread_cond_init(_remove_response_conds + 1, NULL);
+      remove_response_cond = _remove_response_conds;
+#endif
     }
     ~info_t() {
       delete [] fixed_buf;
       while (inactive_cond_exprs != NULL) {
 	inactive_cond_exprs->free(&inactive_cond_exprs);
       }
-      pthread_cond_destroy(&_from_writer_conds[0]);
-      pthread_cond_destroy(&_from_writer_conds[1]);
-      pthread_cond_destroy(&to_writer_cond);
+      pthread_cond_destroy(_append_response_conds);
+      pthread_cond_destroy(_append_response_conds + 1);
 #if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
 #else
+      pthread_cond_destroy(_remove_response_conds);
+      pthread_cond_destroy(_remove_response_conds + 1);
+      pthread_cond_destroy(&to_writer_cond);
       assert(remove_list == NULL);
 #endif
       delete append_list;
@@ -385,6 +396,7 @@ private:
   listener_list_t listener_list; /* access serialized using listener_mutex */
   
   pthread_t writer_thread;
+  bool writer_do_wake_listeners;
   
   my_off_t bytes_removed;
   
@@ -458,6 +470,7 @@ private:
   static void *_writer_start(void* self) {
     return static_cast<queue_share_t*>(self)->writer_start();
   }
+  my_off_t compact_do_copy(queue_compact_writer &writer, info_t *info, my_off_t *row_count);
   int compact(info_t *info);
   queue_share_t();
   ~queue_share_t();
