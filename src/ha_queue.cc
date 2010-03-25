@@ -89,6 +89,12 @@ static MYSQL_SYSVAR_INT(use_concurrent_compaction,
 			PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
 			"set to 1 if concurrent compaction is on",
 			NULL, NULL, 0, 0, 1, 0);
+static int concurrent_compaction_interval;
+static MYSQL_SYSVAR_INT(concurrent_compaction_interval,
+			concurrent_compaction_interval,
+			PLUGIN_VAR_RQCMDARG,
+			"interval of accepting INSERTs during compaction (in bytes)",
+			NULL, NULL, 1048576, 1024, INT_MAX, 0);
 
 static HASH queue_open_tables;
 static pthread_mutex_t open_mutex, listener_mutex;
@@ -140,8 +146,21 @@ STAT_VALUE(queue_rowid);
 STAT_VALUE(queue_set_srcid);
 #undef STAT_VALUE
 
-#define log(fmt, ...) fprintf(stderr, "ha_queue:" __FILE__ ":%d: " fmt, __LINE__, ## __VA_ARGS__)
-#define kill_proc(...) (log(__VA_ARGS__), abort(), *(char*)NULL = 1)
+#define log(fmt, ...) do {						\
+    time_t _t = time(NULL);						\
+    tm _tm;								\
+    localtime_r(&_t, &_tm);						\
+    fprintf(stderr,							\
+	    "%02d%02d%02d %02d:%02d:%02d ha_queue: " __FILE__ ":%d: " fmt, \
+	    _tm.tm_year % 100, _tm.tm_mon + 1, _tm.tm_mday,	        \
+	    _tm.tm_hour, _tm.tm_min, _tm.tm_sec,			\
+	    __LINE__, ## __VA_ARGS__);					\
+  } while (0)
+#define kill_proc(...) do { \
+    log(__VA_ARGS__);	    \
+    abort();		    \
+    *(char*)NULL = 1;	    \
+  } while (0)
 
 inline ssize_t sys_pread(int d, void *b, size_t n, my_off_t o)
 {
@@ -1793,7 +1812,8 @@ my_off_t queue_share_t::compact_do_copy(queue_compact_writer &writer, info_t* in
     off = row.next(off);
     
     if (concurrent_compaction
-	&& last_compact_check_off + 10485760 < writer.off) {
+	&& (last_compact_check_off + concurrent_compaction_interval
+	    < writer.off)) {
       last_compact_check_off = writer.off;
       pthread_mutex_lock(this->info.mutex());
       append_list_t *al = NULL;
@@ -2667,6 +2687,7 @@ struct st_mysql_storage_engine queue_storage_engine = {
 
 static struct st_mysql_sys_var *queue_plugin_vars[] = {
   MYSQL_SYSVAR(use_concurrent_compaction),
+  MYSQL_SYSVAR(concurrent_compaction_interval),
   NULL
 };
 
