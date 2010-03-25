@@ -1,3 +1,7 @@
+0.9.3 - Thu Mar 25 15:00:00 JST 2010
+	- support for concurrent compaction (INSERTs allowed during compaction)
+	- fix livelock on osx
+
 0.9.2 - Fri Jan 22 00:45:00 JST 2010
 	- fix bug that likely causes data corruption on mmap failure (only happens on 32bit systems)
 	- limit max. mmap size on 32bit systems to 256MB per table (was 1GB)
