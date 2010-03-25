@@ -50,11 +50,11 @@ my $total = $dbh->selectrow_arrayref(
     'select count(*) from q4m_t',
 )->[0];
 
-# fork 4 childs that does select
+# fork 20 childs that does select
 $dbh->disconnect;
 undef $dbh;
 my @pids;
-for (my $i = 0; $i < 4; $i++) {
+for (my $i = 0; $i < 20; $i++) {
     my $pid = fork;
     die "fork failed:$!"
         unless defined $pid;
@@ -98,6 +98,7 @@ while (@pids) {
         or die "failed to open file:$pid.tmp:$!";
     $consumed += <$fh>;
     close $fh;
+    unlink "$pid.tmp";
 }
 my $left = $dbh->selectrow_arrayref('select count(*) from q4m_t')->[0];
 

@@ -1739,7 +1739,7 @@ struct queue_compact_writer {
 my_off_t queue_share_t::compact_do_copy(queue_compact_writer &writer, info_t* info, my_off_t *row_count)
 {
   my_off_t off = info->_header.begin(), end_off = info->_header.end(),
-    new_begin = 0, last_compact_check_off = 0;
+    new_begin = 0, last_compact_check_off = 0, last_tmp_sync_off = 0;
   *row_count = 0;
   size_t rows_removed = 0;
   
@@ -1837,13 +1837,16 @@ my_off_t queue_share_t::compact_do_copy(queue_compact_writer &writer, info_t* in
 	if (err != 0) {
 	  goto ERROR;
 	}
-	sync_file(writer.fd);
 	log("accepted commits during compaction, changing end from %llu to %llu\n",
 	    end_off, info->_header.end());
 	end_off = info->_header.end();
       }
       if (writer_do_wake_listeners && wake_listeners(true)) {
 	writer_do_wake_listeners = false;
+      }
+      if (last_tmp_sync_off + 10485760 < writer.off) {
+	last_tmp_sync_off = writer.off;
+	sync_file(writer.fd);
       }
     }
   }
