@@ -73,15 +73,23 @@ using namespace std;
 #define COMPACT_THRESHOLD (16 * 1024 * 1024)
 #define EXPAND_BY (4 * 1024 * 1024)
 #if SIZEOF_INTP == 4
-# define MMAP_MAX (256ULL * 1024 * 1024)
+# define MMAP_MAX_DEFAULT (256ULL * 1024 * 1024)
 #else
-# define MMAP_MAX (64ULL * 1024 * 1024 * 1024 * 1024) // 64 terabytes
+# define MMAP_MAX_DEFAULT (16384ULL * 1024 * 1024) // 16GB, since max_map_count=65530 on linux, limiting max accessible memory size to 256GB on linux
 #endif
 
 #define DO_COMPACT(all, free) \
   ((all) >= COMPACT_THRESHOLD && (free) * 4 >= (all) * 3)
 #define Q4M ".Q4M"
 #define Q4T ".Q4T"
+
+static ulonglong mmap_max;
+static MYSQL_SYSVAR_ULONGLONG(mmap_max,
+			      mmap_max,
+			      PLUGIN_VAR_READONLY | PLUGIN_VAR_RQCMDARG,
+			      "per-table limit of mapping data onto memory (in bytes)",
+			      NULL, NULL, MMAP_MAX_DEFAULT, EXPAND_BY, 0,
+			      EXPAND_BY);
 
 static int concurrent_compaction;
 static MYSQL_SYSVAR_INT(use_concurrent_compaction,
@@ -669,7 +677,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
     /* mmap */
     if (share->mmap_table(max(min((info->_header.end() + EXPAND_BY - 1)
 				  / EXPAND_BY * EXPAND_BY,
-				  MMAP_MAX),
+				  mmap_max),
 			      EXPAND_BY))
 	!= 0) {
       log("mmap failed\n");
@@ -956,12 +964,12 @@ bool queue_share_t::wake_listeners(bool from_writer)
   /* remap if called from writer */
   if (from_writer
       && (map.unsafe_ref()->len
-	  < min(info.unsafe_ref()->_header.end(), MMAP_MAX))) {
+	  < min(info.unsafe_ref()->_header.end(), mmap_max))) {
     cac_mutex_t<info_t>::lockref info(this->info);
-    if (map.unsafe_ref()->len < min(info->_header.end(), MMAP_MAX)) {
+    if (map.unsafe_ref()->len < min(info->_header.end(), mmap_max)) {
       if (mmap_table(min((info->_header.end() + EXPAND_BY - 1) / EXPAND_BY
 			 * EXPAND_BY,
-			 MMAP_MAX))
+			 mmap_max))
 	  != 0) {
 	log("mmap failed: size=%lu\n",
 	    static_cast<unsigned long>(map.unsafe_ref()->len));
@@ -1959,7 +1967,7 @@ int queue_share_t::compact(info_t *info)
   fd = tmp_fd;
 #ifdef Q4M_USE_MMAP
   if (mmap_table(min((tmp_hdr.end() + EXPAND_BY - 1) / EXPAND_BY * EXPAND_BY,
-		     MMAP_MAX))
+		     mmap_max))
       != 0) {
     log("mmap failed: size=%lu\n",
 	static_cast<unsigned long>(map.unsafe_ref()->len));
@@ -2689,6 +2697,7 @@ struct st_mysql_storage_engine queue_storage_engine = {
 };
 
 static struct st_mysql_sys_var *queue_plugin_vars[] = {
+  MYSQL_SYSVAR(mmap_max),
   MYSQL_SYSVAR(use_concurrent_compaction),
   MYSQL_SYSVAR(concurrent_compaction_interval),
   NULL
