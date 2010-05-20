@@ -892,7 +892,7 @@ bool queue_share_t::lock_reader(bool from_queue_wait)
   return true;
 }
 
-void queue_share_t::unlock_reader(bool from_queue_wait)
+void queue_share_t::unlock_reader(bool from_queue_wait, bool force_compaction)
 {
   pthread_rwlock_unlock(&rwlock);
   
@@ -903,9 +903,10 @@ void queue_share_t::unlock_reader(bool from_queue_wait)
   }
   
   // trigger compactation
-  if (! from_queue_wait && pthread_mutex_trylock(&compact_mutex) == 0) {
-    bool do_compact = false;
-    {
+  if ((force_compaction || ! from_queue_wait)
+      && pthread_mutex_trylock(&compact_mutex) == 0) {
+    bool do_compact = force_compaction;
+    if (! do_compact) {
       queue_file_header_t *header = &info.unsafe_ref()->_header;
       if (DO_COMPACT(header->end() - sizeof(*header), bytes_removed)) {
 	do_compact = true;
@@ -915,8 +916,9 @@ void queue_share_t::unlock_reader(bool from_queue_wait)
       pthread_rwlock_wrlock(&rwlock);
       cac_mutex_t<info_t>::lockref info(this->info);
       if (info->do_compact_cond == NULL
-	  && DO_COMPACT(info->_header.end() - sizeof(info->_header),
-			bytes_removed)) {
+	  && (force_compaction
+	      || DO_COMPACT(info->_header.end() - sizeof(info->_header),
+			    bytes_removed))) {
 	pthread_cond_t c;
 	pthread_cond_init(&c, NULL);
 	info->do_compact_cond = &c;
@@ -3067,6 +3069,38 @@ long long queue_set_srcid(UDF_INIT *initid __attribute__((unused)),
     return 0;
   }
   conn->source = queue_source_t(sender, *(long long*)args->args[2]);
+  return 1;
+}
+
+my_bool queue_compact_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+  if (args->arg_count != 1) {
+    strcpy(message, "queue_compact(table_name): argument error");
+    return 1;
+  }
+  args->arg_type[0] = STRING_RESULT;
+  args->maybe_null[0] = 0;
+  initid->maybe_null = 0;
+  return 0;
+}
+
+void queue_compact_deinit(UDF_INIT *initid __attribute__((unused)))
+{
+}
+
+long long queue_compact(UDF_INIT *initid __attribute__((unused)),
+			UDF_ARGS *args, char *is_null __attribute__((unused)),
+			char *error)
+{
+  queue_share_t *share;
+  if ((share = get_share_check(args->args[0])) == NULL) {
+    log("could not find table: %s\n", args->args[0]);
+    *error = 1;
+    return 0;
+  }
+  share->lock_reader();
+  share->unlock_reader(false, true);
+  share->release();
   return 1;
 }
 

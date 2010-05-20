@@ -417,7 +417,7 @@ public:
   bool init_fixed_fields();
   void init_fixed_fields(info_t *info, TABLE *_table);
   bool lock_reader(bool from_queue_wait = false);
-  void unlock_reader(bool from_queue_wait = false);
+  void unlock_reader(bool from_queue_wait = false, bool force_compaction = false);
   void register_listener(listener_t *l, cond_expr_t *c, int queue_wait_index) {
     listener_list.push_back(listener_cond_t(l, c, queue_wait_index));
   }
@@ -602,6 +602,10 @@ extern "C" {
   my_bool queue_set_srcid_init(UDF_INIT *initid, UDF_ARGS *args, char *message);
   void queue_set_srcid_deinit(UDF_INIT *initid);
   long long queue_set_srcid(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
+			    char *error);
+  my_bool queue_compact_init(UDF_INIT *initid, UDF_ARGS *args, char *message);
+  void queue_compact_deinit(UDF_INIT *initid);
+  long long queue_compact(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
 			    char *error);
 };
 
