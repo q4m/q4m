@@ -1,3 +1,6 @@
+0.9.4 - Mon Jun 28 17:46:00 JST 2010
+	- added queue_compact(table_name) function to trigger compaction manually
+
 0.9.3 - Thu Mar 25 15:00:00 JST 2010
 	- support for concurrent compaction (INSERTs allowed during compaction)
 	- fix livelock on osx
