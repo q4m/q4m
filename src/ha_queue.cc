@@ -565,7 +565,7 @@ static bool load_table(TABLE *table, const char *db_table_name)
   return false;
 }
 
-queue_share_t *queue_share_t::get_share(const char *table_name)
+queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
 {
   queue_share_t *share;
   uint table_name_length;
@@ -589,6 +589,10 @@ queue_share_t *queue_share_t::get_share(const char *table_name)
     ++share->ref_cnt;
     pthread_mutex_unlock(&open_mutex);
     return share;
+  }
+  if (if_is_open) {
+    pthread_mutex_unlock(&open_mutex);
+    return NULL;
   }
   
   /* alloc */
@@ -2310,7 +2314,15 @@ int ha_queue::create(const char *name, TABLE *table_arg,
   int fd;
   
   fn_format(filename, name, "", Q4M, MY_REPLACE_EXT | MY_UNPACK_FILENAME);
-  if ((fd = ::open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE, 0660))
+  /* unlink existing file (if exists, is the case for TRUNCATE TABLE) instead
+   * of using O_TRUNC so that already-establised connections can still refer
+   * to the data (NOTE: the call to this function is serialized by LOCK_open)
+   */
+  if (! (unlink(filename) == 0 || errno == ENOENT)) {
+    log("failed to unlink file: %s\n", filename);
+    return HA_ERR_GENERIC; // ????
+  }
+  if ((fd = ::open(filename, O_WRONLY | O_CREAT | O_EXCL | O_LARGEFILE, 0660))
       == -1) {
     return HA_ERR_GENERIC; // ????
   }
@@ -2324,6 +2336,19 @@ int ha_queue::create(const char *name, TABLE *table_arg,
   }
   sync_file(fd);
   ::close(fd);
+  
+  /* close the existing share that holds the descriptor pointing to the old file
+   * (or the share will persist until the number of owning connections become
+   * zero at some point)
+   */
+  {
+    queue_share_t* share;
+    if ((share = queue_share_t::get_share(name, false)) != NULL) {
+      share->detach();
+      share->release();
+    }
+  }
+  
   return 0;
   
  ERROR:

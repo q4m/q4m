@@ -411,7 +411,7 @@ public:
 #endif
   static uchar *get_share_key(queue_share_t *share, size_t *length,
 			      my_bool not_used);
-  static queue_share_t *get_share(const char* table_name);
+  static queue_share_t *get_share(const char* table_name, bool if_is_open = false);
   void detach();
   void release();
   bool init_fixed_fields();
