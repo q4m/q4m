@@ -1,3 +1,7 @@
+0.9.5 - Thu Feb 24 17:20:00 JST 2011
+	- fix SIGSEGV/SIGBUS on TRUNCATE TABLE
+	- fix race condition that caused (in rare situation) .Q4M file to reappear after DROP TABLE
+
 0.9.4 - Mon Jun 28 17:46:00 JST 2010
 	- added queue_compact(table_name) function to trigger compaction manually
 
