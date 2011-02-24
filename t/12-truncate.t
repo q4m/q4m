@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 use DBI;
-use Test::More tests => 54;
+use Test::More tests => 72;
 
 sub dbi_connect {
     DBI->connect(
@@ -28,6 +28,7 @@ is_deeply $dbh->selectall_arrayref('select * from q4m_t'), [];
 # try truncating the table while owning a row
 for my $n (11..16) {
     my $owner = dbi_connect();
+    ok $dbh->do('delete from q4m_t');
     ok $dbh->do("insert into q4m_t values ($n),($n*10)");
     is_deeply(
         $owner->selectall_arrayref(q{select queue_wait('q4m_t')}),
@@ -42,13 +43,18 @@ for my $n (11..16) {
         [ [ $n * 10 ] ],
     );
     ok $dbh->do('truncate q4m_t');
-    ok $owner->do($n %2 ? q{select queue_end()} : q{select queue_abort()});
+    ok $dbh->do("insert into q4m_t values ($n*20)");
     is_deeply(
         $owner->selectall_arrayref(q{select * from q4m_t}),
         [],
     );
+    ok $owner->do($n %2 ? q{select queue_end()} : q{select queue_abort()});
+    is_deeply(
+        $owner->selectall_arrayref(q{select * from q4m_t}),
+        [ [ $n * 20 ] ],
+    );
     is_deeply(
         $dbh->selectall_arrayref(q{select * from q4m_t}),
-        [],
+        [ [ $n * 20 ] ],
     );
 }
