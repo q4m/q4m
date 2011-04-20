@@ -1,5 +1,7 @@
 #! /usr/bin/perl
 
+# should set queue-use-concurrent-compaction=1 and queue-concurrent-compaction-interval to a small value
+
 use strict;
 use warnings;
 
@@ -30,12 +32,14 @@ utf8'),
     'create table',
 );
 
-my $TOTAL_ROWS = 65536;
+my $TOTAL_ROWS = 65536 * 4;
 my $kilodata = '0123456789abcdef' x 64;
 my $rows_per_insert = 16;
 my $insert_sql = 'insert into q4m_t values ' . join(
     ',',
-    map { "('$kilodata')" } 1..$rows_per_insert
+    map {
+	"('" . substr($kilodata, 0, int(rand() * 1024)) . "')"
+    } 1..$rows_per_insert
 );
 
 undef $dbh;
@@ -73,9 +77,9 @@ for (my $i = 0; $i < 20; $i++) {
                 or die $dbh->errstr;
             die "the queue is empty (logic flaw"
 		unless $r->[0];
-	    $dbh->do("SELECT queue_end()") or die $dbh->errstr;
             $c++;
         }
+	$dbh->do("SELECT queue_end()") or die $dbh->errstr;
     }
     open my $fh, '>', "$$.tmp"
         or die "failed to create file:$$.tmp:$!";
