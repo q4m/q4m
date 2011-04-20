@@ -1891,6 +1891,7 @@ int queue_share_t::compact(info_t *info)
   char filename[FN_REFLEN], tmp_filename[FN_REFLEN];
   int tmp_fd;
   queue_file_header_t tmp_hdr;
+  tmp_hdr.set_attr(tmp_hdr.attr() | queue_file_header_t::attr_is_dirty);
   
   /* reset owned_row_off_post_compact */
   if (info->rows_owned != NULL) {
