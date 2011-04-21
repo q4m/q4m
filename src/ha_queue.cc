@@ -1851,8 +1851,8 @@ my_off_t queue_share_t::compact_do_copy(queue_compact_writer &writer, info_t* in
 	if (err != 0) {
 	  goto ERROR;
 	}
-	log("accepted commits during compaction, changing end from %llu to %llu\n",
-	    end_off, info->_header.end());
+	log("accepted commits during compaction, changing end from %llu to %llu\n (off: %llu, writer.off: %llu)\n",
+	    end_off, info->_header.end(), off, writer.off);
 	end_off = info->_header.end();
       }
       if (writer_do_wake_listeners && wake_listeners(true)) {
@@ -1886,7 +1886,9 @@ my_off_t queue_share_t::compact_do_copy(queue_compact_writer &writer, info_t* in
 
 int queue_share_t::compact(info_t *info)
 {
-  log("starting table compaction: %s\n", table_name);
+  log("starting table compaction: %s (begin: %llu, end: %llu, rows: %llu)\n",
+      table_name, info->_header.begin(), info->_header.end(),
+      info->_header.row_count());
   
   char filename[FN_REFLEN], tmp_filename[FN_REFLEN];
   int tmp_fd;
@@ -2008,7 +2010,9 @@ int queue_share_t::compact(info_t *info)
   }
   apply_cond_exprs(info, cond_expr_reset_pos_t());
   
-  log("finished table compaction: %s\n", table_name);
+  log("finished table compaction: %s (begin: %llu, end: %llu, rows: %llu)\n",
+      table_name, info->_header.begin(), info->_header.end(),
+      info->_header.row_count());
   return 0;
     
  ERR_OPEN:
