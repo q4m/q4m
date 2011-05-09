@@ -71,7 +71,7 @@ protected:
   T t_;
   pthread_rwlock_t rwlock_;
 public:
-  cac_rwlock_t(pthread_rwlockattr_t* attr) : t_() {
+  cac_rwlock_t(const pthread_rwlockattr_t* attr) : t_() {
     pthread_rwlock_init(&rwlock_, attr);
   }
   ~cac_rwlock_t() {

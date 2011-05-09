@@ -54,7 +54,7 @@ protected:
   T t_;
   pthread_mutex_t mutex_;
 public:
-  cac_mutex_t(pthread_mutexattr_t* attr) : t_() {
+  cac_mutex_t(const pthread_mutexattr_t* attr) : t_() {
     pthread_mutex_init(&mutex_, attr);
   }
   ~cac_mutex_t() {
