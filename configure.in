@@ -6,7 +6,7 @@ AM_CONFIG_HEADER(src/queue_config.h)
 AC_PREFIX_PROGRAM(mysqld_safe)
 
 # **** edit below two lines to update version ****
-AM_INIT_AUTOMAKE("q4m", 0.9.5)
+AM_INIT_AUTOMAKE("q4m", 0.9.6)
 AC_DEFINE([Q4M_VERSION_HEX],[0x0009],[hexadecimal version no])
 
 AC_PROG_CC
