@@ -687,9 +687,9 @@ queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
       log("mmap failed\n");
       goto ERR_AFTER_FILEOPEN;
     }
+#endif
   }
   
-#endif
   /* start threads */
   share->writer_do_wake_listeners = false;
   if (pthread_create(&share->writer_thread, NULL, _writer_start, share) != 0) {
