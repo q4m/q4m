@@ -25,6 +25,8 @@ extern "C" {
 #include <algorithm>
 #include <functional>
 #include <list>
+#include <map>
+#include <string>
 #include <vector>
 
 #define MYSQL_SERVER
@@ -255,6 +257,37 @@ static int timedwait_cond(pthread_cond_t *cond, pthread_mutex_t *mutex, int msec
   setup_timespec(&ts, msec);
   return pthread_cond_timedwait(cond, mutex, &ts);
 #endif
+}
+
+static cac_mutex_t<queue_share_t::stats_t>* get_stats_for(const char* _name,
+							  bool remove = false)
+{
+  static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+  static map<string, cac_mutex_t<queue_share_t::stats_t>*> stats;
+  
+  string name(_name);
+  cac_mutex_t<queue_share_t::stats_t>* ret = NULL;
+  
+  pthread_mutex_lock(&mutex);
+  map<string, cac_mutex_t<queue_share_t::stats_t>*>::iterator i
+    = stats.lower_bound(name);
+  if (i != stats.end() && i->first == name) {
+    if (remove) {
+      stats.erase(i);
+    } else {
+      ret = i->second;
+    }
+  } else {
+    if (remove) {
+      // nothing to do
+    } else {
+      ret = new cac_mutex_t<queue_share_t::stats_t>(NULL);
+      stats.insert(make_pair(name, ret));
+    }
+  }
+  pthread_mutex_unlock(&mutex);
+  
+  return ret;
 }
 
 my_off_t queue_row_t::validate_checksum(int fd, my_off_t off)
@@ -689,6 +722,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
     }
 #endif
   }
+  share->stats = get_stats_for(table_name);
   
   /* start threads */
   share->writer_do_wake_listeners = false;
@@ -1527,6 +1561,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
       }
     }
     info->_header.set_row_count(info->_header.row_count() + row_count);
+    info->rows_written += row_count;
   }
   
   my_free(iov[0].iov_base, MYF(0));
@@ -1585,6 +1620,7 @@ int queue_share_t::do_remove_rows(my_off_t *offsets, int cnt)
 	  }
 	}
 	info->_header.set_row_count(info->_header.row_count() - 1);
+	++info->rows_removed;
       }
     } else {
       log("got unexpected response while reading file\n");
@@ -2045,6 +2081,8 @@ int queue_connection_t::close(handlerton *hton, THD *thd)
   if (conn->share_owned != NULL) {
     if (conn->share_owned->reset_owner(conn) != 0) {
       conn->share_owned->wake_listeners();
+      ++cac_mutex_t<queue_share_t::stats_t>::lockref(*conn->share_owned->stats)
+	->close_cnt;
     }
     conn->share_owned->release();
   }
@@ -2493,6 +2531,7 @@ int ha_queue::delete_table(const char *name)
     share->release();
     share = NULL;
   }
+  get_stats_for(name, true);
   return handler::delete_table(name);
 }
 
@@ -2883,6 +2922,8 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
     }
     if (shares[i]->assign_owner(*share_infos[i], conn, cond_exprs[i]) != 0) {
       share_owned = i;
+      ++cac_mutex_t<queue_share_t::stats_t>::lockref(*shares[i]->stats)
+	->wait_immediate_cnt;
       break;
     }
   }
@@ -2902,6 +2943,8 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
 	  share_lock_t::unlock(locks, shares[j]);
 	}
 	share_owned = i;
+	++cac_mutex_t<queue_share_t::stats_t>::lockref(*shares[i]->stats)
+	  ->wait_immediate_cnt;
 	break;
       }
     }
@@ -2920,6 +2963,11 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
 	  shares[i]->unregister_listener(&listener);
 	}
       }
+      if (share_owned != -1) {
+	++cac_mutex_t<queue_share_t::stats_t>::lockref(*shares[share_owned]
+						       ->stats)
+	  ->wait_delayed_cnt;
+      }
     }
     pthread_mutex_unlock(&listener_mutex);
   }
@@ -2932,6 +2980,8 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
   }
   for (int i = 0; i < num_shares && shares[i] != NULL; i++) {
     if (i != share_owned) {
+      ++cac_mutex_t<queue_share_t::stats_t>::lockref(*shares[i]->stats)
+	->wait_timeout_cnt;
       shares[i]->release();
     }
   }
@@ -3027,6 +3077,9 @@ long long queue_abort(UDF_INIT *initid, UDF_ARGS *args __attribute__((unused)),
     if (conn->share_owned != NULL) {
       if (conn->share_owned->reset_owner(conn) != 0) {
 	conn->share_owned->wake_listeners();
+	++cac_mutex_t<queue_share_t::stats_t>::lockref(*conn->share_owned
+						       ->stats)
+	  ->abort_cnt;
       }
       conn->share_owned->release();
       conn->share_owned = NULL;
@@ -3150,6 +3203,62 @@ long long queue_compact(UDF_INIT *initid __attribute__((unused)),
   share->unlock_reader(false, true);
   share->release();
   return 1;
+}
+
+my_bool queue_stats_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
+{
+  if (args->arg_count != 1) {
+    strcpy(message, "queue_stats(table_name): argument error");
+    return 1;
+  }
+  args->arg_type[0] = STRING_RESULT;
+  args->maybe_null[0] = 0;
+  initid->maybe_null = 0;
+  initid->ptr = (char*)malloc(4096);
+  return 0;
+}
+
+void queue_stats_deinit(UDF_INIT *initid __attribute__((unused)))
+{
+  free(initid->ptr);
+}
+
+char* queue_stats(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long *length, char *is_null, char *error)
+{
+  queue_share_t *share;
+  if ((share = get_share_check(args->args[0])) == NULL) {
+    log("could not find table: %s\n", args->args[0]);
+    *error = 1;
+    return NULL;
+  }
+  my_off_t rows_written;
+  my_off_t rows_removed;
+  {
+    cac_mutex_t<queue_share_t::info_t>::lockref info(share->info);
+    rows_written = info->rows_written;
+    rows_removed = info->rows_removed;
+  }
+  queue_share_t::stats_t stats =
+    *cac_mutex_t<queue_share_t::stats_t>::lockref(*share->stats);
+  sprintf(initid->ptr,
+	  "rows_written: %llu\n"
+	  "rows_removed: %llu\n"
+	  "wait_immediate: %llu\n"
+	  "wait_delayed: %llu\n"
+	  "wait_timeout: %llu\n"
+	  "restored_by_abort: %llu\n"
+	  "restored_by_close: %llu\n",
+	  rows_written,
+	  rows_removed,
+	  stats.wait_immediate_cnt,
+	  stats.wait_delayed_cnt,
+	  stats.wait_timeout_cnt,
+	  stats.abort_cnt,
+	  stats.close_cnt);
+  share->release();
+  *length = strlen(initid->ptr);
+  *is_null = 0;
+  return initid->ptr;
 }
 
 #if defined(Q4M_USE_RELATIVE_TIMEDWAIT) && defined(SAFE_MUTEX)

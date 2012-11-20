@@ -115,6 +115,8 @@ private:
   char _begin_row_id[8];
   char _last_received_offsets[QUEUE_MAX_SOURCES][8];
   char _row_count[8];
+  char _rows_written[8];
+  char _rows_removed[8];
   unsigned _padding[1024 - (4 + 4 + 8 + 8 + 8 + QUEUE_MAX_SOURCES * 8 + 8)];
 public:
   queue_file_header_t();
@@ -317,6 +319,9 @@ public:
     uchar *fixed_buf;
     size_t fixed_buf_size;
     
+    my_off_t rows_written;
+    my_off_t rows_removed;
+    
     info_t() : _header(), rows_owned(NULL), max_owned_row_off(0),
 	       append_list(new append_list_t()),
 #if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
@@ -326,7 +331,8 @@ public:
                do_compact_cond(NULL), is_deleting(false), cond_eval(),
                active_cond_exprs(NULL), inactive_cond_exprs(NULL),
                inactive_cond_expr_cnt(0), writer_exit(false), null_bytes(0),
-               fields(0), fixed_buf(NULL), fixed_buf_size(0)
+               fields(0), fixed_buf(NULL), fixed_buf_size(0), rows_written(0),
+	       rows_removed(0)
     {
       pthread_cond_init(&to_writer_cond, NULL);
       pthread_cond_init(_append_response_conds, NULL);
@@ -363,6 +369,15 @@ public:
     }
   };
   
+  struct stats_t {
+    my_off_t wait_immediate_cnt;
+    my_off_t wait_delayed_cnt;
+    my_off_t wait_timeout_cnt;
+    my_off_t abort_cnt;
+    my_off_t close_cnt;
+    stats_t() : wait_immediate_cnt(0), wait_delayed_cnt(0), wait_timeout_cnt(0), abort_cnt(0), close_cnt(0) {}
+  };
+  
 private:
   uint ref_cnt;
   char *table_name;
@@ -391,6 +406,7 @@ private:
   int fd;
 public:
   cac_mutex_t<info_t> info;
+  cac_mutex_t<stats_t> *stats;
 private:
   cond_expr_t cond_expr_true;
   
@@ -608,6 +624,10 @@ extern "C" {
   void queue_compact_deinit(UDF_INIT *initid);
   long long queue_compact(UDF_INIT *initid, UDF_ARGS *args, char *is_null,
 			    char *error);
+  my_bool queue_stats_init(UDF_INIT *initid, UDF_ARGS *args, char *message);
+  void queue_stats_deinit(UDF_INIT *initid);
+  char* queue_stats(UDF_INIT *initid, UDF_ARGS *args, char *result,
+		    unsigned long *length, char *is_null, char *error);
 };
 
 #endif
