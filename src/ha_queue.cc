@@ -395,7 +395,7 @@ uchar* queue_share_t::get_share_key(queue_share_t *share, size_t *length,
   return reinterpret_cast<uchar*>(share->table_name);
 }
 
-void queue_share_t::recalc_row_count(info_t *info)
+void queue_share_t::recalc_row_count(info_t *info, bool log)
 {
   my_off_t off = info->_header.begin(), row_count = 0;
   
@@ -415,9 +415,10 @@ void queue_share_t::recalc_row_count(info_t *info)
     }
     off = row.next(off);
   }
-  
-  log("setting row count of %s.Q4M to %llu (was %llu)\n", table_name, row_count,
-      info->_header.row_count());
+  if (log || row_count != info->_header.row_count()) {
+    log("setting row count of %s.Q4M to %llu (was %llu)\n", table_name,
+	row_count, info->_header.row_count());
+  }
   info->_header.set_row_count(row_count);
 }
 
@@ -503,7 +504,7 @@ bool queue_share_t::fixup_header(info_t *info)
       off, row_id, info->_header.begin(), info->_header.begin_row_id());
   info->_header.set_begin(off, row_id);
   /* update row_count */
-  recalc_row_count(info);
+  recalc_row_count(info, true);
   /* save */
   info->_header.set_attr(info->_header.attr()
 			 & ~queue_file_header_t::attr_is_dirty);
@@ -686,7 +687,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
 	goto ERR_AFTER_FILEOPEN;
       }
     } else if (info->_header.row_count() == 0) {
-      share->recalc_row_count(info);
+      share->recalc_row_count(info, false);
     }
     /* set dirty flag */
     info->_header.set_attr(info->_header.attr()

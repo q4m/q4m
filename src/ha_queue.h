@@ -421,7 +421,7 @@ private:
   queue_fixed_field_t **fixed_fields_;
   
 public:
-  void recalc_row_count(info_t *info);
+  void recalc_row_count(info_t *info, bool log);
   bool fixup_header(info_t *info);
 #ifdef Q4M_USE_MMAP
   int mmap_table(size_t new_size);
