@@ -16,7 +16,7 @@ my $dbh = DBI->connect(
 ok($dbh->do('drop table if exists q4m_t'));
 ok($dbh->do('create table q4m_t (v int not null) engine=queue'));
 
-ok($dbh->do("select queue_wait('test.q4m_t', 1)"));
+ok($dbh->do("select queue_wait('q4m_t', 1)"));
 is_deeply(
     $dbh->selectall_arrayref("select * from q4m_t"),
     [],
@@ -31,12 +31,12 @@ is_deeply(
     $dbh->selectall_arrayref("select * from q4m_t"),
     [ [ 1 ] ],
 );
-ok($dbh->do("select queue_wait('test.q4m_t', 1)"));
+ok($dbh->do("select queue_wait('q4m_t', 1)"));
 is_deeply(
     $dbh->selectall_arrayref("select * from q4m_t"),
     [ [ 1 ] ],
 );
-ok($dbh->do("select queue_wait('test.q4m_t', 1)"));
+ok($dbh->do("select queue_wait('q4m_t', 1)"));
 is_deeply(
     $dbh->selectall_arrayref("select * from q4m_t"),
     [],

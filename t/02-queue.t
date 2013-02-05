@@ -29,7 +29,7 @@ ok($dbh->do('create table q4m_t (v int not null) engine=queue'));
 
 for (my $i = 0; $i < $TEST_ROWS; $i++) {
     ok($dbh->do("insert into q4m_t (v) values ($i)"));
-    ok($dbh->do("select queue_wait('test.q4m_t')"));
+    ok($dbh->do("select queue_wait('q4m_t')"));
     is_deeply(
         $dbh->selectall_arrayref('select * from q4m_t'),
         [ [ $i ] ],
