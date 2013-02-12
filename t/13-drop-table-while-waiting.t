@@ -41,9 +41,9 @@ if (my $pid = fork) {
     my $owner = dbi_connect();
     note("child: start queue_wait");
     my $res = $owner->selectall_arrayref(q{select queue_wait('q4m_t', 5)});
-    $res->[0][0] == 0 or die 'Fail at l.$.';
+    $res->[0][0] == 0 or die 'Fail at l.' . __LINE__;
     note("child: q4m_t should be removed by parent process after 5 sec wait");
     $res = $owner->selectall_arrayref(q{show tables like '%q4m_t%'}),
-    @$res == 0 or die 'Fail at l.$.';
+    @$res == 0 or die 'Fail at l.' . __LINE__;
     $owner->do("select queue_end()");
 }
