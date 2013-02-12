@@ -23,7 +23,7 @@ ok($dbh->do('create table q4m_t (v int not null) engine=queue'));
 
 ok($dbh->do("insert into q4m_t (v) values (1),(2)"));
 is_deeply(
-    [ $dbh2->selectrow_array("select queue_wait('test.q4m_t')") ],
+    [ $dbh2->selectrow_array("select queue_wait('q4m_t')") ],
     [ 1 ],
 );
 is_deeply(
@@ -44,7 +44,7 @@ is_deeply(
     [ [ 1 ], [ 2 ] ],
 );
 
-ok($dbh2->do("select queue_wait('test.q4m_t')"));
+ok($dbh2->do("select queue_wait('q4m_t')"));
 is_deeply(
     $dbh2->selectall_arrayref("select * from q4m_t"),
     [ [ 1 ] ],
@@ -65,7 +65,7 @@ $dbh2->disconnect;
 my $pid = fork;
 if ($pid == 0) {
     $dbh = dbi_connect();
-    $dbh->do("select queue_wait('test.q4m_t')");
+    $dbh->do("select queue_wait('q4m_t')");
     sleep 10;
     die "shouldn't reach here\n";
 }
