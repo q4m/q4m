@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 use DBI;
-use Test::More;
+use Test::More tests => 6;
 
 sub dbi_connect {
     DBI->connect(
@@ -19,10 +19,10 @@ if (my $pid = fork) {
     # parent process = subscriber
     my $dbh = dbi_connect();
     ok $dbh->do('drop table if exists q4m_t');
-    diag("parent: start create table");
+    note("parent: start create table");
     ok $dbh->do('create table q4m_t (v int not null) engine=queue');
     my $owner_pid = $pid;
-    diag("parent: waiting for child process to start queue_wait()");
+    note("parent: waiting for child process to start queue_wait()");
     sleep 2;  # waiting for child process to start queue_wait()
     ok $dbh->do('drop table q4m_t');
     is_deeply(
@@ -30,24 +30,20 @@ if (my $pid = fork) {
         [],
     );
     is($dbh->do(q{select * from q4m_t}), undef);
-    diag("parent: waiting for child process to finish");
+    note("parent: waiting for child process to finish");
     waitpid($owner_pid, 0);
+    ok(($?>>8) == 0);
+    done_testing;
 } else {
     # child process = owner
-    diag("child: waiting for parent process to create table");
+    note("child: waiting for parent process to create table");
     sleep 1;  # waiting for parent process to create table
     my $owner = dbi_connect();
-    diag("child: start queue_wait");
-    is_deeply(
-        $owner->selectall_arrayref(q{select queue_wait('q4m_t', 5)}),
-        [ [ 0 ] ],
-    );
-    diag("child: q4m_t should be removed by parent process after 5 sec wait");
-    is_deeply(
-        $owner->selectall_arrayref(q{show tables like '%q4m_t%'}),
-        [],
-    );
+    note("child: start queue_wait");
+    my $res = $owner->selectall_arrayref(q{select queue_wait('q4m_t', 5)});
+    $res->[0][0] == 0 or die 'Fail at l.$.';
+    note("child: q4m_t should be removed by parent process after 5 sec wait");
+    $res = $owner->selectall_arrayref(q{show tables like '%q4m_t%'}),
+    @$res == 0 or die 'Fail at l.$.';
     $owner->do("select queue_end()");
 }
-
-done_testing;
