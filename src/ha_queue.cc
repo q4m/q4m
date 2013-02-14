@@ -550,8 +550,8 @@ static bool load_table(TABLE *table, const char *db_table_name)
   int err;
   char *db_table_buf;
   
-  bzero((char*)&table_list, sizeof(TABLE_LIST));
-  bzero((char*)table, sizeof(TABLE));
+  memset(&table_list, 0, sizeof(TABLE_LIST));
+  memset(table, 0, sizeof(TABLE));
   
   /* copy table name to buffer and split to db name and table name */
   if ((db_table_buf = strdup(db_table_name)) == NULL) {
