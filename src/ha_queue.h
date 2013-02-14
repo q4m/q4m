@@ -23,6 +23,8 @@
 #include "dllist.h"
 #include "queue_cond.h"
 
+#include "mysql_version.h"
+
 // error numbers should be less than HA_ERR_FIRST
 #define QUEUE_ERR_RECORD_EXISTS (1)
 
@@ -164,8 +166,13 @@ protected:
 public:
   queue_fixed_field_t(const TABLE *t, const Field *f, size_t s)
   : nam(new char [strlen(f->field_name) + 1]), sz(s),
+#if MYSQL_VERSION_ID < 50600
     null_off(f->null_ptr != NULL ? f->null_ptr - t->record[0] : 0),
     null_bit(f->null_ptr != NULL ? f->null_bit : 0) {
+#else
+    null_off(f->real_maybe_null() ? f->null_offset() : 0),
+    null_bit(f->real_maybe_null() ? f->null_bit : 0) {
+#endif
     strcpy(nam, f->field_name);
   }
   virtual ~queue_fixed_field_t() { delete [] nam; }

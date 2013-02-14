@@ -31,7 +31,15 @@ extern "C" {
 
 #define MYSQL_SERVER
 
+#include "mysql_version.h"
+
+#if MYSQL_VERSION_ID < 50500
 #include "mysql_priv.h"
+#else
+#include "sql_priv.h"
+#include "sql_base.h"
+#include "probes_mysql.h"
+#endif
 #undef PACKAGE
 #undef VERSION
 #undef HAVE_DTRACE
@@ -41,6 +49,20 @@ extern "C" {
 #undef PACKAGE_TARNAME
 #undef PACKAGE_VERSION
 #include <mysql/plugin.h>
+
+#if MYSQL_VERSION_ID >= 50500
+#define my_free(PTR, FLAG) my_free(PTR)
+#endif
+
+#if MYSQL_VERSION_ID < 50500
+#define mysql_mutex_lock(mutex) pthread_mutex_lock(mutex)
+#define mysql_mutex_unlock(mutex) pthread_mutex_unlock(mutex)
+#endif
+
+#if MYSQL_VERSION_ID >= 50600
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#endif
 
 #define Q4M_DELETE_MSYNC 1
 #define Q4M_DELETE_MT_PWRITE 2
@@ -578,10 +600,19 @@ static bool load_table(TABLE *table, const char *db_table_name)
   *table_list.table_name++ = '\0';
   
   /* load table data */
+#if MYSQL_VERSION_ID >= 50603
+  key_length = get_table_def_key(&table_list, (const char**)&key);
+#else
   key_length = create_table_def_key(current_thd, key, &table_list, 0);
-  if ((share = get_table_share(current_thd, &table_list, key, key_length, 0,
-			       &err))
-      == NULL) {
+#endif
+#if MYSQL_VERSION_ID < 50500
+  share = get_table_share(current_thd, &table_list, key, key_length, 0, &err);
+#else
+  my_hash_value_type hash_value;
+  hash_value = my_calc_hash(&table_def_cache, (uchar*) key, key_length);
+  share = get_table_share(current_thd, &table_list, key, key_length, 0, &err, hash_value);
+#endif
+  if (share == NULL) {
     return true;
   }
   if (open_table_from_share(current_thd, share, table_list.table_name, 0,
@@ -831,25 +862,25 @@ bool queue_share_t::init_fixed_fields()
   }
   
   // lock order: LOCK_open -> info_t
-  pthread_mutex_lock(&LOCK_open);
+  mysql_mutex_lock(&LOCK_open);
   if (fixed_fields_ != NULL) {
-    pthread_mutex_unlock(&LOCK_open);
+    mysql_mutex_unlock(&LOCK_open);
     return true;
   }
   
   cac_mutex_t<info_t>::lockref info(this->info);
   TABLE table;
   if (fixed_fields_ != NULL) {
-    pthread_mutex_unlock(&LOCK_open);
+    mysql_mutex_unlock(&LOCK_open);
     return true;
   }
   if (! load_table(&table, table_name)) {
-    pthread_mutex_unlock(&LOCK_open);
+    mysql_mutex_unlock(&LOCK_open);
     return false;
   }
   init_fixed_fields(info, &table);
   closefrm(&table, true);
-  pthread_mutex_unlock(&LOCK_open);
+  mysql_mutex_unlock(&LOCK_open);
   
   return true;
 }
