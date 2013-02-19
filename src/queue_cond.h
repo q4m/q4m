@@ -78,7 +78,7 @@ public:
     };
     node_t *nodes[N];
     pop_op() {
-      fill(nodes, nodes + N, static_cast<node_t*>(NULL));
+      std::fill(nodes, nodes + N, static_cast<node_t*>(NULL));
     }
     virtual ~pop_op() {
       for (size_t i = 0; i < N; i++) {
