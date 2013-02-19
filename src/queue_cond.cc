@@ -10,7 +10,10 @@
 #include <string>
 #include <iostream>
 #endif
+#ifdef Q4M_USING_CMAKE
+#else
 #include "queue_config.h"
+#endif
 #include "queue_cond.h"
 
 using namespace std;

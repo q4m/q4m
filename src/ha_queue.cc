@@ -68,7 +68,10 @@ extern "C" {
 #define Q4M_DELETE_MT_PWRITE 2
 #define Q4M_DELETE_SERIAL_PWRITE 3
 
+#ifdef Q4M_USING_CMAKE
+#else
 #include "queue_config.h"
+#endif
 
 #if SIZEOF_OFF_T != 8
 #  error "support for 64-bit file offsets is mandatory"
