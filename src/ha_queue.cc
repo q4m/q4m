@@ -35,9 +35,13 @@ extern "C" {
 
 #if MYSQL_VERSION_ID < 50500
 #include "mysql_priv.h"
+extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
+				 const char *table, const char *ext,
+				 uint flags);
 #else
 #include "sql_priv.h"
 #include "sql_base.h"
+#include "sql_table.h"
 #include "probes_mysql.h"
 #endif
 #undef PACKAGE
@@ -87,11 +91,6 @@ extern "C" {
 
 #include "ha_queue.h"
 #include "adler32.c"
-
-extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
-				 const char *table, const char *ext,
-				 uint flags);
-
 
 using namespace std;
 
