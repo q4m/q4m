@@ -48,7 +48,7 @@ public:
     readref(const readref&);
     readref& operator=(const readref&);
     
-    friend class cac_rwlock_t<T>::writeref;
+    friend class writeref;
     readref(cac_rwlock_t<T>& m, int) : m_(&m) {}
   };
   
