@@ -351,7 +351,7 @@ my_off_t queue_row_t::validate_checksum(int fd, my_off_t off)
     }
     while (off != row_end) {
       char buf[4096];
-      ssize_t bs = min(row_end - off, sizeof(buf));
+      ssize_t bs = min((size_t)(row_end - off), sizeof(buf));
       if (sys_pread(fd, buf, bs, off) != bs) {
 	return 0;
       }
@@ -896,7 +896,11 @@ bool queue_share_t::init_fixed_fields()
   if ((tmpbuf = parse_db_table_name(table_name, db, tbl)) == NULL) {
     return false;
   }
-  TABLE* table = open_table_uncached(current_thd, table_name, db, tbl, false);
+  TABLE* table = open_table_uncached(current_thd, table_name, db, tbl, false
+#if MYSQL_VERSION_ID >= 50600
+                                     , false /* open_in_engine */
+#endif
+                                     );
   if (table == NULL) {
     free(tmpbuf);
     return false;
@@ -1412,8 +1416,8 @@ int queue_share_t::setup_cond_eval(info_t *info, my_off_t pos)
     return HA_ERR_CRASHED_ON_USAGE;
   }
   if (read(info->fixed_buf, pos + queue_row_t::header_size(),
-	   min(hdr.size(), info->fixed_buf_size))
-      != static_cast<ssize_t>(min(hdr.size(), info->fixed_buf_size))) {
+	   min((size_t)hdr.size(), info->fixed_buf_size))
+      != static_cast<ssize_t>(min((size_t)hdr.size(), info->fixed_buf_size))) {
     return HA_ERR_CRASHED_ON_USAGE;
   }
   /* assign row data to evaluator */
@@ -2030,7 +2034,7 @@ int queue_share_t::compact(info_t *info)
 	goto ERR_OPEN;
       }
     }
-    tmp_hdr.set_begin(max(sizeof(queue_file_header_t), new_begin),
+    tmp_hdr.set_begin(max((my_off_t)sizeof(queue_file_header_t), new_begin),
 		      info->_header.begin_row_id());
     tmp_hdr.set_end(writer.off);
     tmp_hdr.set_row_count(row_count);
@@ -3060,7 +3064,7 @@ my_bool queue_wait_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
     args->arg_type[args->arg_count - 1] = INT_RESULT;
     args->maybe_null[args->arg_count - 1] = 0;
   }
-  for (int i = max(args->arg_count - 2, 0); i >= 0; i--) {
+  for (int i = max((int)args->arg_count - 2, 0); i >= 0; i--) {
     args->arg_type[i] = STRING_RESULT;
     args->maybe_null[i] = 0;
   }
@@ -3082,7 +3086,8 @@ long long queue_wait(UDF_INIT *initid __attribute__((unused)), UDF_ARGS *args,
   
   *is_null = 0;
   return
-    _queue_wait_core(args->args, max(args->arg_count - 1, 1), timeout, error)
+    _queue_wait_core(args->args, max((int)args->arg_count - 1, 1), timeout,
+                     error)
     + 1;
 }
 
