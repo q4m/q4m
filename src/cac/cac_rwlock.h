@@ -47,15 +47,17 @@ public:
   private:
     readref(const readref&);
     readref& operator=(const readref&);
-    
-    friend class cac_rwlock_t<T>::writeref;
-    readref(cac_rwlock_t<T>& m, int) : m_(&m) {}
   };
   
-  class writeref : public readref {
+  class writeref {
+  protected:
+    cac_rwlock_t<T>* m_;
   public:
-    writeref(cac_rwlock_t<T>& m) : readref(m, 0) {
-      pthread_rwlock_wrlock(&m.rwlock_);
+    writeref(cac_rwlock_t<T>& m) : m_(&m) {
+      pthread_rwlock_wrlock(&m_->rwlock_);
+    }
+    ~writeref() {
+      pthread_rwlock_unlock(&m_->rwlock_);
     }
     operator T*() {
       // GCC 4.1 seems to require the use of "this->"
@@ -63,6 +65,9 @@ public:
     }
     T& operator*() { return *operator T*(); }
     T* operator->() { return operator T*(); }
+  private:
+    writeref(const writeref&);
+    writeref& operator=(const writeref&);
   };
   
 protected:
