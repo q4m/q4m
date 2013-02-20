@@ -188,7 +188,7 @@ STAT_VALUE(queue_set_srcid);
 #define kill_proc(...) do { \
     log(__VA_ARGS__);	    \
     abort();		    \
-    *(char*)NULL = 1;	    \
+    *(char*)1 = 1;	    \
   } while (0)
 
 inline ssize_t sys_pread(int d, void *b, size_t n, my_off_t o)
