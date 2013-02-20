@@ -107,7 +107,7 @@ static MYSQL_SYSVAR_INT(concurrent_compaction_interval,
 			NULL, NULL, 1048576, 1024, INT_MAX, 0);
 
 static HASH queue_open_tables;
-static pthread_mutex_t open_mutex, listener_mutex;
+static pthread_mutex_t open_mutex, listener_mutex, tbl_stat_mutex;
 #if Q4M_DELETE_METHOD == Q4M_DELETE_MSYNC
 static ptrdiff_t psz_mask;
 #endif
@@ -262,13 +262,12 @@ static int timedwait_cond(pthread_cond_t *cond, pthread_mutex_t *mutex, int msec
 static cac_mutex_t<queue_share_t::stats_t>* get_stats_for(const char* _name,
 							  bool remove = false)
 {
-  static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
   static map<string, cac_mutex_t<queue_share_t::stats_t>*> stats;
   
   string name(_name);
   cac_mutex_t<queue_share_t::stats_t>* ret = NULL;
   
-  pthread_mutex_lock(&mutex);
+  pthread_mutex_lock(&tbl_stat_mutex);
   map<string, cac_mutex_t<queue_share_t::stats_t>*>::iterator i
     = stats.lower_bound(name);
   if (i != stats.end() && i->first == name) {
@@ -285,7 +284,7 @@ static cac_mutex_t<queue_share_t::stats_t>* get_stats_for(const char* _name,
       stats.insert(make_pair(name, ret));
     }
   }
-  pthread_mutex_unlock(&mutex);
+  pthread_mutex_unlock(&tbl_stat_mutex);
   
   return ret;
 }
@@ -2754,6 +2753,7 @@ static int init_plugin(void *p)
   
   pthread_mutex_init(&open_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&listener_mutex, MY_MUTEX_INIT_FAST);
+  pthread_mutex_init(&tbl_stat_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&stat_mutex, MY_MUTEX_INIT_FAST);
   my_hash_init(&queue_open_tables, system_charset_info, 32, 0, 0,
 	    reinterpret_cast<my_hash_get_key>(queue_share_t::get_share_key), 0, 0);
@@ -2775,6 +2775,7 @@ static int deinit_plugin(void *p)
   
   my_hash_free(&queue_open_tables);
   pthread_mutex_destroy(&stat_mutex);
+  pthread_mutex_destroy(&tbl_stat_mutex);
   pthread_mutex_destroy(&listener_mutex);
   pthread_mutex_destroy(&open_mutex);
   queue_hton = NULL;
