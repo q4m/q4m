@@ -558,7 +558,37 @@ int queue_share_t::mmap_table(size_t new_size)
 }
 #endif
 
-static bool load_table(TABLE *table, const char *db_table_name)
+static char *parse_db_table_name(const char *db_table_name, char*& db,
+                                 char*& table)
+{
+  char *db_table_buf;
+  
+  if ((db_table_buf = strdup(db_table_name)) == NULL) {
+    log("out of memory\n");
+    return NULL;
+  }
+  for (db = db_table_buf; *db == '/' || *db == '.'; db++)
+    ;
+  if (*db == '\0') {
+    log("invalid table name: %s\n", db_table_name);
+    goto Error;
+  }
+  for (table = db + 1; *table != '/'; table++) {
+    if (*table == '\0') {
+      log("invalid table name: %s\n", db_table_name);
+      goto Error;
+    }
+  }
+  *table++ = '\0';
+  
+  return db_table_buf;
+ Error:
+  free(db_table_buf);
+  return NULL;
+}
+
+#if MYSQL_VERSION_ID < 50500
+static bool load_table51(TABLE *table, const char *db_table_name)
 {
   // precondition: LOCK_open should be acquired
   
@@ -573,27 +603,11 @@ static bool load_table(TABLE *table, const char *db_table_name)
   memset(table, 0, sizeof(TABLE));
   
   /* copy table name to buffer and split to db name and table name */
-  if ((db_table_buf = strdup(db_table_name)) == NULL) {
-    log("out of memory\n");
+  if ((db_table_buf = parse_db_table_name(db_table_name, table_list.db,
+                                          table_list.table_name))
+      == NULL) {
     return false;
   }
-  for (table_list.db = db_table_buf;
-       *table_list.db == '/' || *table_list.db == '.';
-       table_list.db++)
-    ;
-  if (*table_list.db == '\0') {
-    log("invalid table name: %s\n", db_table_name);
-    goto Error;
-  }
-  for (table_list.table_name = table_list.db + 1;
-       *table_list.table_name != '/';
-       table_list.table_name++) {
-    if (*table_list.table_name == '\0') {
-      log("invalid table name: %s\n", db_table_name);
-      goto Error;
-    }
-  }
-  *table_list.table_name++ = '\0';
   
   /* load table data */
   key_length = create_table_def_key(current_thd, key, &table_list, 0);
@@ -621,6 +635,7 @@ static bool load_table(TABLE *table, const char *db_table_name)
   free(db_table_buf);
   return false;
 }
+#endif
 
 queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
 {
@@ -853,6 +868,7 @@ bool queue_share_t::init_fixed_fields()
     return true;
   }
   
+#if MYSQL_VERSION_ID < 50500
   // lock order: LOCK_open -> info_t
   mysql_mutex_lock(&LOCK_open);
   if (fixed_fields_ != NULL) {
@@ -866,7 +882,7 @@ bool queue_share_t::init_fixed_fields()
     mysql_mutex_unlock(&LOCK_open);
     return true;
   }
-  if (! load_table(&table, table_name)) {
+  if (! load_table51(&table, table_name)) {
     mysql_mutex_unlock(&LOCK_open);
     return false;
   }
@@ -875,6 +891,27 @@ bool queue_share_t::init_fixed_fields()
   mysql_mutex_unlock(&LOCK_open);
   
   return true;
+#else
+  char *db, *tbl, *tmpbuf;
+  if ((tmpbuf = parse_db_table_name(table_name, db, tbl)) == NULL) {
+    return false;
+  }
+  TABLE* table = open_table_uncached(current_thd, table_name, db, tbl, false);
+  if (table == NULL) {
+    free(tmpbuf);
+    return false;
+  }
+  {
+    cac_mutex_t<info_t>::lockref info(this->info);
+    if (fixed_fields_ == NULL) {
+      init_fixed_fields(info, table);
+    }
+  }
+  intern_close_table(table);
+  free(tmpbuf);
+  
+  return true;
+#endif
 }
 
 void queue_share_t::init_fixed_fields(info_t *info, TABLE *table)
