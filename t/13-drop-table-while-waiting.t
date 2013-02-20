@@ -26,7 +26,7 @@ if (my $pid = fork) {
     sleep 2;  # waiting for child process to start queue_wait()
     ok $dbh->do('drop table q4m_t');
     is_deeply(
-        $dbh->selectall_arrayref(q{show tables like '%q4m_t%'}),
+        $dbh->selectall_arrayref(q{show tables like 'q4m_t'}),
         [],
     );
     is($dbh->do(q{select * from q4m_t}), undef);
@@ -43,7 +43,7 @@ if (my $pid = fork) {
     my $res = $owner->selectall_arrayref(q{select queue_wait('q4m_t', 5)});
     $res->[0][0] == 0 or die 'Fail at l.' . __LINE__;
     note("child: q4m_t should be removed by parent process after 5 sec wait");
-    $res = $owner->selectall_arrayref(q{show tables like '%q4m_t%'}),
+    $res = $owner->selectall_arrayref(q{show tables like 'q4m_t'}),
     @$res == 0 or die 'Fail at l.' . __LINE__;
     $owner->do("select queue_end()");
 }

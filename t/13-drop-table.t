@@ -36,7 +36,7 @@ is_deeply(
 );
 ok $dbh->do('drop table q4m_t');
 is_deeply(
-    $dbh->selectall_arrayref(q{show tables like '%q4m_t%'}),
+    $dbh->selectall_arrayref(q{show tables like 'q4m_t'}),
     [],
 );
 is($dbh->do(q{select * from q4m_t}), undef);
