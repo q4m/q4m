@@ -31,7 +31,15 @@ extern "C" {
 
 #define MYSQL_SERVER
 
+#include "mysql_version.h"
+
+#if MYSQL_VERSION_ID < 50500
 #include "mysql_priv.h"
+#else
+#include "sql_priv.h"
+#include "sql_base.h"
+#include "probes_mysql.h"
+#endif
 #undef PACKAGE
 #undef VERSION
 #undef HAVE_DTRACE
@@ -42,11 +50,22 @@ extern "C" {
 #undef PACKAGE_VERSION
 #include <mysql/plugin.h>
 
+#if MYSQL_VERSION_ID >= 50500
+#define my_free(PTR, FLAG) my_free(PTR)
+#endif
+
+#if MYSQL_VERSION_ID < 50500
+#define mysql_mutex_lock(mutex) pthread_mutex_lock(mutex)
+#define mysql_mutex_unlock(mutex) pthread_mutex_unlock(mutex)
+#endif
+
 #define Q4M_DELETE_MSYNC 1
 #define Q4M_DELETE_MT_PWRITE 2
 #define Q4M_DELETE_SERIAL_PWRITE 3
 
+#if MYSQL_VERSION_ID < 50500
 #include "queue_config.h"
+#endif
 
 #if SIZEOF_OFF_T != 8
 #  error "support for 64-bit file offsets is mandatory"
@@ -112,18 +131,6 @@ static pthread_mutex_t open_mutex, listener_mutex, tbl_stat_mutex;
 static ptrdiff_t psz_mask;
 #endif
 
-#ifdef Q4M_USE_RELATIVE_TIMEDWAIT
-# ifdef SAFE_MUTEX
-static int safe_cond_timedwait_relative_np(pthread_cond_t *cond,
-					   safe_mutex_t *mp,
-					   struct timespec *abstime,
-					   const char *file, uint line);
-#define pthread_cond_timedwait_relative_np(A,B,C) safe_cond_timedwait_relative_np((A),(B),(C),__FILE__,__LINE__)
-# elif defined(MY_PTHREAD_FASTMUTEX)
-#define pthread_cond_timedwait_relative_np(A,B,C) pthread_cond_timedwait_relative_np((A),&(B)->mutex,(C))
-# endif
-#endif
-
 static handlerton *queue_hton;
 
 /* stat */
@@ -169,7 +176,7 @@ STAT_VALUE(queue_set_srcid);
 #define kill_proc(...) do { \
     log(__VA_ARGS__);	    \
     abort();		    \
-    *(char*)NULL = 1;	    \
+    *(char*)1 = 1;	    \
   } while (0)
 
 inline ssize_t sys_pread(int d, void *b, size_t n, my_off_t o)
@@ -246,17 +253,9 @@ static int timedlock_mutex(pthread_mutex_t *mutex, int msec)
 
 static int timedwait_cond(pthread_cond_t *cond, pthread_mutex_t *mutex, int msec)
 {
-#ifdef Q4M_USE_RELATIVE_TIMEDWAIT
-  timespec ts = {
-    msec / 1000,
-    msec % 1000 * 1000000
-  };
-  return pthread_cond_timedwait_relative_np(cond, mutex, &ts);
-#else
   timespec ts;
   setup_timespec(&ts, msec);
   return pthread_cond_timedwait(cond, mutex, &ts);
-#endif
 }
 
 static cac_mutex_t<queue_share_t::stats_t>* get_stats_for(const char* _name,
@@ -332,7 +331,7 @@ my_off_t queue_row_t::validate_checksum(int fd, my_off_t off)
     }
     while (off != row_end) {
       char buf[4096];
-      ssize_t bs = min(row_end - off, sizeof(buf));
+      ssize_t bs = min((size_t)(row_end - off), sizeof(buf));
       if (sys_pread(fd, buf, bs, off) != bs) {
 	return 0;
       }
@@ -539,7 +538,37 @@ int queue_share_t::mmap_table(size_t new_size)
 }
 #endif
 
-static bool load_table(TABLE *table, const char *db_table_name)
+static char *parse_db_table_name(const char *db_table_name, char*& db,
+                                 char*& table)
+{
+  char *db_table_buf;
+  
+  if ((db_table_buf = strdup(db_table_name)) == NULL) {
+    log("out of memory\n");
+    return NULL;
+  }
+  for (db = db_table_buf; *db == '/' || *db == '.'; db++)
+    ;
+  if (*db == '\0') {
+    log("invalid table name: %s\n", db_table_name);
+    goto Error;
+  }
+  for (table = db + 1; *table != '/'; table++) {
+    if (*table == '\0') {
+      log("invalid table name: %s\n", db_table_name);
+      goto Error;
+    }
+  }
+  *table++ = '\0';
+  
+  return db_table_buf;
+ Error:
+  free(db_table_buf);
+  return NULL;
+}
+
+#if MYSQL_VERSION_ID < 50500
+static bool load_table51(TABLE *table, const char *db_table_name)
 {
   // precondition: LOCK_open should be acquired
   
@@ -554,33 +583,22 @@ static bool load_table(TABLE *table, const char *db_table_name)
   memset(table, 0, sizeof(TABLE));
   
   /* copy table name to buffer and split to db name and table name */
-  if ((db_table_buf = strdup(db_table_name)) == NULL) {
-    log("out of memory\n");
+  if ((db_table_buf = parse_db_table_name(db_table_name, table_list.db,
+                                          table_list.table_name))
+      == NULL) {
     return false;
   }
-  for (table_list.db = db_table_buf;
-       *table_list.db == '/' || *table_list.db == '.';
-       table_list.db++)
-    ;
-  if (*table_list.db == '\0') {
-    log("invalid table name: %s\n", db_table_name);
-    goto Error;
-  }
-  for (table_list.table_name = table_list.db + 1;
-       *table_list.table_name != '/';
-       table_list.table_name++) {
-    if (*table_list.table_name == '\0') {
-      log("invalid table name: %s\n", db_table_name);
-      goto Error;
-    }
-  }
-  *table_list.table_name++ = '\0';
   
   /* load table data */
   key_length = create_table_def_key(current_thd, key, &table_list, 0);
-  if ((share = get_table_share(current_thd, &table_list, key, key_length, 0,
-			       &err))
-      == NULL) {
+#if MYSQL_VERSION_ID < 50500
+  share = get_table_share(current_thd, &table_list, key, key_length, 0, &err);
+#else
+  my_hash_value_type hash_value;
+  hash_value = my_calc_hash(&table_def_cache, (uchar*) key, key_length);
+  share = get_table_share(current_thd, &table_list, key, key_length, 0, &err, hash_value);
+#endif
+  if (share == NULL) {
     return true;
   }
   if (open_table_from_share(current_thd, share, table_list.table_name, 0,
@@ -597,6 +615,7 @@ static bool load_table(TABLE *table, const char *db_table_name)
   free(db_table_buf);
   return false;
 }
+#endif
 
 queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
 {
@@ -829,28 +848,54 @@ bool queue_share_t::init_fixed_fields()
     return true;
   }
   
+#if MYSQL_VERSION_ID < 50500
   // lock order: LOCK_open -> info_t
-  pthread_mutex_lock(&LOCK_open);
+  mysql_mutex_lock(&LOCK_open);
   if (fixed_fields_ != NULL) {
-    pthread_mutex_unlock(&LOCK_open);
+    mysql_mutex_unlock(&LOCK_open);
     return true;
   }
   
   cac_mutex_t<info_t>::lockref info(this->info);
   TABLE table;
   if (fixed_fields_ != NULL) {
-    pthread_mutex_unlock(&LOCK_open);
+    mysql_mutex_unlock(&LOCK_open);
     return true;
   }
-  if (! load_table(&table, table_name)) {
-    pthread_mutex_unlock(&LOCK_open);
+  if (! load_table51(&table, table_name)) {
+    mysql_mutex_unlock(&LOCK_open);
     return false;
   }
   init_fixed_fields(info, &table);
   closefrm(&table, true);
-  pthread_mutex_unlock(&LOCK_open);
+  mysql_mutex_unlock(&LOCK_open);
   
   return true;
+#else
+  char *db, *tbl, *tmpbuf;
+  if ((tmpbuf = parse_db_table_name(table_name, db, tbl)) == NULL) {
+    return false;
+  }
+  TABLE* table = open_table_uncached(current_thd, table_name, db, tbl, false
+#if MYSQL_VERSION_ID >= 50600
+                                     , false /* open_in_engine */
+#endif
+                                     );
+  if (table == NULL) {
+    free(tmpbuf);
+    return false;
+  }
+  {
+    cac_mutex_t<info_t>::lockref info(this->info);
+    if (fixed_fields_ == NULL) {
+      init_fixed_fields(info, table);
+    }
+  }
+  intern_close_table(table);
+  free(tmpbuf);
+  
+  return true;
+#endif
 }
 
 void queue_share_t::init_fixed_fields(info_t *info, TABLE *table)
@@ -1351,8 +1396,8 @@ int queue_share_t::setup_cond_eval(info_t *info, my_off_t pos)
     return HA_ERR_CRASHED_ON_USAGE;
   }
   if (read(info->fixed_buf, pos + queue_row_t::header_size(),
-	   min(hdr.size(), info->fixed_buf_size))
-      != static_cast<ssize_t>(min(hdr.size(), info->fixed_buf_size))) {
+	   min((size_t)hdr.size(), info->fixed_buf_size))
+      != static_cast<ssize_t>(min((size_t)hdr.size(), info->fixed_buf_size))) {
     return HA_ERR_CRASHED_ON_USAGE;
   }
   /* assign row data to evaluator */
@@ -1969,7 +2014,7 @@ int queue_share_t::compact(info_t *info)
 	goto ERR_OPEN;
       }
     }
-    tmp_hdr.set_begin(max(sizeof(queue_file_header_t), new_begin),
+    tmp_hdr.set_begin(max((my_off_t)sizeof(queue_file_header_t), new_begin),
 		      info->_header.begin_row_id());
     tmp_hdr.set_end(writer.off);
     tmp_hdr.set_row_count(row_count);
@@ -2992,6 +3037,22 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
 
 my_bool queue_wait_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 {
+#if MYSQL_VERSION_ID >= 50600
+  /*
+    In MySQL 5.6, queue_wait() in WHERE clause cannot be supported, since
+    UDFs are never folded by the optimizer (see is_expensive(), eval_cond,
+    ...).
+    The guard checks if such query has been issued.
+   */
+  {
+    THD* thd = current_thd;
+    if (thd->lex != NULL
+        && thd->lex->select_lex.table_list.elements != 0) {
+      strcpy(message, "as of MySQL 5.6, the function cannot be used within a WHERE clause");
+      return 1;
+    }
+  }
+#endif
   if (args->arg_count == 0) {
     strcpy(message, "queue_wait(table_name[,timeout]): argument error");
     return 1;
@@ -2999,7 +3060,7 @@ my_bool queue_wait_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
     args->arg_type[args->arg_count - 1] = INT_RESULT;
     args->maybe_null[args->arg_count - 1] = 0;
   }
-  for (int i = max(args->arg_count - 2, 0); i >= 0; i--) {
+  for (int i = max((int)args->arg_count - 2, 0); i >= 0; i--) {
     args->arg_type[i] = STRING_RESULT;
     args->maybe_null[i] = 0;
   }
@@ -3021,7 +3082,8 @@ long long queue_wait(UDF_INIT *initid __attribute__((unused)), UDF_ARGS *args,
   
   *is_null = 0;
   return
-    _queue_wait_core(args->args, max(args->arg_count - 1, 1), timeout, error)
+    _queue_wait_core(args->args, max((int)args->arg_count - 1, 1), timeout,
+                     error)
     + 1;
 }
 
@@ -3262,45 +3324,3 @@ char* queue_stats(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long 
   *is_null = 0;
   return initid->ptr;
 }
-
-#if defined(Q4M_USE_RELATIVE_TIMEDWAIT) && defined(SAFE_MUTEX)
-#undef pthread_mutex_lock
-#undef pthread_mutex_unlock
-#undef pthread_cond_timedwait_relative_np
-int safe_cond_timedwait_relative_np(pthread_cond_t *cond, safe_mutex_t *mp,
-				    struct timespec *abstime, const char *file,
-				    uint line)
-{
-  int error;
-  pthread_mutex_lock(&mp->global);
-  if (mp->count != 1 || !pthread_equal(pthread_self(),mp->thread))
-  {
-    fprintf(stderr,"safe_mutex: Trying to cond_wait at %s, line %d on a not hold mutex\n",file,line);
-    fflush(stderr);
-    abort();
-  }
-  mp->count--;                                  /* Mutex will be released */
-  pthread_mutex_unlock(&mp->global);
-  error=pthread_cond_timedwait_relative_np(cond,&mp->mutex,abstime);
-#ifdef EXTRA_DEBUG
-  if (error && (error != EINTR && error != ETIMEDOUT && error != ETIME))
-  {
-    fprintf(stderr,"safe_mutex: Got error: %d (%d) when doing a safe_mutex_timedwait at %s, line %d\n", error, errno, file, line);
-  }
-#endif
-  pthread_mutex_lock(&mp->global);
-  mp->thread=pthread_self();
-  if (mp->count++)
-  {
-    fprintf(stderr,
-            "safe_mutex:  Count was %d in thread 0x%lx when locking mutex at %s, line %d (error: %d (%d))\n",
-            mp->count-1, my_thread_dbug_id(), file, line, error, error);
-    fflush(stderr);
-    abort();
-  }
-  mp->file= file;
-  mp->line=line;
-  pthread_mutex_unlock(&mp->global);
-  return error;
-}
-#endif

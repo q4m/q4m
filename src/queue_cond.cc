@@ -10,7 +10,6 @@
 #include <string>
 #include <iostream>
 #endif
-#include "queue_config.h"
 #include "queue_cond.h"
 
 using namespace std;

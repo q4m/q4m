@@ -154,10 +154,6 @@ else
     exit 1
 fi
 
-if test "$OSNAME" = "darwin" ; then
-    AC_DEFINE([Q4M_USE_RELATIVE_TIMEDWAIT],1,[use pthread_cond_timedwait_relative_np])
-fi
-
 if test -z "$DOC_ROOT"
 then
     DOC_ROOT='http://q4m.github.com/'
