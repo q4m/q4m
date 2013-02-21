@@ -131,18 +131,6 @@ static pthread_mutex_t open_mutex, listener_mutex, tbl_stat_mutex;
 static ptrdiff_t psz_mask;
 #endif
 
-#ifdef Q4M_USE_RELATIVE_TIMEDWAIT
-# ifdef SAFE_MUTEX
-static int safe_cond_timedwait_relative_np(pthread_cond_t *cond,
-					   safe_mutex_t *mp,
-					   struct timespec *abstime,
-					   const char *file, uint line);
-#define pthread_cond_timedwait_relative_np(A,B,C) safe_cond_timedwait_relative_np((A),(B),(C),__FILE__,__LINE__)
-# elif defined(MY_PTHREAD_FASTMUTEX)
-#define pthread_cond_timedwait_relative_np(A,B,C) pthread_cond_timedwait_relative_np((A),&(B)->mutex,(C))
-# endif
-#endif
-
 static handlerton *queue_hton;
 
 /* stat */
@@ -265,17 +253,9 @@ static int timedlock_mutex(pthread_mutex_t *mutex, int msec)
 
 static int timedwait_cond(pthread_cond_t *cond, pthread_mutex_t *mutex, int msec)
 {
-#ifdef Q4M_USE_RELATIVE_TIMEDWAIT
-  timespec ts = {
-    msec / 1000,
-    msec % 1000 * 1000000
-  };
-  return pthread_cond_timedwait_relative_np(cond, mutex, &ts);
-#else
   timespec ts;
   setup_timespec(&ts, msec);
   return pthread_cond_timedwait(cond, mutex, &ts);
-#endif
 }
 
 static cac_mutex_t<queue_share_t::stats_t>* get_stats_for(const char* _name,
@@ -3328,45 +3308,3 @@ char* queue_stats(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long 
   *is_null = 0;
   return initid->ptr;
 }
-
-#if defined(Q4M_USE_RELATIVE_TIMEDWAIT) && defined(SAFE_MUTEX)
-#undef pthread_mutex_lock
-#undef pthread_mutex_unlock
-#undef pthread_cond_timedwait_relative_np
-int safe_cond_timedwait_relative_np(pthread_cond_t *cond, safe_mutex_t *mp,
-				    struct timespec *abstime, const char *file,
-				    uint line)
-{
-  int error;
-  pthread_mutex_lock(&mp->global);
-  if (mp->count != 1 || !pthread_equal(pthread_self(),mp->thread))
-  {
-    fprintf(stderr,"safe_mutex: Trying to cond_wait at %s, line %d on a not hold mutex\n",file,line);
-    fflush(stderr);
-    abort();
-  }
-  mp->count--;                                  /* Mutex will be released */
-  pthread_mutex_unlock(&mp->global);
-  error=pthread_cond_timedwait_relative_np(cond,&mp->mutex,abstime);
-#ifdef EXTRA_DEBUG
-  if (error && (error != EINTR && error != ETIMEDOUT && error != ETIME))
-  {
-    fprintf(stderr,"safe_mutex: Got error: %d (%d) when doing a safe_mutex_timedwait at %s, line %d\n", error, errno, file, line);
-  }
-#endif
-  pthread_mutex_lock(&mp->global);
-  mp->thread=pthread_self();
-  if (mp->count++)
-  {
-    fprintf(stderr,
-            "safe_mutex:  Count was %d in thread 0x%lx when locking mutex at %s, line %d (error: %d (%d))\n",
-            mp->count-1, my_thread_dbug_id(), file, line, error, error);
-    fflush(stderr);
-    abort();
-  }
-  mp->file= file;
-  mp->line=line;
-  pthread_mutex_unlock(&mp->global);
-  return error;
-}
-#endif
