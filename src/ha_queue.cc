@@ -3037,6 +3037,22 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
 
 my_bool queue_wait_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 {
+#if MYSQL_VERSION_ID >= 50600
+  /*
+    In MySQL 5.6, queue_wait() in WHERE clause cannot be supported, since
+    UDFs are never folded by the optimizer (see is_expensive(), eval_cond,
+    ...).
+    The guard checks if such query has been issued.
+   */
+  {
+    THD* thd = current_thd;
+    if (thd->lex != NULL
+        && thd->lex->select_lex.table_list.elements != 0) {
+      strcpy(message, "as of MySQL 5.6, the function cannot be used within a WHERE clause");
+      return 1;
+    }
+  }
+#endif
   if (args->arg_count == 0) {
     strcpy(message, "queue_wait(table_name[,timeout]): argument error");
     return 1;
