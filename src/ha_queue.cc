@@ -28,6 +28,7 @@ extern "C" {
 #include <map>
 #include <string>
 #include <vector>
+#include <boost/static_assert.hpp>
 
 #define MYSQL_SERVER
 
@@ -81,6 +82,9 @@ extern "C" {
 
 #include "ha_queue.h"
 #include "adler32.c"
+
+BOOST_STATIC_ASSERT(sizeof(queue_file_header_t)
+                    == queue_file_header_t::_HEADER_SIZE);
 
 extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 				 const char *table, const char *ext,

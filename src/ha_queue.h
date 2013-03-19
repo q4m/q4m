@@ -107,6 +107,9 @@ public:
     MAGIC_V2      = 0x314d3451, // 'Q4M1' in little endian, w. conditional wait
     attr_is_dirty = 0x1
   };
+  enum {
+    _HEADER_SIZE = 4096
+  };
 private:
   char _magic[4];
   char _attr[4];
@@ -117,7 +120,8 @@ private:
   char _row_count[8];
   char _rows_written[8];
   char _rows_removed[8];
-  unsigned _padding[1024 - (4 + 4 + 8 + 8 + 8 + QUEUE_MAX_SOURCES * 8 + 8)];
+  char _padding[_HEADER_SIZE
+                - (4 + 4 + 8 + 8 + 8 + QUEUE_MAX_SOURCES * 8 + 8 + 8 + 8)];
 public:
   queue_file_header_t();
   unsigned magic() const { return uint4korr(_magic); }
