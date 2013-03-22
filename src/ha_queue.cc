@@ -3318,10 +3318,14 @@ char* queue_stats(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long 
   }
   my_off_t rows_written;
   my_off_t rows_removed;
+  my_off_t bytes_total;
+  my_off_t bytes_removed;
   {
     cac_mutex_t<queue_share_t::info_t>::lockref info(share->info);
     rows_written = info->rows_written;
     rows_removed = info->rows_removed;
+    bytes_total = info->_header.bytes_total();
+    bytes_removed = info->_header.bytes_removed();
   }
   queue_share_t::stats_t stats =
     *cac_mutex_t<queue_share_t::stats_t>::lockref(*share->stats);
@@ -3332,14 +3336,18 @@ char* queue_stats(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long 
 	  "wait_delayed: %llu\n"
 	  "wait_timeout: %llu\n"
 	  "restored_by_abort: %llu\n"
-	  "restored_by_close: %llu\n",
+	  "restored_by_close: %llu\n"
+          "bytes_total: %llu\n"
+          "bytes_removed: %llu\n",
 	  rows_written,
 	  rows_removed,
 	  stats.wait_immediate_cnt,
 	  stats.wait_delayed_cnt,
 	  stats.wait_timeout_cnt,
 	  stats.abort_cnt,
-	  stats.close_cnt);
+	  stats.close_cnt,
+          bytes_total,
+          bytes_removed);
   share->release();
   *length = strlen(initid->ptr);
   *is_null = 0;
