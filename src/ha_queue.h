@@ -118,8 +118,8 @@ private:
   char _begin_row_id[8];
   char _last_received_offsets[QUEUE_MAX_SOURCES][8];
   char _row_count[8];
-  char _rows_written[8];
-  char _rows_removed[8];
+  char _bytes_total[8]; // sum of size of type_row(|_received)(|_removed)
+  char _bytes_removed[8]; // sum of size of *_removed
   char _padding[_HEADER_SIZE
                 - (4 + 4 + 8 + 8 + 8 + QUEUE_MAX_SOURCES * 8 + 8 + 8 + 8)];
 public:
@@ -143,6 +143,10 @@ public:
   }
   my_off_t row_count() const { return uint8korr(_row_count); }
   void set_row_count(my_off_t c) { int8store(_row_count, c); }
+  my_off_t bytes_total() const { return uint8korr(_bytes_total); }
+  void set_bytes_total(my_off_t n) { int8store(_bytes_total, n); }
+  my_off_t bytes_removed() const { return uint8korr(_bytes_removed); }
+  void set_bytes_removed(my_off_t n) { int8store(_bytes_removed, n); }
   void write(int fd);
 };
 
@@ -425,8 +429,6 @@ private:
   pthread_t writer_thread;
   bool writer_do_wake_listeners;
   
-  my_off_t bytes_removed;
-  
   /* following fields are for V2 type table only */
   queue_fixed_field_t **fixed_fields_;
   
@@ -497,7 +499,7 @@ private:
   static void *_writer_start(void* self) {
     return static_cast<queue_share_t*>(self)->writer_start();
   }
-  my_off_t compact_do_copy(queue_compact_writer &writer, info_t *info, my_off_t *row_count);
+  my_off_t compact_do_copy(queue_compact_writer &writer, info_t *info, my_off_t *row_count, my_off_t* bytes_alive);
   int compact(info_t *info);
   queue_share_t();
   ~queue_share_t();

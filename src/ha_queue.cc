@@ -399,7 +399,8 @@ uchar* queue_share_t::get_share_key(queue_share_t *share, size_t *length,
 
 void queue_share_t::recalc_row_count(info_t *info, bool log)
 {
-  my_off_t off = info->_header.begin(), row_count = 0;
+  my_off_t off = info->_header.begin(), row_count = 0, bytes_total = 0,
+    bytes_removed = 0;
   
   while (off != info->_header.end()) {
     queue_row_t row;
@@ -411,6 +412,12 @@ void queue_share_t::recalc_row_count(info_t *info, bool log)
     case queue_row_t::type_row:
     case queue_row_t::type_row_received:
       row_count++;
+      bytes_total += row.next(0);
+      break;
+    case queue_row_t::type_row_removed:
+    case queue_row_t::type_row_received_removed:
+      bytes_total += row.next(0);
+      bytes_removed += row.next(0);
       break;
     default:
       break;
@@ -422,6 +429,8 @@ void queue_share_t::recalc_row_count(info_t *info, bool log)
 	row_count, info->_header.row_count());
   }
   info->_header.set_row_count(row_count);
+  info->_header.set_bytes_total(bytes_total);
+  info->_header.set_bytes_removed(bytes_removed);
 }
 
 bool queue_share_t::fixup_header(info_t *info)
@@ -995,7 +1004,7 @@ void queue_share_t::unlock_reader(bool from_queue_wait, bool force_compaction)
     bool do_compact = force_compaction;
     if (! do_compact) {
       queue_file_header_t *header = &info.unsafe_ref()->_header;
-      if (DO_COMPACT(header->end() - sizeof(*header), bytes_removed)) {
+      if (DO_COMPACT(header->bytes_total(), header->bytes_removed())) {
 	do_compact = true;
       }
     }
@@ -1004,8 +1013,8 @@ void queue_share_t::unlock_reader(bool from_queue_wait, bool force_compaction)
       cac_mutex_t<info_t>::lockref info(this->info);
       if (info->do_compact_cond == NULL
 	  && (force_compaction
-	      || DO_COMPACT(info->_header.end() - sizeof(info->_header),
-			    bytes_removed))) {
+	      || DO_COMPACT(info->_header.bytes_total(),
+                            info->_header.bytes_removed()))) {
 	pthread_cond_t c;
 	pthread_cond_init(&c, NULL);
 	info->do_compact_cond = &c;
@@ -1551,6 +1560,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
     total_len += iov.back().iov_len = (*i)->rows_size;
     row_count += (*i)->row_count;
   }
+  my_off_t bytes_total_add = total_len;
   iov[0].iov_base =
     queue_row_t::create_checksum(&iov.front() + 1, iov.size() - 1);
   total_len += iov[0].iov_len =
@@ -1611,6 +1621,8 @@ int queue_share_t::writer_do_append(append_list_t *l)
     }
     info->_header.set_row_count(info->_header.row_count() + row_count);
     info->rows_written += row_count;
+    info->_header.set_bytes_total(info->_header.bytes_total()
+                                  + bytes_total_add);
   }
   
   my_free(iov[0].iov_base, MYF(0));
@@ -1656,10 +1668,12 @@ int queue_share_t::do_remove_rows(my_off_t *offsets, int cnt)
       err =
 	overwrite_byte(reinterpret_cast<char*>(&row)[queue_row_t::type_offset],
 		       off + queue_row_t::type_offset);
-      bytes_removed += queue_row_t::header_size() + row.size();
       stat_rows_removed.incr();
       {
 	cac_mutex_t<info_t>::lockref info(this->info);
+        info->_header.set_bytes_removed(info->_header.bytes_removed()
+                                        + queue_row_t::header_size()
+                                        + row.size());
 	if (info->_header.begin() == off) {
 	  my_off_t row_id = info->_header.begin_row_id();
 	  if (next(&off, &row_id) == 0) {
@@ -1705,7 +1719,6 @@ void *queue_share_t::writer_start()
     /* wait for signal if we do not have any pending writes */
     do {
       if (info->do_compact_cond != NULL) {
-        bytes_removed = 0;
         compact(info);
 	pthread_cond_signal(info->do_compact_cond);
 	info->do_compact_cond = NULL;
@@ -1835,11 +1848,12 @@ struct queue_compact_writer {
   }
 };
 
-my_off_t queue_share_t::compact_do_copy(queue_compact_writer &writer, info_t* info, my_off_t *row_count)
+my_off_t queue_share_t::compact_do_copy(queue_compact_writer &writer, info_t* info, my_off_t *row_count, my_off_t* bytes_alive)
 {
   my_off_t off = info->_header.begin(), end_off = info->_header.end(),
     new_begin = 0, last_compact_check_off = 0, last_tmp_sync_off = 0;
   *row_count = 0;
+  *bytes_alive = 0;
   size_t rows_removed = 0;
   
   if (concurrent_compaction) {
@@ -1887,6 +1901,7 @@ my_off_t queue_share_t::compact_do_copy(queue_compact_writer &writer, info_t* in
 	goto ERROR;
       }
       ++*row_count;
+      *bytes_alive += row.next(0);
       break;
     case queue_row_t::type_row_removed:
     case queue_row_t::type_row_received_removed:
@@ -2001,13 +2016,14 @@ int queue_share_t::compact(info_t *info)
   { 
     queue_compact_writer writer(this, tmp_fd,
 				sizeof(tmp_hdr) + queue_row_t::checksum_size());
-    my_off_t new_begin, row_count;
+    my_off_t new_begin, row_count, bytes_total;
     /* write content to new file */
     if (lseek(tmp_fd, sizeof(tmp_hdr) + queue_row_t::checksum_size(), SEEK_SET)
 	== -1) {
       goto ERR_OPEN;
     }
-    if ((new_begin = compact_do_copy(writer, info, &row_count)) == (my_off_t)-1) {
+    if ((new_begin = compact_do_copy(writer, info, &row_count, &bytes_total))
+        == (my_off_t)-1) {
       goto ERR_OPEN;
     }
     /* adjust write position if file is empty */
@@ -2022,6 +2038,7 @@ int queue_share_t::compact(info_t *info)
 		      info->_header.begin_row_id());
     tmp_hdr.set_end(writer.off);
     tmp_hdr.set_row_count(row_count);
+    tmp_hdr.set_bytes_total(bytes_total);
     for (int i = 0; i < QUEUE_MAX_SOURCES; i++) {
       tmp_hdr.set_last_received_offset(i,
 				       info->_header.last_received_offset(i));
@@ -3301,10 +3318,14 @@ char* queue_stats(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long 
   }
   my_off_t rows_written;
   my_off_t rows_removed;
+  my_off_t bytes_total;
+  my_off_t bytes_removed;
   {
     cac_mutex_t<queue_share_t::info_t>::lockref info(share->info);
     rows_written = info->rows_written;
     rows_removed = info->rows_removed;
+    bytes_total = info->_header.bytes_total();
+    bytes_removed = info->_header.bytes_removed();
   }
   queue_share_t::stats_t stats =
     *cac_mutex_t<queue_share_t::stats_t>::lockref(*share->stats);
@@ -3315,14 +3336,18 @@ char* queue_stats(UDF_INIT *initid, UDF_ARGS *args, char *result, unsigned long 
 	  "wait_delayed: %llu\n"
 	  "wait_timeout: %llu\n"
 	  "restored_by_abort: %llu\n"
-	  "restored_by_close: %llu\n",
+	  "restored_by_close: %llu\n"
+          "bytes_total: %llu\n"
+          "bytes_removed: %llu\n",
 	  rows_written,
 	  rows_removed,
 	  stats.wait_immediate_cnt,
 	  stats.wait_delayed_cnt,
 	  stats.wait_timeout_cnt,
 	  stats.abort_cnt,
-	  stats.close_cnt);
+	  stats.close_cnt,
+          bytes_total,
+          bytes_removed);
   share->release();
   *length = strlen(initid->ptr);
   *is_null = 0;
