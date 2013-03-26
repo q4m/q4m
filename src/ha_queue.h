@@ -108,7 +108,9 @@ public:
     attr_is_dirty = 0x1
   };
   enum {
-    _HEADER_SIZE = 4096
+    HEADER_SIZE_0_9_6 = 2440,
+    HEADER_SIZE_0_9_7 = 2456,
+    HEADER_SIZE_0_9_8 = 4096
   };
 private:
   char _magic[4];
@@ -120,7 +122,7 @@ private:
   char _row_count[8];
   char _bytes_total[8]; // sum of size of type_row(|_received)(|_removed)
   char _bytes_removed[8]; // sum of size of *_removed
-  char _padding[_HEADER_SIZE
+  char _padding[HEADER_SIZE_0_9_8
                 - (4 + 4 + 8 + 8 + 8 + QUEUE_MAX_SOURCES * 8 + 8 + 8 + 8)];
 public:
   queue_file_header_t();
@@ -148,6 +150,7 @@ public:
   my_off_t bytes_removed() const { return uint8korr(_bytes_removed); }
   void set_bytes_removed(my_off_t n) { int8store(_bytes_removed, n); }
   void write(int fd);
+  my_off_t size() const;
 };
 
 struct queue_source_t {
