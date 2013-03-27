@@ -84,7 +84,7 @@ extern "C" {
 #include "adler32.c"
 
 BOOST_STATIC_ASSERT(sizeof(queue_file_header_t)
-                    == queue_file_header_t::_HEADER_SIZE);
+                    == queue_file_header_t::HEADER_SIZE_0_9_8);
 
 extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 				 const char *table, const char *ext,
@@ -385,9 +385,25 @@ queue_file_header_t::queue_file_header_t()
 
 void queue_file_header_t::write(int fd)
 {
-  if (sys_pwrite(fd, this, sizeof(*this), 0) != sizeof(*this)) {
+  size_t sz = static_cast<size_t>(size());
+  if (sys_pwrite(fd, this, sz, 0) != sz) {
     kill_proc("failed to update header\n");
   }
+}
+
+my_off_t queue_file_header_t::size() const
+{
+#define CHECK_AND_RETURN(sz)                                            \
+  if (reinterpret_cast<const queue_row_t*>(reinterpret_cast<const char*>(this) \
+                                           + sz)->type()                \
+      == queue_row_t::type_checksum) {                                  \
+    return sz;                                                          \
+  }
+  
+  CHECK_AND_RETURN(HEADER_SIZE_0_9_6);
+  CHECK_AND_RETURN(HEADER_SIZE_0_9_7);
+#undef CHECK_AND_RETURN
+  return HEADER_SIZE_0_9_8;
 }
 
 uchar* queue_share_t::get_share_key(queue_share_t *share, size_t *length,
@@ -437,7 +453,7 @@ bool queue_share_t::fixup_header(info_t *info)
 {
   log("%s.Q4M was not closed properly... checking consistency.\n", table_name);
   /* update end */
-  my_off_t off = info->_header.end(), old_off = off;
+  my_off_t off = info->_header.size(), old_off = off;
   while (1) {
     queue_row_t row;
     if (read(&row, off, queue_row_t::header_size())
