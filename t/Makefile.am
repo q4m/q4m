@@ -1,4 +1,6 @@
-EXTRA_DIST=	*.t
+EXTRA_DIST=	*.t \
+	16-upgrade/test/*.frm \
+	16-upgrade/test/*.Q4M
 noinst_PROGRAMS=	05-multireader-read 05-multirw-core 05-multiwait-core
 
 INCLUDES=	$(MYSQL_INC)
