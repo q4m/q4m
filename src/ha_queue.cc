@@ -134,6 +134,7 @@ static pthread_mutex_t open_mutex, listener_mutex, tbl_stat_mutex;
 #if Q4M_DELETE_METHOD == Q4M_DELETE_MSYNC
 static ptrdiff_t psz_mask;
 #endif
+static pthread_mutex_t compile_expr_mutex;
 
 static handlerton *queue_hton;
 
@@ -1484,7 +1485,9 @@ queue_share_t::compile_cond_expr(info_t *info, const char *expr, size_t len)
   }
   
   // compile and return
+  pthread_mutex_lock(&compile_expr_mutex);
   queue_cond_t::node_t *n = info->cond_eval.compile_expression(expr, len);
+  pthread_mutex_unlock(&compile_expr_mutex);
   if (n == NULL) {
     return NULL;
   }
@@ -2836,6 +2839,7 @@ static int init_plugin(void *p)
   pthread_mutex_init(&open_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&listener_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&tbl_stat_mutex, MY_MUTEX_INIT_FAST);
+  pthread_mutex_init(&compile_expr_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&stat_mutex, MY_MUTEX_INIT_FAST);
   my_hash_init(&queue_open_tables, system_charset_info, 32, 0, 0,
 	    reinterpret_cast<my_hash_get_key>(queue_share_t::get_share_key), 0, 0);
@@ -2857,6 +2861,7 @@ static int deinit_plugin(void *p)
   
   my_hash_free(&queue_open_tables);
   pthread_mutex_destroy(&stat_mutex);
+  pthread_mutex_destroy(&compile_expr_mutex);
   pthread_mutex_destroy(&tbl_stat_mutex);
   pthread_mutex_destroy(&listener_mutex);
   pthread_mutex_destroy(&open_mutex);
