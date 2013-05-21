@@ -1,3 +1,6 @@
+0.9.10 - Tue May 21 18:30:00 JST 2013
+	- fix crash when using conditional subscription under high load
+
 0.9.9 - Wed Mar 27 11:43:00 JST 2013
 	- fix possible crash / data-loss when trying to access data created by Q4M < 0.9.8 (the bug exists in Q4M 0.9.7 and 0.9.8)
 
