@@ -156,7 +156,7 @@ fi
 
 if test -z "$DOC_ROOT"
 then
-    DOC_ROOT='http://q4m.github.com/'
+    DOC_ROOT='http://q4m.github.io/'
 fi
 AC_SUBST(DOC_ROOT)
 
