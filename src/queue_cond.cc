@@ -323,23 +323,37 @@ int queue_cond_t::find_column(const char *first, const char *last) const
 
 #ifdef TEST
 
+static void* doit(void* _cond)
+{
+  queue_cond_t cond;
+  cond.add_column("a");
+  cond.set_value(0, queue_cond_t::value_t::int_value(3));
+  cond.add_column("not");
+  cond.set_value(1, queue_cond_t::value_t::int_value(4));
+
+  static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+  for (int i = 0; i < 10000; ++i) {
+    //pthread_mutex_lock(&mutex);
+    queue_cond_t::node_t* expr = cond.compile_expression("a=1", 3);
+    //pthread_mutex_unlock(&mutex);
+    assert(expr != NULL);
+    delete expr;
+  }
+  return NULL;
+}
+
 int main(int argc, char **argv)
 {
   string s;
   
-  while (getline(cin, s)) {
-    queue_cond_t cond;
-    cond.add_column("a");
-    cond.set_value(0, queue_cond_t::value_t::int_value(3));
-    cond.add_column("not");
-    cond.set_value(1, queue_cond_t::value_t::int_value(4));
-    queue_cond_t::node_t *expr = cond.compile_expression(s.c_str(), s.size());
-    if (expr != NULL) {
-      cout << cond.evaluate(expr) << endl;
-      delete expr;
-    } else {
-      cout << "error" << endl;
-    }
+#define NUM_THREADS 2
+  pthread_t tids[NUM_THREADS];
+
+  for (int i = 0; i < NUM_THREADS; ++i) {
+    pthread_create(tids + i, NULL, doit, NULL);
+  }
+  for (int i = 0; i < NUM_THREADS; ++i) {
+    pthread_join(tids[i], NULL);
   }
   
   return 0;
