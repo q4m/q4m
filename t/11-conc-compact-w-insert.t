@@ -1,4 +1,4 @@
-#! /usr/bin/perl
+#! /usr/bin/env perl
 
 # should set queue-use-concurrent-compaction=1 and queue-concurrent-compaction-interval to a small value
 
