@@ -1507,7 +1507,9 @@ void queue_share_t::release_cond_expr(cond_expr_t *e)
     e->detach(info->active_cond_exprs);
     e->attach_front(info->inactive_cond_exprs);
     if (++info->inactive_cond_expr_cnt > 100) {
-      info->inactive_cond_exprs->prev()->free(&info->inactive_cond_exprs);
+      cond_expr_t *prev = info->inactive_cond_exprs->prev();
+      prev->free(&info->inactive_cond_exprs);
+      delete prev;
       info->inactive_cond_expr_cnt--;
     }
   }
