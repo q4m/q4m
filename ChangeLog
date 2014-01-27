@@ -1,3 +1,6 @@
+0.9.11 - Mon Jan 27 18:18:00 JST 2014
+	- fix memory leak in conditional subscription (thanks to hkobayash)
+
 0.9.10 - Tue May 21 18:30:00 JST 2013
 	- fix crash when using conditional subscription under high load
 
