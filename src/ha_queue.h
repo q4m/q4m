@@ -285,6 +285,7 @@ public:
       expr = NULL;
       delete node;
       node = NULL;
+      delete this;
     }
   };
   
