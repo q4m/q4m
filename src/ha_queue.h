@@ -366,7 +366,9 @@ public:
     ~info_t() {
       delete [] fixed_buf;
       while (inactive_cond_exprs != NULL) {
+        cond_expr_t *e = inactive_cond_exprs;
 	inactive_cond_exprs->free(&inactive_cond_exprs);
+        delete e;
       }
       pthread_cond_destroy(_append_response_conds);
       pthread_cond_destroy(_append_response_conds + 1);
