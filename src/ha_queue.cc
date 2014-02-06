@@ -885,7 +885,6 @@ bool queue_share_t::init_fixed_fields()
     return true;
   }
   
-  cac_mutex_t<info_t>::lockref info(this->info);
   TABLE table;
   if (fixed_fields_ != NULL) {
     mysql_mutex_unlock(&LOCK_open);
@@ -895,7 +894,7 @@ bool queue_share_t::init_fixed_fields()
     mysql_mutex_unlock(&LOCK_open);
     return false;
   }
-  init_fixed_fields(info, &table);
+  init_fixed_fields(&table);
   closefrm(&table, true);
   mysql_mutex_unlock(&LOCK_open);
   
@@ -914,12 +913,7 @@ bool queue_share_t::init_fixed_fields()
     free(tmpbuf);
     return false;
   }
-  {
-    cac_mutex_t<info_t>::lockref info(this->info);
-    if (fixed_fields_ == NULL) {
-      init_fixed_fields(info, table);
-    }
-  }
+  init_fixed_fields(table);
   intern_close_table(table);
   free(tmpbuf);
   
@@ -927,12 +921,17 @@ bool queue_share_t::init_fixed_fields()
 #endif
 }
 
-void queue_share_t::init_fixed_fields(info_t *info, TABLE *table)
+void queue_share_t::init_fixed_fields(TABLE *table)
 {
   if (fixed_fields_ != NULL) {
     return;
   }
   
+  cac_mutex_t<info_t>::lockref info(this->info);
+  if (fixed_fields_ != NULL) {
+    return;
+  }
+
   /* setup fixed_fields */
   queue_fixed_field_t** fixed_fields
     = new queue_fixed_field_t* [table->s->fields];
@@ -2230,7 +2229,7 @@ int ha_queue::open(const char *name, int mode, uint test_if_locked)
   if ((share = queue_share_t::get_share(name)) == NULL) {
     return HA_ERR_CRASHED_ON_USAGE;
   }
-  share->init_fixed_fields(cac_mutex_t<queue_share_t::info_t>::lockref(share->info), table);
+  share->init_fixed_fields(table);
   thr_lock_data_init(share->get_store_lock(), &lock, NULL);
   
   return 0;

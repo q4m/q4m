@@ -448,7 +448,7 @@ public:
   void detach();
   void release();
   bool init_fixed_fields();
-  void init_fixed_fields(info_t *info, TABLE *_table);
+  void init_fixed_fields(TABLE *_table);
   bool lock_reader(bool from_queue_wait = false);
   void unlock_reader(bool from_queue_wait = false, bool force_compaction = false);
   void register_listener(listener_t *l, cond_expr_t *c, int queue_wait_index) {
