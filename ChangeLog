@@ -1,3 +1,6 @@
+0.9.13 - Thu Feb 6 14:49:00 JST 2014
+	- fix deadlock when using multi-table queue_wait on MySQL 5.1
+
 0.9.12 - Thu Jan 30 11:40:00 JST 2014
 	- inlcude CMakeFiles.txt in dist (MySQL 5.5/5.6 support)
 
