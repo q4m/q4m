@@ -1,0 +1,10 @@
+--- sql/item_func.h.orig   2013-02-20 18:07:38.000000000 +0900
++++ sql/item_func.h	2013-02-20 19:04:55.000000000 +0900
+@@ -1358,7 +1358,6 @@
+   void cleanup();
+   Item_result result_type () const { return udf.result_type(); }
+   table_map not_null_tables() const { return 0; }
+-  bool is_expensive() { return 1; }
+   virtual void print(String *str, enum_query_type query_type);
+ };
+ 

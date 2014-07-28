@@ -1,12 +1,23 @@
 Q4M - a Message Queue for MySQL
 
-Apr 15 2009
-Kazuho Oku at Cybozu Labs, Inc.
+http://q4m.github.io/
 
 Q4M is a message queue that works as a pluggable storage engine of MySQL
-5.1.
+5.1 / 5.5 / 5.6.
+
+* MySQL 5.6 Compatibility
+
+It is mandatory to apply `support-files/5.6-select-where-queue-wait.patch`
+to the MySQL source code if you are using `queue_wait()` as an argument
+of the `WHERE` clause.
+
+The patch is not necessary if you are always calling the function in a
+separate statement (e.g. `SELECT queue_wait()`).
 
 * LICENSE and COPYRIGHT
+
+Copyright (c) 2009-2010 Cybozu Labs, Inc.
+Copyright (c) 2010-2014 DeNA Co., Ltd.
 
 Please refer to each file.  The engine was built from the Skeleton engine
 and the copyright of the build scripts mostly belong to their authors.
