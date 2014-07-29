@@ -324,7 +324,7 @@ public:
     pthread_cond_t _remove_response_conds[2];
 #endif
     pthread_cond_t *do_compact_cond;
-    bool is_deleting;
+    bool is_dropping_table;
     
     queue_cond_t cond_eval;
     cond_expr_t *active_cond_exprs;
@@ -346,7 +346,7 @@ public:
 #else
  remove_list(NULL),
 #endif
-               do_compact_cond(NULL), is_deleting(false), cond_eval(),
+               do_compact_cond(NULL), is_dropping_table(false), cond_eval(),
                active_cond_exprs(NULL), inactive_cond_exprs(NULL),
                inactive_cond_expr_cnt(0), writer_exit(false), null_bytes(0),
                fields(0), fixed_buf(NULL), fixed_buf_size(0), rows_written(0),

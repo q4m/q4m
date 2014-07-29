@@ -2084,7 +2084,7 @@ int queue_share_t::compact(info_t *info)
     sync_file(tmp_fd);
   }
   /* rename */
-  if (info->is_deleting) {
+  if (info->is_dropping_table) {
     if (unlink(tmp_filename) != 0) {
       log("failed to unlink file: %s\n", tmp_filename);
       goto ERR_OPEN;
@@ -2450,11 +2450,11 @@ int ha_queue::create(const char *name, TABLE *table_arg,
   
   queue_share_t* old_share = queue_share_t::get_share(name, false);
   
-  /* set is_deleting flag to prevent the compaction thread from overriting .Q4M
+  /* set is_dropping_table flag to prevent the compaction thread from overriting .Q4M
    */
   if (old_share != NULL) {
     cac_mutex_t<queue_share_t::info_t>::lockref info(old_share->info);
-    info->is_deleting = true;
+    info->is_dropping_table = true;
   }
   
   /* unlink existing file (if exists, is the case for TRUNCATE TABLE) instead
@@ -2608,7 +2608,7 @@ int ha_queue::delete_table(const char *name)
   if (share != NULL || (share = queue_share_t::get_share(name)) != NULL) {
     {
       cac_mutex_t<queue_share_t::info_t>::lockref info(share->info);
-      info->is_deleting = true;
+      info->is_dropping_table = true;
     }
     share->detach();
     share->release();
