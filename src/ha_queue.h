@@ -340,6 +340,8 @@ public:
     my_off_t rows_written;
     my_off_t rows_removed;
     
+    bool delete_is_running;
+
     info_t() : _header(), rows_owned(NULL), max_owned_row_off(0),
 	       append_list(new append_list_t()),
 #if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
@@ -350,7 +352,7 @@ public:
                active_cond_exprs(NULL), inactive_cond_exprs(NULL),
                inactive_cond_expr_cnt(0), writer_exit(false), null_bytes(0),
                fields(0), fixed_buf(NULL), fixed_buf_size(0), rows_written(0),
-	       rows_removed(0)
+	       rows_removed(0), delete_is_running(false)
     {
       pthread_cond_init(&to_writer_cond, NULL);
       pthread_cond_init(_append_response_conds, NULL);
@@ -555,7 +557,8 @@ class ha_queue: public handler
   size_t bulk_insert_rows; /* should be -1 unless bulk_insertion */
   std::vector<my_off_t> *bulk_delete_rows;
   bool defer_reader_lock;
-  
+  bool owns_delete_lock;
+
  public:
   ha_queue(handlerton *hton, TABLE_SHARE *table_arg);
   ~ha_queue();
