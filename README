@@ -7,9 +7,14 @@ Q4M is a message queue that works as a pluggable storage engine of MySQL
 
 * MySQL 5.6 Compatibility
 
-It is mandatory to apply `support-files/5.6-select-where-queue-wait.patch`
-to the MySQL source code if you are using `queue_wait()` as an argument
-of the `WHERE` clause.
+As of MySQL 5.6, it is no longer possible to call the `queue_wait()`
+function within a `WHERE` clause, due to a change within the internals
+of MySQL core.
+
+In case it is necessary to use the feature, you should apply
+`support-files/5.6-select-where-queue-wait.patch` to the MySQL source
+code, disable the assertion code at the top of `queue_wait_init`
+function in `src/ha_queue.cc`, and recompile both MySQL and Q4M.
 
 The patch is not necessary if you are always calling the function in a
 separate statement (e.g. `SELECT queue_wait()`).
