@@ -1113,6 +1113,8 @@ bool queue_share_t::wake_listeners(bool from_writer)
   
   { // per-listener test
     cac_mutex_t<info_t>::lockref info(this->info);
+    if (info->delete_is_running)
+      goto RETURN;
     if (off == 0) {
       off = info->_header.begin();
       row_id = info->_header.begin_row_id();
@@ -1375,6 +1377,10 @@ queue_connection_t *queue_share_t::find_owner(info_t *info, my_off_t off)
 my_off_t queue_share_t::assign_owner(info_t *info, queue_connection_t *conn,
 				     cond_expr_t *cond_expr)
 {
+  // should not assign an owner until DELETE finishes
+  if (info->delete_is_running)
+    return 0;
+
   my_off_t off = cond_expr->pos, row_id = cond_expr->row_id;
   if (off == 0) {
     off = info->_header.begin();
@@ -2204,7 +2210,8 @@ ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
    rows_reserved(0),
    bulk_insert_rows(static_cast<size_t>(-1)),
    bulk_delete_rows(NULL),
-   defer_reader_lock(false)
+   defer_reader_lock(false),
+   owns_delete_lock(false)
 {
   assert(ref_length == sizeof(my_off_t));
 }
@@ -2260,6 +2267,16 @@ int ha_queue::external_lock(THD *thd, int lock_type)
     }
     defer_reader_lock = false;
     free_rows_buffer();
+    // after DELETE, unlock the delete lock and wake-up the pending listeners
+    if (owns_delete_lock) {
+      {
+        cac_mutex_t<queue_share_t::info_t>::lockref info(share->info);
+        assert(info->delete_is_running);
+        info->delete_is_running = false;
+      }
+      owns_delete_lock = false;
+      share->wake_listeners(false);
+    }
     break;
   default:
     break;
@@ -2319,6 +2336,12 @@ int ha_queue::rnd_next(uchar *buf)
       if (pos == info->_header.end()) {
 	goto EXIT;
       }
+    }
+    if (lock.type >= TL_WRITE_ALLOW_WRITE
+        && thd_sql_command(current_thd) == SQLCOM_DELETE) {
+      // block rows from being assigned, if DELETE is running (see also: store_lock & external_lock)
+      info->delete_is_running = true;
+      owns_delete_lock = true;
     }
   }
   
