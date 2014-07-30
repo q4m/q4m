@@ -1799,9 +1799,12 @@ void *queue_share_t::writer_start()
       } else {
 	sync_file(fd);
       }
+#if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
+#else
       if (remove_response_cond != NULL) {
 	pthread_cond_broadcast(remove_response_cond);
       }
+#endif
       /* reset wake_listeners flag if successfully woke listeners */
       if (writer_do_wake_listeners && wake_listeners(true)) {
 	writer_do_wake_listeners = false;
@@ -3077,7 +3080,7 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
 
 my_bool queue_wait_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 {
-#if MYSQL_VERSION_ID >= 50600
+#if MYSQL_VERSION_ID >= 50600 && ! defined(SKIP_QUEUE_WAIT_CHECK_COMPAT)
   /*
     In MySQL 5.6, queue_wait() in WHERE clause cannot be supported, since
     UDFs are never folded by the optimizer (see is_expensive(), eval_cond,
