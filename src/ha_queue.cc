@@ -1799,9 +1799,12 @@ void *queue_share_t::writer_start()
       } else {
 	sync_file(fd);
       }
+#if Q4M_DELETE_METHOD != Q4M_DELETE_SERIAL_PWRITE && defined(FDATASYNC_SKIP)
+#else
       if (remove_response_cond != NULL) {
 	pthread_cond_broadcast(remove_response_cond);
       }
+#endif
       /* reset wake_listeners flag if successfully woke listeners */
       if (writer_do_wake_listeners && wake_listeners(true)) {
 	writer_do_wake_listeners = false;
