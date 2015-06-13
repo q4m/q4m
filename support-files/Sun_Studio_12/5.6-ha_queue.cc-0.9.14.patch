@@ -1,0 +1,237 @@
+diff -r 838a3a572fb2 storage/q4m/src/ha_queue.cc
+--- a/storage/q4m/src/ha_queue.cc	Sat Apr 25 08:55:27 2015 +0900
++++ b/storage/q4m/src/ha_queue.cc	Sun Apr 26 17:05:45 2015 +0900
+@@ -387,7 +387,12 @@
+ {
+   size_t sz = static_cast<size_t>(size());
+   if (sys_pwrite(fd, this, sz, 0) != sz) {
++#ifdef __GNUC__
+     kill_proc("failed to update header\n");
++#else
++    kill_proc("failed to update header\n", "");
++#endif
++
+   }
+ }
+ 
+@@ -537,7 +542,12 @@
+ 			 & ~queue_file_header_t::attr_is_dirty);
+   info->_header.write(fd);
+   sync_file(fd);
++#ifdef __GNUC__
+   log("finished consistency checking.\n");
++#else
++  log("finished consistency checking.\n", "");
++#endif
++
+   return true;
+ }
+ 
+@@ -573,7 +583,12 @@
+   char *db_table_buf;
+   
+   if ((db_table_buf = strdup(db_table_name)) == NULL) {
++#ifdef __GNUC__
+     log("out of memory\n");
++#else
++    log("out of memory\n", "");
++#endif
++
+     return NULL;
+   }
+   for (db = db_table_buf; *db == '/' || *db == '.'; db++)
+@@ -804,7 +819,11 @@
+  ERR_AFTER_FILEOPEN:
+   close(share->fd);
+  ERR_ON_FILEOPEN:
++#ifdef __GNUC__
+   share->listener_list.~list();
++#else
++  share->listener_list.~listener_list_t();
++#endif
+   share->cond_expr_true.~cond_expr_t();
+   share->info.~cac_mutex_t();
+   thr_lock_delete(&share->store_lock);
+@@ -835,9 +854,19 @@
+       pthread_cond_signal(&info->to_writer_cond);
+     }
+     if (pthread_join(writer_thread, NULL) != 0) {
++#ifdef __GNUC__
+       kill_proc("failed to join writer thread\n");
++#else
++      kill_proc("failed to join writer thread\n", "");
++#endif
++      
+     }
++#ifdef __GNUC__
+     listener_list.~list();
++#else
++    listener_list.~listener_list_t();
++#endif
++
+     cond_expr_true.~cond_expr_t();
+ #ifdef Q4M_USE_MMAP
+     {
+@@ -1119,7 +1148,12 @@
+       off = info->_header.begin();
+       row_id = info->_header.begin_row_id();
+     } else if (next(&off, &row_id) != 0) {
++#ifdef __GNUC__
+       log("internal error, table corrupt?\n");
++#else
++      log("internal error, table corrupt?\n", "");
++#endif
++      
+       goto RETURN;
+     }
+     if (off != info->_header.end()) {
+@@ -1397,7 +1431,11 @@
+ 	goto FOUND;
+       } else {
+ 	if (setup_cond_eval(info, off) != 0) {
++#ifdef __GNUC__
+ 	  log("internal error, table corrupt?");
++#else
++	  log("internal error, table corrupt?", "");
++#endif
+ 	  return 0;
+ 	}
+ 	stat_cond_eval.incr();
+@@ -1709,7 +1747,12 @@
+ 	++info->rows_removed;
+       }
+     } else {
+-      log("got unexpected response while reading file\n");
++#ifdef __GNUC__
++	  log("got unexpected response while reading file\n");
++#else
++	  log("got unexpected response while reading file\n", "");
++#endif
++
+       err = HA_ERR_CRASHED_ON_USAGE;
+     }
+   }
+@@ -1890,7 +1933,12 @@
+     queue_row_t row;
+     if (read(&row, off, queue_row_t::header_size())
+ 	!= static_cast<ssize_t>(queue_row_t::header_size())) {
+-      log("file corrupt\n");
++#ifdef __GNUC__
++	  log("file corrupt\n");
++#else
++	  log("file corrupt\n", "");
++#endif
++
+       goto ERROR;
+     }
+     switch (row.type()) {
+@@ -1898,7 +1946,11 @@
+     case queue_row_t::type_row_received:
+       if (rows_removed != 0) {
+ 	if (! writer.append_rows_removed(rows_removed)) {
++#ifdef __GNUC__
+ 	  log("I/O error\n");
++#else
++	  log("I/O error\n", "");
++#endif
+ 	  goto ERROR;
+ 	}
+ 	rows_removed = 0;
+@@ -1923,7 +1975,11 @@
+       if (! writer.append_row_header(&row)
+ 	  || ! writer.copy_data(off + queue_row_t::header_size(),
+ 				row.size())) {
+-	log("I/O error\n");
++#ifdef __GNUC__
++	  log("I/O error\n");
++#else
++	  log("I/O error\n", "");
++#endif
+ 	goto ERROR;
+       }
+       ++*row_count;
+@@ -1938,7 +1994,11 @@
+ 	   rows_removed >= queue_row_t::max_size;
+ 	   rows_removed -= queue_row_t::max_size) {
+ 	if (! writer.append_rows_removed(queue_row_t::max_size)) {
++#ifdef __GNUC__
+ 	  log("I/O error\n");
++#else
++	  log("I/O error\n", "");
++#endif
+ 	  goto ERROR;
+ 	}
+       }
+@@ -1946,7 +2006,11 @@
+     case queue_row_t::type_checksum:
+       break;
+     default:
++#ifdef __GNUC__
+       log("file corrupt\n");
++#else
++      log("file corrupt\n", "");
++#endif
+       goto ERROR;
+     }
+     off = row.next(off);
+@@ -1992,7 +2056,11 @@
+   }
+   
+   if (rows_removed != 0 && ! writer.append_rows_removed(rows_removed)) {
++#ifdef __GNUC__
+     log("I/O error\n");
++#else
++    log("I/O error\n", "");
++#endif
+     goto ERROR;
+   }
+   writer.flush();
+@@ -2074,7 +2142,12 @@
+     }
+     /* write checksum */
+     if (writer.off != sizeof(queue_file_header_t)) {
++#ifdef __GNUC__
+       char cbuf[queue_row_t::checksum_size()];
++#else
++      size_t n = queue_row_t::checksum_size();
++      char *cbuf = (char*)alloca(n * sizeof(char));
++#endif
+       queue_row_t::create_checksum(reinterpret_cast<queue_row_t*>(cbuf),
+ 				   writer.off - sizeof(queue_file_header_t)
+ 				   - queue_row_t::checksum_size(),
+@@ -2786,7 +2859,11 @@
+   build_table_filename(path, FN_REFLEN - 1, db, tbl, "", 0);
+   queue_share_t *share = queue_share_t::get_share(path);
+   if (share != NULL && ! share->init_fixed_fields()) {
++#ifdef __GNUC__
+     log("failed to initialize fixed field info.\n");
++#else
++    log("failed to initialize fixed field info.\n", "");
++#endif
+     share->release();
+     share = NULL;
+   }
+@@ -3017,7 +3094,11 @@
+     }
+     if ((share_infos[i] = share_lock_t::lock(locks, shares[i], locks_buf))
+ 	== NULL) {
++#ifdef __GNUC__
+       log("detected misuse of queue_wait(), returning error\n");
++#else
++      log("detected misuse of queue_wait(), returning error\n", "");
++#endif
+       shares[i]->release();
+       shares[i] = NULL;
+       *error = 1;
+@@ -3246,7 +3327,11 @@
+   stat_queue_rowid.incr();
+   queue_connection_t *conn;
+   if ((conn = queue_connection_t::current()) == NULL) {
++#ifdef __GNUC__
+     log("internal error, unexpectedly conn==NULL\n");
++#else
++    log("internal error, unexpectedly conn==NULL\n", "");
++#endif
+     *error = 1;
+     return 0;
+   }
