@@ -1,0 +1,15 @@
+diff -r 838a3a572fb2 storage/q4m/src/queue_cond.h
+--- a/storage/q4m/src/queue_cond.h	Sat Apr 25 08:55:27 2015 +0900
++++ b/storage/q4m/src/queue_cond.h	Sun Apr 26 17:06:25 2015 +0900
+@@ -1,6 +1,11 @@
+ #ifndef QUEUE_COND_H
+ #define QUEUE_COND_H
+ 
++#ifdef __GNUC__
++#else
++#include <math.h>
++#endif
++
+ class queue_cond_expr_t;
+ 
+ class queue_cond_t {

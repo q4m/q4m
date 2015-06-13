@@ -1,0 +1,16 @@
+diff -r 838a3a572fb2 storage/q4m/src/queue_cond.cc
+--- a/storage/q4m/src/queue_cond.cc	Sat Apr 25 08:55:27 2015 +0900
++++ b/storage/q4m/src/queue_cond.cc	Sun Apr 26 17:06:05 2015 +0900
+@@ -6,6 +6,12 @@
+ #include "boost/spirit/tree/ast.hpp"
+ #include "boost/spirit/utility/confix.hpp"
+ #include "boost/spirit/utility/escape_char.hpp"
++
++#ifdef __GNUC__
++#else
++#include <strings.h>
++#endif
++
+ #ifdef TEST
+ #include <string>
+ #include <iostream>
