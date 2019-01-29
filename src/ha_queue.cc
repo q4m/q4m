@@ -690,7 +690,11 @@ queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
   /* init members that would always succeed in doing so */
   share->ref_cnt = 1;
   share->table_name = tmp_name;
+#if MYSQL_VERSION_ID >= 50703
+  my_stpcpy(share->table_name, table_name);
+#else
   strmov(share->table_name, table_name);
+#endif
   share->table_name_length = table_name_length;
   pthread_mutex_init(&share->compact_mutex, MY_MUTEX_INIT_FAST);
   {
