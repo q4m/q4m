@@ -88,6 +88,7 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 #endif
 
 #include "ha_queue.h"
+#include "queue_mysql_compat.h"
 #include "adler32.c"
 
 BOOST_STATIC_ASSERT(sizeof(queue_file_header_t)
@@ -109,6 +110,10 @@ using namespace std;
   ((all) >= COMPACT_THRESHOLD && (free) * 4 >= (all) * 3)
 #define Q4M ".Q4M"
 #define Q4T ".Q4T"
+
+#ifdef Q4M_HAVE_PSI_MEMORY_KEY
+static PSI_memory_key queue_key_memory_queue_share;
+#endif
 
 static ulonglong mmap_max;
 static MYSQL_SYSVAR_ULONGLONG(mmap_max,
@@ -368,7 +373,7 @@ queue_row_t *queue_row_t::create_checksum(const iovec* iov, int iovcnt)
   }
   
   queue_row_t *row =
-    static_cast<queue_row_t*>(my_malloc(checksum_size(), MYF(0)));
+    static_cast<queue_row_t*>(q4m_my_malloc(checksum_size(), MYF(0)));
   create_checksum(row, sz, adler);
   
   return row;
@@ -680,7 +685,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
   }
   
   /* alloc */
-  if (my_multi_malloc(MYF(MY_WME | MY_ZEROFILL), &share, sizeof(queue_share_t),
+  if (q4m_my_multi_malloc(MYF(MY_WME | MY_ZEROFILL), &share, sizeof(queue_share_t),
 		      &tmp_name, table_name_length + 1, NullS)
       == NULL) {
     goto ERR_RETURN;
@@ -2655,7 +2660,7 @@ int ha_queue::prepare_rows_buffer(size_t sz)
     while (rows_reserved < sz) {
       rows_reserved *= 2;
     }
-    if ((rows = static_cast<uchar*>(my_malloc(rows_reserved, MYF(0))))
+    if ((rows = static_cast<uchar*>(q4m_my_malloc(rows_reserved, MYF(0))))
 	== NULL) {
       return -1;
     }
@@ -2665,7 +2670,7 @@ int ha_queue::prepare_rows_buffer(size_t sz)
       new_reserve *= 2;
     } while (new_reserve < rows_size + sz);
     void *pt;
-    if ((pt = my_realloc(rows, new_reserve, MYF(0))) == NULL) {
+    if ((pt = q4m_my_realloc(rows, new_reserve, MYF(0))) == NULL) {
       return -1;
     }
     rows = static_cast<uchar*>(pt);
@@ -2859,17 +2864,42 @@ static bool show_status(handlerton *hton, THD *thd, stat_print_fn *print,
   }
 }
 
+#ifdef Q4M_HAVE_PSI_MEMORY_KEY
+static PSI_memory_info all_queue_memory[]=
+{
+  { &queue_key_memory_queue_share, "queue_share", 0}
+};
+
+void init_queue_psi_keys()
+{
+  const char* category= "queue";
+  int count;
+
+  count= array_elements(all_queue_memory);
+  mysql_memory_register(category, all_queue_memory, count);
+}
+#endif /* Q4M_HAVE_PSI_MEMORY_KEY */
+
 static int init_plugin(void *p)
 {
   queue_hton = (handlerton *)p;
-  
+
+#ifdef Q4M_HAVE_PSI_MEMORY_KEY
+  init_queue_psi_keys();
+#endif
+
   pthread_mutex_init(&open_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&listener_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&tbl_stat_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&compile_expr_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&stat_mutex, MY_MUTEX_INIT_FAST);
   my_hash_init(&queue_open_tables, system_charset_info, 32, 0, 0,
-	    reinterpret_cast<my_hash_get_key>(queue_share_t::get_share_key), 0, 0);
+	    reinterpret_cast<my_hash_get_key>(queue_share_t::get_share_key),
+#ifdef Q4M_HAVE_PSI_MEMORY_KEY
+        0, 0, queue_key_memory_queue_share);
+#else
+        0, 0);
+#endif
   queue_hton->state = SHOW_OPTION_YES;
   queue_hton->close_connection = queue_connection_t::close;
   queue_hton->create = create_handler;
