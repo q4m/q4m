@@ -58,10 +58,6 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 #undef PACKAGE_VERSION
 #include <mysql/plugin.h>
 
-#if MYSQL_VERSION_ID >= 50500
-#define my_free(PTR, FLAG) my_free(PTR)
-#endif
-
 #if MYSQL_VERSION_ID < 50500
 #define mysql_mutex_lock(mutex) pthread_mutex_lock(mutex)
 #define mysql_mutex_unlock(mutex) pthread_mutex_unlock(mutex)
@@ -818,7 +814,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
   thr_lock_delete(&share->store_lock);
   pthread_rwlock_destroy(&share->rwlock);
   pthread_mutex_destroy(&share->compact_mutex);
-  my_free(reinterpret_cast<uchar*>(share), MYF(0));
+  q4m_my_free(reinterpret_cast<uchar*>(share), MYF(0));
  ERR_RETURN:
   pthread_mutex_unlock(&open_mutex);
   return NULL;
@@ -873,7 +869,7 @@ void queue_share_t::release()
     thr_lock_delete(&store_lock);
     pthread_rwlock_destroy(&rwlock);
     pthread_mutex_destroy(&compact_mutex);
-    my_free(reinterpret_cast<uchar*>(this), MYF(0));
+    q4m_my_free(reinterpret_cast<uchar*>(this), MYF(0));
   }
   
   pthread_mutex_unlock(&open_mutex);
@@ -1620,7 +1616,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
       if (i - writev_from >= IOV_MAX
 	  || writev_len + i->iov_len > SSIZE_MAX / 2) {
 	if (sys_writev(fd, &*writev_from, i - writev_from) != writev_len) {
-	  my_free(iov[0].iov_base, MYF(0));
+	  q4m_my_free(iov[0].iov_base, MYF(0));
 	  return HA_ERR_CRASHED_ON_USAGE;
 	}
 	writev_from = i;
@@ -1629,7 +1625,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
       writev_len += i->iov_len;
     }
     if (sys_writev(fd, &*writev_from, iov.end() - writev_from) != writev_len) {
-      my_free(iov[0].iov_base, MYF(0));
+      q4m_my_free(iov[0].iov_base, MYF(0));
       return HA_ERR_CRASHED_ON_USAGE;
     }
     sync_file(fd);
@@ -1656,7 +1652,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
                                   + bytes_total_add);
   }
   
-  my_free(iov[0].iov_base, MYF(0));
+  q4m_my_free(iov[0].iov_base, MYF(0));
   return 0;
 }
 
@@ -2685,7 +2681,7 @@ void ha_queue::free_rows_buffer(bool force)
     return;
   }
   if (rows != NULL) {
-    my_free(rows, MYF(0));
+    q4m_my_free(rows, MYF(0));
     rows = NULL;
     rows_size = 0;
   }

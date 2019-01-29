@@ -18,3 +18,7 @@
 #  define q4m_my_multi_malloc(flags, ...) \
   my_multi_malloc(flags, __VA_ARGS__)
 #endif
+
+#if MYSQL_VERSION_ID >= 50500
+#define q4m_my_free(PTR, FLAG) my_free(PTR)
+#endif
