@@ -3146,7 +3146,11 @@ my_bool queue_wait_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
   {
     THD* thd = current_thd;
     if (thd->lex != NULL
+#if MYSQL_VERSION_ID >= 50705
+        && thd->lex->select_lex->table_list.elements != 0) {
+#else
         && thd->lex->select_lex.table_list.elements != 0) {
+#endif
       strcpy(message, "as of MySQL 5.6, the function cannot be used within a WHERE clause");
       return 1;
     }
