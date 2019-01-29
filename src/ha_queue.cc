@@ -40,7 +40,9 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 				 const char *table, const char *ext,
 				 uint flags);
 #else
+#if MYSQL_VERSION_ID < 50700
 #include "sql_priv.h"
+#endif
 #include "sql_base.h"
 #include "sql_table.h"
 #include "probes_mysql.h"
