@@ -89,7 +89,8 @@ int main(int argc, char **argv)
     insert_row(i + start_value, var_length);
     /* queue_wait */
     while (1) {
-      res = do_select("SELECT * FROM q4m_t WHERE queue_wait('q4m_t')");
+      res = do_select("SELECT queue_wait('q4m_t')");
+      res = do_select("SELECT * FROM q4m_t");
       if (mysql_num_rows(res) != 0) {
 	break;
       }

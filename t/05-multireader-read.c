@@ -67,7 +67,8 @@ int main(int argc, char **argv)
   }
   for (i = 0; i < loop;) {
     /* read data and print */
-    res = do_select("SELECT * FROM q4m_t WHERE queue_wait('q4m_t')");
+    res = do_select("SELECT queue_wait('q4m_t')");
+    res = do_select("SELECT * FROM q4m_t");
     if (mysql_num_rows(res) != 0) {
       printf("%s\n", mysql_fetch_row(res)[0]);
       i++;
