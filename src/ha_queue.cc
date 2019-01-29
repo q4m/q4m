@@ -2780,7 +2780,11 @@ static queue_share_t* get_share_check(const char* db_table_name)
     db = buf;
     tbl = tbl + 1;
   } else {
+#if MYSQL_VERSION_ID >= 50705
+    db = current_thd->db().str;
+#else
     db = current_thd->db;
+#endif
     tbl = db_table_name;
   }
   if (db == NULL) {
