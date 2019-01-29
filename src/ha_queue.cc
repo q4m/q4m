@@ -21,6 +21,7 @@ extern "C" {
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <sys/time.h>
 }
 #include <algorithm>
 #include <functional>
