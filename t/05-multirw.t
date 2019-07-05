@@ -70,7 +70,10 @@ for (my $i = 0; $i < $NUM_CHILDREN; $i++) {
             my $rows;
             do {
                 $rows = $dbh->selectall_arrayref(
-                    "select * from q4m_t where queue_wait('q4m_t')",
+                    "select queue_wait('q4m_t')",
+                ) or die $dbh->errstr;
+                $rows = $dbh->selectall_arrayref(
+                    "select * from q4m_t",
                 ) or die $dbh->errstr;
             } while (@$rows == 0);
             print "$rows->[0]->[0]\n";

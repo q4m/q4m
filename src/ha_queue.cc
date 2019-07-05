@@ -21,6 +21,7 @@ extern "C" {
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <sys/time.h>
 }
 #include <algorithm>
 #include <functional>
@@ -40,7 +41,9 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 				 const char *table, const char *ext,
 				 uint flags);
 #else
+#if MYSQL_VERSION_ID < 50700
 #include "sql_priv.h"
+#endif
 #include "sql_base.h"
 #include "sql_table.h"
 #include "probes_mysql.h"
@@ -54,10 +57,6 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 #undef PACKAGE_TARNAME
 #undef PACKAGE_VERSION
 #include <mysql/plugin.h>
-
-#if MYSQL_VERSION_ID >= 50500
-#define my_free(PTR, FLAG) my_free(PTR)
-#endif
 
 #if MYSQL_VERSION_ID < 50500
 #define mysql_mutex_lock(mutex) pthread_mutex_lock(mutex)
@@ -85,6 +84,7 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 #endif
 
 #include "ha_queue.h"
+#include "queue_mysql_compat.h"
 #include "adler32.c"
 
 BOOST_STATIC_ASSERT(sizeof(queue_file_header_t)
@@ -106,6 +106,10 @@ using namespace std;
   ((all) >= COMPACT_THRESHOLD && (free) * 4 >= (all) * 3)
 #define Q4M ".Q4M"
 #define Q4T ".Q4T"
+
+#ifdef Q4M_HAVE_PSI_MEMORY_KEY
+static PSI_memory_key queue_key_memory_queue_share;
+#endif
 
 static ulonglong mmap_max;
 static MYSQL_SYSVAR_ULONGLONG(mmap_max,
@@ -365,7 +369,7 @@ queue_row_t *queue_row_t::create_checksum(const iovec* iov, int iovcnt)
   }
   
   queue_row_t *row =
-    static_cast<queue_row_t*>(my_malloc(checksum_size(), MYF(0)));
+    static_cast<queue_row_t*>(q4m_my_malloc(checksum_size(), MYF(0)));
   create_checksum(row, sz, adler);
   
   return row;
@@ -677,7 +681,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
   }
   
   /* alloc */
-  if (my_multi_malloc(MYF(MY_WME | MY_ZEROFILL), &share, sizeof(queue_share_t),
+  if (q4m_my_multi_malloc(MYF(MY_WME | MY_ZEROFILL), &share, sizeof(queue_share_t),
 		      &tmp_name, table_name_length + 1, NullS)
       == NULL) {
     goto ERR_RETURN;
@@ -686,7 +690,11 @@ queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
   /* init members that would always succeed in doing so */
   share->ref_cnt = 1;
   share->table_name = tmp_name;
+#if MYSQL_VERSION_ID >= 50703
+  my_stpcpy(share->table_name, table_name);
+#else
   strmov(share->table_name, table_name);
+#endif
   share->table_name_length = table_name_length;
   pthread_mutex_init(&share->compact_mutex, MY_MUTEX_INIT_FAST);
   {
@@ -810,7 +818,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
   thr_lock_delete(&share->store_lock);
   pthread_rwlock_destroy(&share->rwlock);
   pthread_mutex_destroy(&share->compact_mutex);
-  my_free(reinterpret_cast<uchar*>(share), MYF(0));
+  q4m_my_free(reinterpret_cast<uchar*>(share), MYF(0));
  ERR_RETURN:
   pthread_mutex_unlock(&open_mutex);
   return NULL;
@@ -865,7 +873,7 @@ void queue_share_t::release()
     thr_lock_delete(&store_lock);
     pthread_rwlock_destroy(&rwlock);
     pthread_mutex_destroy(&compact_mutex);
-    my_free(reinterpret_cast<uchar*>(this), MYF(0));
+    q4m_my_free(reinterpret_cast<uchar*>(this), MYF(0));
   }
   
   pthread_mutex_unlock(&open_mutex);
@@ -1612,7 +1620,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
       if (i - writev_from >= IOV_MAX
 	  || writev_len + i->iov_len > SSIZE_MAX / 2) {
 	if (sys_writev(fd, &*writev_from, i - writev_from) != writev_len) {
-	  my_free(iov[0].iov_base, MYF(0));
+	  q4m_my_free(iov[0].iov_base, MYF(0));
 	  return HA_ERR_CRASHED_ON_USAGE;
 	}
 	writev_from = i;
@@ -1621,7 +1629,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
       writev_len += i->iov_len;
     }
     if (sys_writev(fd, &*writev_from, iov.end() - writev_from) != writev_len) {
-      my_free(iov[0].iov_base, MYF(0));
+      q4m_my_free(iov[0].iov_base, MYF(0));
       return HA_ERR_CRASHED_ON_USAGE;
     }
     sync_file(fd);
@@ -1648,7 +1656,7 @@ int queue_share_t::writer_do_append(append_list_t *l)
                                   + bytes_total_add);
   }
   
-  my_free(iov[0].iov_base, MYF(0));
+  q4m_my_free(iov[0].iov_base, MYF(0));
   return 0;
 }
 
@@ -2652,7 +2660,7 @@ int ha_queue::prepare_rows_buffer(size_t sz)
     while (rows_reserved < sz) {
       rows_reserved *= 2;
     }
-    if ((rows = static_cast<uchar*>(my_malloc(rows_reserved, MYF(0))))
+    if ((rows = static_cast<uchar*>(q4m_my_malloc(rows_reserved, MYF(0))))
 	== NULL) {
       return -1;
     }
@@ -2662,7 +2670,7 @@ int ha_queue::prepare_rows_buffer(size_t sz)
       new_reserve *= 2;
     } while (new_reserve < rows_size + sz);
     void *pt;
-    if ((pt = my_realloc(rows, new_reserve, MYF(0))) == NULL) {
+    if ((pt = q4m_my_realloc(rows, new_reserve, MYF(0))) == NULL) {
       return -1;
     }
     rows = static_cast<uchar*>(pt);
@@ -2677,7 +2685,7 @@ void ha_queue::free_rows_buffer(bool force)
     return;
   }
   if (rows != NULL) {
-    my_free(rows, MYF(0));
+    q4m_my_free(rows, MYF(0));
     rows = NULL;
     rows_size = 0;
   }
@@ -2776,7 +2784,11 @@ static queue_share_t* get_share_check(const char* db_table_name)
     db = buf;
     tbl = tbl + 1;
   } else {
+#if MYSQL_VERSION_ID >= 50705
+    db = current_thd->db().str;
+#else
     db = current_thd->db;
+#endif
     tbl = db_table_name;
   }
   if (db == NULL) {
@@ -2856,17 +2868,42 @@ static bool show_status(handlerton *hton, THD *thd, stat_print_fn *print,
   }
 }
 
+#ifdef Q4M_HAVE_PSI_MEMORY_KEY
+static PSI_memory_info all_queue_memory[]=
+{
+  { &queue_key_memory_queue_share, "queue_share", 0}
+};
+
+void init_queue_psi_keys()
+{
+  const char* category= "queue";
+  int count;
+
+  count= array_elements(all_queue_memory);
+  mysql_memory_register(category, all_queue_memory, count);
+}
+#endif /* Q4M_HAVE_PSI_MEMORY_KEY */
+
 static int init_plugin(void *p)
 {
   queue_hton = (handlerton *)p;
-  
+
+#ifdef Q4M_HAVE_PSI_MEMORY_KEY
+  init_queue_psi_keys();
+#endif
+
   pthread_mutex_init(&open_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&listener_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&tbl_stat_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&compile_expr_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&stat_mutex, MY_MUTEX_INIT_FAST);
   my_hash_init(&queue_open_tables, system_charset_info, 32, 0, 0,
-	    reinterpret_cast<my_hash_get_key>(queue_share_t::get_share_key), 0, 0);
+	    reinterpret_cast<my_hash_get_key>(queue_share_t::get_share_key),
+#ifdef Q4M_HAVE_PSI_MEMORY_KEY
+        0, 0, queue_key_memory_queue_share);
+#else
+        0, 0);
+#endif
   queue_hton->state = SHOW_OPTION_YES;
   queue_hton->close_connection = queue_connection_t::close;
   queue_hton->create = create_handler;
@@ -3113,7 +3150,11 @@ my_bool queue_wait_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
   {
     THD* thd = current_thd;
     if (thd->lex != NULL
+#if MYSQL_VERSION_ID >= 50705
+        && thd->lex->select_lex->table_list.elements != 0) {
+#else
         && thd->lex->select_lex.table_list.elements != 0) {
+#endif
       strcpy(message, "as of MySQL 5.6, the function cannot be used within a WHERE clause");
       return 1;
     }

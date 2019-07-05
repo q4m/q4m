@@ -3,7 +3,7 @@ Q4M - a Message Queue for MySQL
 http://q4m.github.io/
 
 Q4M is a message queue that works as a pluggable storage engine of MySQL
-5.1 / 5.5 / 5.6.
+5.1 / 5.5 / 5.6 / 5.7.
 
 * MySQL 5.6 Compatibility
 
