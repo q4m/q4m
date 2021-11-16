@@ -40,13 +40,21 @@ extern "C" {
 extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 				 const char *table, const char *ext,
 				 uint flags);
-#else
-#if MYSQL_VERSION_ID < 50700
+#elif MYSQL_VERSION_ID < 50700
 #include "sql_priv.h"
-#endif
+#elif MYSQL_VERSION_ID < 80000
 #include "sql_base.h"
 #include "sql_table.h"
 #include "probes_mysql.h"
+#else
+#include "sql/sql_base.h"
+#include "sql/sql_table.h"
+#include "sql/current_thd.h"
+#include "sql/sql_class.h"
+#include "sql/sql_lex.h"
+#include "sql/dd/cache/dictionary_client.h"
+#include "mysql/psi/mysql_memory.h"
+#include "mysql.h"
 #endif
 #undef PACKAGE
 #undef VERSION
@@ -71,9 +79,7 @@ extern uint build_table_filename(char *buff, size_t bufflen, const char *db,
 #include "queue_config.h"
 #endif
 
-#if SIZEOF_OFF_T != 8
-#  error "support for 64-bit file offsets is mandatory"
-#endif
+BOOST_STATIC_ASSERT(sizeof(off_t) >= 8);
 #ifdef HAVE_LSEEK64
 #  define lseek  lseek64
 #  define pread  pread64
@@ -132,7 +138,14 @@ static MYSQL_SYSVAR_INT(concurrent_compaction_interval,
 			"interval of accepting INSERTs during compaction (in bytes)",
 			NULL, NULL, 1048576, 1024, INT_MAX, 0);
 
+#define Q4M_USE_MULTIMAP
+
+#ifdef Q4M_USE_MULTIMAP
+typedef std::multimap<std::string, queue_share_t *> queue_open_tables2_type;
+queue_open_tables2_type queue_open_tables2;
+#else
 static HASH queue_open_tables;
+#endif
 static pthread_mutex_t open_mutex, listener_mutex, tbl_stat_mutex;
 #if Q4M_DELETE_METHOD == Q4M_DELETE_MSYNC
 static ptrdiff_t psz_mask;
@@ -410,12 +423,14 @@ my_off_t queue_file_header_t::size() const
   return HEADER_SIZE_0_9_8;
 }
 
+#if MYSQL_VERSION_ID < 80000
 uchar* queue_share_t::get_share_key(queue_share_t *share, size_t *length,
 				    my_bool not_used __attribute__((unused)))
 {
   *length = share->table_name_length;
   return reinterpret_cast<uchar*>(share->table_name);
 }
+#endif
 
 void queue_share_t::recalc_row_count(info_t *info, bool log)
 {
@@ -669,8 +684,13 @@ queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
   table_name_length = strlen(table_name);
   
   /* return the one, if found (after incrementing refcount) */
-  if ((share = reinterpret_cast<queue_share_t*>(my_hash_search(&queue_open_tables, reinterpret_cast<const uchar*>(table_name), table_name_length)))
-      != NULL) {
+#ifdef Q4M_USE_MULTIMAP
+  queue_open_tables2_type::const_iterator const iter = queue_open_tables2.find(std::string(table_name, table_name_length));
+  share = (iter != queue_open_tables2.end()) ? iter->second : NULL;
+#else
+  share = reinterpret_cast<queue_share_t*>(my_hash_search(&queue_open_tables, reinterpret_cast<const uchar*>(table_name), table_name_length));
+#endif
+  if (share != NULL) {
     ++share->ref_cnt;
     pthread_mutex_unlock(&open_mutex);
     return share;
@@ -786,9 +806,16 @@ queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
     goto ERR_AFTER_MMAP;
   }
   /* add to open_tables */
+#ifdef Q4M_USE_MULTIMAP
+  {
+    std::string tn(share->table_name, share->table_name_length);
+    queue_open_tables2.insert(std::make_pair(tn, share));
+  }
+#else
   if (my_hash_insert(&queue_open_tables, reinterpret_cast<uchar*>(share))) {
     goto ERR_AFTER_WRITER_START;
   }
+#endif
   
   /* success, unlock */
   pthread_mutex_unlock(&open_mutex);
@@ -824,10 +851,30 @@ queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
   return NULL;
 }
 
+#ifdef Q4M_USE_MULTIMAP
+static void queue_open_tables2_erase(queue_share_t *p, std::string s)
+{
+  typedef queue_open_tables2_type::iterator iter_t;
+  std::pair<iter_t, iter_t> eqr = queue_open_tables2.equal_range(s);
+  for (iter_t iter = eqr.first; iter != eqr.second; ) {
+    iter_t iter_next = iter;
+    ++iter_next;
+    if (iter->second == p) {
+      queue_open_tables2.erase(iter);
+    }
+    iter = iter_next;
+  }
+}
+#endif
+
 void queue_share_t::detach()
 {
   pthread_mutex_lock(&open_mutex);
+#ifdef Q4M_USE_MULTIMAP
+  queue_open_tables2_erase(this, std::string(this->table_name, this->table_name_length));
+#else
   my_hash_delete(&queue_open_tables, reinterpret_cast<uchar*>(this));
+#endif
   pthread_mutex_unlock(&open_mutex);
 }
 
@@ -836,7 +883,11 @@ void queue_share_t::release()
   pthread_mutex_lock(&open_mutex);
   
   if (--ref_cnt == 0) {
+#ifdef Q4M_USE_MULTIMAP
+    queue_open_tables2_erase(this, std::string(this->table_name, this->table_name_length));
+#else
     my_hash_delete(&queue_open_tables, reinterpret_cast<uchar*>(this));
+#endif
     {
       cac_mutex_t<info_t>::lockref info(this->info);
       info->writer_exit = true;
@@ -912,11 +963,23 @@ bool queue_share_t::init_fixed_fields()
   if ((tmpbuf = parse_db_table_name(table_name, db, tbl)) == NULL) {
     return false;
   }
-  TABLE* table = open_table_uncached(current_thd, table_name, db, tbl, false
+  THD *thd = current_thd;
+#if MYSQL_VERSION_ID < 80000
+  TABLE* table = open_table_uncached(thd, table_name, db, tbl, false
 #if MYSQL_VERSION_ID >= 50600
                                      , false /* open_in_engine */
 #endif
                                      );
+#else
+  dd::cache::Dictionary_client::Auto_releaser releaser(thd->dd_client());
+  const dd::Table *tab_obj = NULL;
+  if (thd->dd_client()->acquire(db, tbl, &tab_obj)) return true;
+  assert(tab_obj);
+  TABLE* table = open_table_uncached(thd, table_name, db, tbl, false
+                                     , false /* open_in_engine */
+                                     , *tab_obj
+                                     );
+#endif
   if (table == NULL) {
     free(tmpbuf);
     return false;
@@ -2242,7 +2305,11 @@ const char **ha_queue::bas_ext() const
   return ha_queue_exts;
 }
 
+#if MYSQL_VERSION_ID < 80000
 int ha_queue::open(const char *name, int mode, uint test_if_locked)
+#else
+int ha_queue::open(const char *name, int mode, uint test_if_locked, const dd::Table *table_def)
+#endif
 {
   if ((share = queue_share_t::get_share(name)) == NULL) {
     return HA_ERR_CRASHED_ON_USAGE;
@@ -2379,11 +2446,19 @@ int ha_queue::rnd_next(uchar *buf)
   
   /* unlock and convert to internal representation */
   unpack_row(buf);
+#if MYSQL_VERSION_ID < 80000
   table->status = 0;
+#else
+  table->set_found_row();
+#endif
   return 0;
   
  EXIT:
+#if MYSQL_VERSION_ID < 80000
   table->status = STATUS_NOT_FOUND;
+#else
+  table->set_no_row();
+#endif
   return err;
 }
 
@@ -2474,8 +2549,13 @@ THR_LOCK_DATA **ha_queue::store_lock(THD *thd, THR_LOCK_DATA **to,
   return to;
 }
 
+#if MYSQL_VERSION_ID < 80000
 int ha_queue::create(const char *name, TABLE *table_arg,
 		     HA_CREATE_INFO *create_info)
+#else
+int ha_queue::create(const char *name, TABLE *table_arg,
+		     HA_CREATE_INFO *create_info, dd::Table *table_def)
+#endif
 {
   char filename[FN_REFLEN];
   int fd;
@@ -2637,7 +2717,11 @@ int ha_queue::delete_row(const uchar *buf __attribute__((unused)))
   return err;
 }
 
+#if MYSQL_VERSION_ID < 80000
 int ha_queue::delete_table(const char *name)
+#else
+int ha_queue::delete_table(const char *name, const dd::Table *tbl)
+#endif
 {
   if (share != NULL || (share = queue_share_t::get_share(name)) != NULL) {
     {
@@ -2649,7 +2733,11 @@ int ha_queue::delete_table(const char *name)
     share = NULL;
   }
   get_stats_for(name, true);
+#if MYSQL_VERSION_ID < 80000
   return handler::delete_table(name);
+#else
+  return handler::delete_table(name, tbl);
+#endif
 }
 
 int ha_queue::prepare_rows_buffer(size_t sz)
@@ -2703,14 +2791,22 @@ void ha_queue::unpack_row(uchar *buf)
        *field != NULL;
        field++, fixed++) {
     if (*fixed != NULL && ! (*field)->is_null()) {
+#if MYSQL_VERSION_ID < 80000
       src = (*field)->unpack(buf + (*field)->offset(table->record[0]), src);
+#else
+      src = (*field)->unpack(buf + (*field)->offset(table->record[0]), src, 0);
+#endif
     }
   }
   for (field = table->field, fixed = share->get_fixed_fields();
        *field != NULL;
        field++, fixed++) {
     if (*fixed == NULL && ! (*field)->is_null()) {
+#if MYSQL_VERSION_ID < 80000
       src = (*field)->unpack(buf + (*field)->offset(table->record[0]), src);
+#else
+      src = (*field)->unpack(buf + (*field)->offset(table->record[0]), src, 0);
+#endif
     }
   }
 }
@@ -2741,14 +2837,22 @@ size_t ha_queue::pack_row(uchar *buf, queue_source_t *source)
        *field != NULL;
        field++, fixed++) {
     if (*fixed != NULL && ! (*field)->is_null()) {
+#if MYSQL_VERSION_ID < 80000
       dst = (*field)->pack(dst, buf + (*field)->offset(buf));
+#else
+      dst = (*field)->pack(dst, buf + (*field)->offset(buf), UINT_MAX);
+#endif
     }
   }
   for (field = table->field, fixed = share->get_fixed_fields();
        *field != NULL;
        field++, fixed++) {
     if (*fixed == NULL && ! (*field)->is_null()) {
+#if MYSQL_VERSION_ID < 80000
       dst = (*field)->pack(dst, buf + (*field)->offset(buf));
+#else
+      dst = (*field)->pack(dst, buf + (*field)->offset(buf), UINT_MAX);
+#endif
     }
   }
   /* write source */
@@ -2763,8 +2867,14 @@ size_t ha_queue::pack_row(uchar *buf, queue_source_t *source)
   return sz;
 }
 
+
+#if MYSQL_VERSION_ID < 80000
 static handler *create_handler(handlerton *hton, TABLE_SHARE *table,
 			MEM_ROOT *mem_root)
+#else
+static handler *create_handler(handlerton *hton, TABLE_SHARE *table,
+			bool partitioned, MEM_ROOT *mem_root)
+#endif
 {
   return new (mem_root) ha_queue(hton, table);
 }
@@ -2864,7 +2974,7 @@ static bool show_status(handlerton *hton, THD *thd, stat_print_fn *print,
   case HA_ENGINE_STATUS:
     return show_engine_status(hton, thd, print);
   default:
-    return FALSE;
+    return false;
   }
 }
 
@@ -2897,12 +3007,14 @@ static int init_plugin(void *p)
   pthread_mutex_init(&tbl_stat_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&compile_expr_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_init(&stat_mutex, MY_MUTEX_INIT_FAST);
+#ifndef Q4M_USE_MULTIMAP
   my_hash_init(&queue_open_tables, system_charset_info, 32, 0, 0,
 	    reinterpret_cast<my_hash_get_key>(queue_share_t::get_share_key),
 #ifdef Q4M_HAVE_PSI_MEMORY_KEY
         0, 0, queue_key_memory_queue_share);
 #else
         0, 0);
+#endif
 #endif
   queue_hton->state = SHOW_OPTION_YES;
   queue_hton->close_connection = queue_connection_t::close;
@@ -2919,8 +3031,11 @@ static int deinit_plugin(void *p)
     // FIXME: what is the appropriate error code to return busy status
     return HA_ERR_GENERIC;
   }
-  
+#ifdef Q4M_USE_MULTIMAP
+  queue_open_tables2.clear();
+#else
   my_hash_free(&queue_open_tables);
+#endif
   pthread_mutex_destroy(&stat_mutex);
   pthread_mutex_destroy(&compile_expr_mutex);
   pthread_mutex_destroy(&tbl_stat_mutex);
@@ -2935,7 +3050,11 @@ struct st_mysql_storage_engine queue_storage_engine = {
   MYSQL_HANDLERTON_INTERFACE_VERSION
 };
 
+#if MYSQL_VERSION_ID < 80000
 static struct st_mysql_sys_var *queue_plugin_vars[] = {
+#else
+static struct SYS_VAR *queue_plugin_vars[] = {
+#endif
   MYSQL_SYSVAR(mmap_max),
   MYSQL_SYSVAR(use_concurrent_compaction),
   MYSQL_SYSVAR(concurrent_compaction_interval),
@@ -2951,6 +3070,9 @@ mysql_declare_plugin(queue)
   "Queue storage engine for MySQL",
   PLUGIN_LICENSE_GPL,
   init_plugin,
+#if MYSQL_VERSION_ID >= 80000
+  NULL,
+#endif
   deinit_plugin,
   Q4M_VERSION_HEX,
   NULL,                       /* status variables                */
@@ -3024,11 +3146,11 @@ static int _queue_wait_core(char **share_names, int num_shares, int timeout,
   conn->erase_owned();
   
   /* setup */
-  shares = static_cast<queue_share_t**>(sql_alloc(num_shares * sizeof(queue_share_t*)));
+  shares = static_cast<queue_share_t**>(sql_calloc(num_shares * sizeof(queue_share_t*)));
   memset(shares, 0, num_shares * sizeof(queue_share_t*));
-  share_infos = static_cast<cac_mutex_t<queue_share_t::info_t>::lockref**>(sql_alloc(num_shares * sizeof(cac_mutex_t<queue_share_t::info_t>::lockref*)));
-  locks_buf = static_cast<share_lock_t*>(sql_alloc(num_shares * sizeof(share_lock_t)));
-  cond_exprs = static_cast<queue_share_t::cond_expr_t**>(sql_alloc(num_shares * sizeof(queue_share_t::cond_expr_t*)));
+  share_infos = static_cast<cac_mutex_t<queue_share_t::info_t>::lockref**>(sql_calloc(num_shares * sizeof(cac_mutex_t<queue_share_t::info_t>::lockref*)));
+  locks_buf = static_cast<share_lock_t*>(sql_calloc(num_shares * sizeof(share_lock_t)));
+  cond_exprs = static_cast<queue_share_t::cond_expr_t**>(sql_calloc(num_shares * sizeof(queue_share_t::cond_expr_t*)));
   memset(cond_exprs, 0, num_shares * sizeof(queue_share_t::cond_expr_t*));
   
   /* setup, or immediately break if data found, note that locks for the tables
@@ -3150,7 +3272,9 @@ my_bool queue_wait_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
   {
     THD* thd = current_thd;
     if (thd->lex != NULL
-#if MYSQL_VERSION_ID >= 50705
+#if MYSQL_VERSION_ID >= 80000
+        && thd->lex->query_block->table_list.elements != 0) {
+#elif MYSQL_VERSION_ID >= 50705
         && thd->lex->select_lex->table_list.elements != 0) {
 #else
         && thd->lex->select_lex.table_list.elements != 0) {

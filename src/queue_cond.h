@@ -1,6 +1,8 @@
 #ifndef QUEUE_COND_H
 #define QUEUE_COND_H
 
+#include <math.h>
+
 class queue_cond_expr_t;
 
 class queue_cond_t {
