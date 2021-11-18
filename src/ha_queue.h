@@ -23,6 +23,12 @@
 #include "dllist.h"
 #include "queue_cond.h"
 
+#if MYSQL_VERSION_ID >= 80000
+#include "my_byteorder.h"
+#include "sql/field.h"
+typedef bool my_bool;
+#endif
+
 // error numbers should be less than HA_ERR_FIRST
 #define QUEUE_ERR_RECORD_EXISTS (1)
 
@@ -71,7 +77,7 @@ public:
   }
   uchar *bytes() { return _bytes; }
   static size_t header_size() {
-    return my_offsetof(queue_row_t, _bytes[0]);
+    return offsetof(queue_row_t, _bytes[0]);
   }
   static size_t checksum_size() {
     return header_size() + sizeof(my_off_t);
@@ -178,9 +184,12 @@ public:
 #if MYSQL_VERSION_ID < 50600
     null_off(f->null_ptr != NULL ? f->null_ptr - t->record[0] : 0),
     null_bit(f->null_ptr != NULL ? f->null_bit : 0)
-#else
+#elif MYSQL_VERSION_ID < 80000
     null_off(f->real_maybe_null() ? f->null_offset() : 0),
     null_bit(f->real_maybe_null() ? f->null_bit : 0)
+#else
+    null_off(const_cast<Field *>(f)->get_null_ptr() ? f->null_offset() : 0),
+    null_bit(const_cast<Field *>(f)->get_null_ptr() ? f->null_bit : 0)
 #endif
   {
     strcpy(nam, f->field_name);
@@ -571,18 +580,30 @@ class ha_queue: public handler
   }
   const char **bas_ext() const;
   ulonglong table_flags() const {
+#if MYSQL_VERSION_ID < 80000
     return HA_NO_TRANSACTIONS | HA_REC_NOT_IN_SEQ | HA_CAN_GEOMETRY
+#else
+    return HA_NO_TRANSACTIONS | HA_UNUSED3 | HA_CAN_GEOMETRY
+#endif
       | HA_STATS_RECORDS_IS_EXACT | HA_CAN_BIT_FIELD
       /* | HA_BINLOG_ROW_CAPABLE | HA_BINLOG_STMT_CAPABLE */ 
       | HA_FILE_BASED | HA_NO_AUTO_INCREMENT
+#if MYSQL_VERSION_ID < 80000
       | HA_HAS_RECORDS;
+#else
+      | HA_COUNT_ROWS_INSTANT;
+#endif
   }
 
   ulong index_flags(uint, uint, bool) const {
     return 0;
   }
   
+#if MYSQL_VERSION_ID < 80000
   int open(const char *name, int mode, uint test_if_locked);
+#else
+  int open(const char *name, int mode, uint test_if_locked, const dd::Table *table_def);
+#endif
   int close();
   int external_lock(THD *thd, int lock_type);
   int rnd_init(bool scan);
@@ -593,11 +614,17 @@ class ha_queue: public handler
   
   int info(uint);
   ha_rows records();
+#if MYSQL_VERSION_ID < 80000
   int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info);
+#else
+  int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info, dd::Table *table_def);
+#endif
 
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type);     ///< required
+#if MYSQL_VERSION_ID < 80000
   uint8 table_cache_type() { return HA_CACHE_TBL_NOCACHE; }
+#endif
   
   void start_bulk_insert(ha_rows rows);
   int end_bulk_insert();
@@ -609,7 +636,11 @@ class ha_queue: public handler
   int update_row(const uchar *old_data, uchar *new_data);
   int delete_row(const uchar *buf);
 private:
+#if MYSQL_VERSION_ID < 80000
   int delete_table(const char *name);
+#else
+  int delete_table(const char *name, const dd::Table *);
+#endif
   int prepare_rows_buffer(size_t sz);
   void free_rows_buffer(bool force = false);
   void unpack_row(uchar *buf);
