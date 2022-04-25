@@ -803,6 +803,7 @@ queue_share_t *queue_share_t::get_share(const char *table_name, bool if_is_open)
   /* start threads */
   share->writer_do_wake_listeners = false;
   if (pthread_create(&share->writer_thread, NULL, _writer_start, share) != 0) {
+    log("Can't create a thread to handle Q4M: %s\n", table_name);
     goto ERR_AFTER_MMAP;
   }
   /* add to open_tables */
