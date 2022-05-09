@@ -1,11 +1,11 @@
 #include <cassert>
 #include <cstring>
 #include <stack>
-#include <boost/spirit/core.hpp>
-#include <boost/spirit/symbols.hpp>
-#include <boost/spirit/tree/ast.hpp>
-#include <boost/spirit/utility/confix.hpp>
-#include <boost/spirit/utility/escape_char.hpp>
+#include <boost/spirit/include/classic_core.hpp>
+#include <boost/spirit/include/classic_symbols.hpp>
+#include <boost/spirit/include/classic_ast.hpp>
+#include <boost/spirit/include/classic_confix.hpp>
+#include <boost/spirit/include/classic_escape_char.hpp>
 #ifdef TEST
 #include <string>
 #include <iostream>
@@ -13,7 +13,7 @@
 #include "queue_cond.h"
 
 using namespace std;
-using namespace boost::spirit;
+using namespace boost::spirit::classic;
 
 #define OR_TOKEN "or"
 #define XOR_TOKEN "xor"
