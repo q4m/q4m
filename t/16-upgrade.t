@@ -5,16 +5,6 @@ use DBI;
 use Test::More;
 use Test::mysqld;
 
-BEGIN {
-    unless ($ENV{MYSQL_DIR}) {
-        plan skip_all => 'set MYSQL_DIR to run these tests';
-    } else {
-        plan tests => 30;
-    }
-    plan skip_all => 'Test::mysqld >= 0.17 is required to run these tests'
-        unless $Test::mysqld::VERSION >= 0.17;
-};
-
 sub get_path_of {
     my ($name, @subdirs) = @_;
     for my $subdir (@subdirs) {
@@ -23,6 +13,22 @@ sub get_path_of {
             if -x $path;
     }
     die "could not find $name under $ENV{MYSQL_DIR}";
+}
+
+# Planning test
+unless ($ENV{MYSQL_DIR}) {
+    plan skip_all => 'set MYSQL_DIR to run these tests';
+} elsif ($Test::mysqld::VERSION < 0.17) {
+    plan skip_all => 'Test::mysqld >= 0.17 is required to run these tests';
+} else {
+    my $mysqld_command = get_path_of(qw(mysqld libexec bin));
+    my ($major_version) = `$mysqld_command --verbose --help` =~ m/\A.*Ver (?<major>[0-9]+)\.(?<minor>[0-9]+)\.(?<patch>[0-9]+)/;
+
+    if ($major_version >= 8) {
+        plan skip_all => "MySQL 8.0 and newer does not need these tests. Version: $major_version.$+{minor}.$+{patch}";
+    } else {
+        plan tests => 30;
+    }
 }
 
 my $mysqld = Test::mysqld->new(
