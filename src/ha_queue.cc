@@ -2272,6 +2272,11 @@ void queue_connection_t::erase_owned()
   owner_mode = false;
 }
 
+static const char *ha_queue_exts[] = {
+  Q4M,
+  NullS
+};
+
 ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
   :handler(hton, table_arg),
    share(NULL),
@@ -2297,11 +2302,6 @@ ha_queue::~ha_queue()
   bulk_delete_rows = NULL;
   free_rows_buffer(true);
 }
-
-static const char *ha_queue_exts[] = {
-  Q4M,
-  NullS
-};
 
 const char **ha_queue::bas_ext() const
 {
