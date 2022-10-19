@@ -2285,6 +2285,9 @@ ha_queue::ha_queue(handlerton *hton, TABLE_SHARE *table_arg)
    owns_delete_lock(false)
 {
   assert(ref_length == sizeof(my_off_t));
+  #if MYSQL_VERSION_ID >= 80000
+  hton->file_extensions = ha_queue_exts;
+  #endif
 }
 
 ha_queue::~ha_queue()
